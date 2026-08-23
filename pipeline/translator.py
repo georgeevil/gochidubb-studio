@@ -183,6 +183,23 @@ def _glossary_for(target_lang: str) -> Dict:
     return _GLOSSARY_CACHE[lang]
 
 
+def clear_glossary_cache(target_lang: Optional[str] = None) -> None:
+    """Forget the cached glossary so the next translation re-reads the file.
+
+    The cache above lives for the whole process, which meant a term saved
+    through /api/glossary had no effect until the server was restarted — the
+    review screen's "we'll remember this for future videos" was silently
+    doing nothing. Every write path to presets/user_glossary.json must call
+    this.
+    """
+    lang = (target_lang or "").strip()
+    if lang:
+        _GLOSSARY_CACHE.pop(lang, None)
+    else:
+        _GLOSSARY_CACHE.clear()
+    log.info(f"[glossary] cache cleared ({lang or 'all languages'})")
+
+
 def _glossary_block(glossary: Optional[Dict], limit: int = 60) -> str:
     """Render a flat {term: translation} map as a prompt section."""
     if not glossary:

@@ -66,6 +66,7 @@ FIELD_SPECS: dict = {
     "output_max_height":   (int, 360, 2160, 0),
     "background_volume":   (float, 0.0, 1.0),
     "bg_ducking":          (bool,),
+    "eta_realtime_factor": (float, 0.5, 60.0),
     "mode":                (str, ("local", "hosted")),
 }
 
@@ -225,6 +226,15 @@ class UserConfig:
     ytdlp_cookies_from_browser: str = ""   # e.g. "firefox", "chrome", "safari"
     ytdlp_cookiefile: str = ""             # path to Netscape cookies.txt
     max_source_duration_sec: int = 0       # 0 = no pre-download duration gate
+
+    # ── Estimates ─────────────────────────────────────────────────────
+    # Fallback wall-clock-seconds per second-of-source, used by
+    # GET /api/estimate until this install has finished enough jobs for
+    # app/estimate.py to measure its own median. 6x is a full-pipeline
+    # run on a 12GB GPU; a CPU-only box is far slower and should raise it.
+    # Note the ETA also multiplies by the language count — the job queue is
+    # single-consumer, so N languages run serially.
+    eta_realtime_factor: float = 6.0
 
     # ── Publishing ────────────────────────────────────────────────────
     # Attribution appended to published-video descriptions. {source_url}

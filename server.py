@@ -57,7 +57,10 @@ del _sys, _types, _gochidubb_stub_module, _n
 # ═══════════════════════════════════════════════════════════════════
 
 import asyncio
+import csv
+import io
 import json
+import math
 import re
 import logging
 import os
@@ -69,6 +72,7 @@ import time
 import uuid
 import webbrowser
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -183,7 +187,11 @@ from pipeline.diarizer import (
     diarize_speakers, assign_speakers_to_segments,
     extract_speaker_audio, extract_fallback_reference, effective_hf_token,
 )
-from pipeline.translator import translate_segments, check_ollama, ollama_pull_stream, unload_ollama_model
+from pipeline.translator import (
+    translate_segments, check_ollama, ollama_pull_stream,
+    unload_ollama_model, clear_glossary_cache, LANGUAGE_NAMES,
+)
+from pipeline.flags import flag_segments
 from pipeline.synthesizer import VoxCPMSynthesizer, F5TTSEngine, EdgeTTSFallback
 from pipeline.assembler import assemble_dubbed_audio, merge_audio_video, write_srt
 from pipeline.models import (
@@ -203,7 +211,8 @@ from app.config import cfg, coerce_field, BASE, UPLOAD_DIR, OUTPUT_DIR, STATIC_D
 from app.db import init_db, save_job_sync, load_all_jobs, delete_job_db
 from app import (logbuf, artifact_store, reuse_runtime, reuse as app_reuse,
                  activity, apikeys as app_apikeys, webhooks as app_webhooks,
-                 billing as app_billing, audit as app_audit)
+                 billing as app_billing, audit as app_audit,
+                 estimate as app_estimate, admin as app_admin)
 
 
 # Force UTF-8 stdout for foreign-language transcripts on Windows cp1252 consoles
@@ -300,6 +309,10 @@ jobs: dict = {}
 # restart, and to refuse settings changes that would swap the TTS model out
 # from under a running synthesis.
 ACTIVE_STATUSES = frozenset({
+    # "preparing" is a batch whose source is still being fetched by the
+    # background task /api/quick_test spawns — no pipeline owns it yet, but a
+    # restart kills the task, so it must be marked stale like the rest.
+    "preparing",
     "queued", "running", "downloading", "extracting",
     "transcribing", "translating", "synthesizing",
     "assembling", "merging",
@@ -344,6 +357,35 @@ def _free_gpu_memory():
 _job_queue: "asyncio.Queue[tuple]" = None  # set in lifespan
 _queue_worker_task = None
 _scheduler_task = None
+
+# Admission gate for the queue worker — the admin console's "Pause new jobs".
+# Set = running, clear = paused, which is the direction asyncio.Event reads
+# naturally in `await _intake_gate.wait()`.
+#
+# The gate is checked BEFORE the dequeue, never after. Holding a job the
+# worker has already taken would leave it out of `qsize()` while it is plainly
+# still waiting, so the console's queue depth would under-report for as long
+# as the pause lasted.
+#
+# That alone is not enough, though, and the gap is the interesting part: an
+# idle worker is parked inside `_job_queue.get()`, which returns the instant
+# something is enqueued — so a job submitted during a pause would start
+# anyway, while the console went on claiming intake was paused. A safety
+# control that lies is worse than not having one.
+#
+# So the worker races the dequeue against `_intake_changed`, which the pause
+# route pulses on every toggle. When the toggle wins, the pending `get()` is
+# cancelled and the worker loops back to park on the gate. Cancelling an
+# `asyncio.Queue.get()` cannot lose a job: the item lives in the queue's own
+# deque and a getter only pops it after being woken, so a cancelled getter
+# leaves it exactly where it was.
+_intake_gate: "asyncio.Event" = None      # set in lifespan; set == open
+_intake_changed: "asyncio.Event" = None   # pulsed when intake is toggled
+_intake_paused_since: float = 0.0
+
+
+def _intake_is_paused() -> bool:
+    return _intake_gate is not None and not _intake_gate.is_set()
 
 # Separate queue for platform uploads (Phase 3C). Uploads are network-bound,
 # not GPU-bound, so they must not wait behind (or block) the dub pipeline.
@@ -679,7 +721,33 @@ async def _job_queue_worker():
     log.info("[queue] Worker started")
     while True:
         try:
-            job_id, pipeline_args = await _job_queue.get()
+            if _intake_gate is not None and not _intake_gate.is_set():
+                log.info("[queue] Intake paused — not starting anything new")
+                await _intake_gate.wait()
+                log.info("[queue] Intake resumed")
+            if _intake_changed is None:
+                job_id, pipeline_args = await _job_queue.get()
+            else:
+                # See the `_intake_gate` comment: race the dequeue against a
+                # pause so an idle worker cannot admit a job the operator has
+                # just closed the door on.
+                getter = asyncio.ensure_future(_job_queue.get())
+                toggled = asyncio.ensure_future(_intake_changed.wait())
+                try:
+                    done, _pending = await asyncio.wait(
+                        {getter, toggled}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    toggled.cancel()
+                if getter in done:
+                    # A job and a pause can land in the same tick. The job is
+                    # already out of the queue by then, so it runs — the
+                    # pause takes effect from the next one.
+                    _intake_changed.clear()
+                    job_id, pipeline_args = getter.result()
+                else:
+                    getter.cancel()
+                    _intake_changed.clear()
+                    continue
         except asyncio.CancelledError:
             log.info("[queue] Worker cancelled, exiting")
             return
@@ -1310,6 +1378,12 @@ async def lifespan(app: FastAPI):
     global _job_queue, _queue_worker_task, _scheduler_task
     global _upload_queue, _upload_worker_task
     _job_queue = asyncio.Queue()
+    # Intake starts open. A pause is a live operational decision, never a
+    # state that survives a restart and silently strands the queue.
+    global _intake_gate, _intake_changed
+    _intake_gate = asyncio.Event()
+    _intake_gate.set()
+    _intake_changed = asyncio.Event()
     _queue_worker_task = asyncio.create_task(_job_queue_worker())
     # Scheduler: polls every 30s looking for jobs with status='scheduled'
     # whose scheduled_at time has arrived. Survives restarts — status and
@@ -3487,10 +3561,433 @@ async def billing_usage(window_days: int = 30):
     return summary
 
 
+# ─────────────────────────────────────────────────────────────
+# API: Pre-flight estimate — price and wait, before Start is pressed
+# ─────────────────────────────────────────────────────────────
+# The wizard needs a dollar total and an ETA on the screen where the user
+# commits. Both are estimates and both say so; see app/billing.py's honesty
+# boundary and app/estimate.py on why the ETA multiplies by language count.
+#
+# There is no quota in this product — no account, no plan, no allowance — so
+# this reports minutes USED, never "minutes left". Rendering a remaining
+# balance would be inventing a number.
+
+# URL -> (fetched_at, curated meta). A wizard re-renders on every language
+# click and yt-dlp takes seconds per probe, so the same URL is probed once.
+_ESTIMATE_META_TTL = 600.0
+_ESTIMATE_META_MAX = 64
+_estimate_meta_cache: dict = {}
+
+
+async def _probe_meta_cached(url: str) -> dict:
+    """curate_metadata(probe_metadata(url)) with a short TTL cache.
+
+    Probe failures cache nothing and return {} — the download stage is where
+    a bad URL should surface, not here.
+    """
+    url = (url or "").strip()
+    if not url.startswith("http"):
+        return {}
+    now = time.time()
+    hit = _estimate_meta_cache.get(url)
+    if hit and (now - hit[0]) < _ESTIMATE_META_TTL:
+        return hit[1]
+    try:
+        info = await asyncio.to_thread(probe_metadata, url)
+    except Exception as e:
+        log.warning(f"[estimate] probe failed (non-fatal): {e}")
+        return {}
+    if not info:
+        return {}
+    meta = curate_metadata(info) or {}
+    if len(_estimate_meta_cache) >= _ESTIMATE_META_MAX:
+        oldest = min(_estimate_meta_cache, key=lambda k: _estimate_meta_cache[k][0])
+        _estimate_meta_cache.pop(oldest, None)
+    _estimate_meta_cache[url] = (now, meta)
+    return meta
+
+
+def _spawn_background(coro):
+    """Start detached work that outlives the request that asked for it.
+
+    A named seam rather than a bare asyncio.create_task, so a test can run
+    the coroutine deterministically instead of racing the event loop. That
+    race is not theoretical: under `TestClient` used without its context
+    manager the portal is torn down when the request ends, and measuring it
+    showed a **one millisecond** delay inside the task is enough for it to
+    be cancelled instead of finishing. Tests that spawn real tasks there
+    pass only by winning a coin flip.
+    """
+    return asyncio.create_task(coro)
+
+
+def _discard_download(path: Path) -> None:
+    """Delete a downloaded source nothing is going to use, best effort.
+
+    Only touches the per-download directory this module creates under
+    uploads/ (``qt_<hex>/``), never an uploaded file a user supplied.
+    """
+    try:
+        parent = path.parent
+        path.unlink(missing_ok=True)
+        if (parent != UPLOAD_DIR and parent.parent == UPLOAD_DIR
+                and parent.name.startswith("qt_") and parent.is_dir()
+                and not any(parent.iterdir())):
+            parent.rmdir()
+    except OSError as e:
+        log.warning(f"[multidub] could not discard {path}: {e}")
+
+
+def _human_duration(seconds: float) -> str:
+    """"12 minutes", "1 hour 5 minutes" — for strings a creator reads."""
+    total = int(max(0, round(float(seconds or 0))))
+    if total < 60:
+        return f"{total} second{'s' if total != 1 else ''}"
+    hours, rem = divmod(total, 3600)
+    minutes = rem // 60
+    if not hours:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    out = f"{hours} hour{'s' if hours != 1 else ''}"
+    if minutes:
+        out += f" {minutes} minute{'s' if minutes != 1 else ''}"
+    return out
+
+
+def _finite_seconds(value: object) -> float:
+    """A duration in seconds, or 0.0 for anything that is not a real one.
+
+    NaN and ±Infinity have to die here rather than downstream: they survive
+    arithmetic and only blow up at `round()` or at `json.dumps(allow_nan=False)`,
+    which turns a bad query parameter into a 500. Negatives floor to zero — a
+    video cannot be minus four seconds long, and pricing one would be worse.
+    """
+    try:
+        out = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(out) or out <= 0:
+        return 0.0
+    return out
+
+
+@app.get("/api/estimate")
+async def get_estimate(source: str = "", duration_sec: float = 0.0,
+                       langs: str = "", window_days: int = 30):
+    """Price and wall-clock estimate for a job that has not started yet.
+
+    `source` is a URL — its duration/title/thumbnail come from a yt-dlp probe.
+    For an upload, pass `duration_sec` read client-side off a <video> element;
+    nothing has to be uploaded to get a price.
+
+    `langs` may be empty: step 1 of the wizard wants the title and thumbnail
+    before any language is picked, and a zero-language quote is $0.00.
+    """
+    codes = [c.strip().lower() for c in langs.split(",") if c.strip()]
+    if len(codes) > MAX_TARGET_LANGS:
+        return JSONResponse(
+            {"error": f"At most {MAX_TARGET_LANGS} languages (got {len(codes)})"}, 400)
+    unknown = [c for c in codes if c not in _QUICK_TEST_KNOWN_LANGS]
+    if unknown:
+        return JSONResponse({"error": f"Unknown language code(s): {unknown}"}, 400)
+    if len(set(codes)) != len(codes):
+        return JSONResponse({"error": "Duplicate language codes"}, 400)
+
+    meta = await _probe_meta_cached(source)
+    # `duration_sec` is read client-side off a <video> element, so it is not
+    # server-controlled: a browser that reports Infinity for a stream (which
+    # they do, before metadata loads) used to reach round() and json.dumps'
+    # allow_nan=False and answer 500. Anything not finite is no duration.
+    duration = _finite_seconds(meta.get("duration")) or _finite_seconds(duration_sec)
+
+    # Same gate the single-dub route applies, moved forward so the wizard can
+    # refuse an over-long video before Start rather than after the download.
+    gate_error = None
+    if cfg.max_source_duration_sec > 0 and duration > cfg.max_source_duration_sec:
+        # No config identifiers here: this string is rendered verbatim on a
+        # consumer screen, and the UI should not have to launder it.
+        gate_error = (
+            f"This video is {_human_duration(duration)} long, and this "
+            f"server's limit is {_human_duration(cfg.max_source_duration_sec)}."
+            f" Pick a shorter video, or raise the limit in Settings."
+        )
+
+    new_minutes = app_estimate.billable_minutes(duration, len(codes))
+    since = time.time() - max(1, int(window_days or 30)) * 86400
+    used = app_billing.summarize(list(jobs.values()), since=since)["minutes"]
+    priced = app_billing.marginal_cost(used, new_minutes)
+
+    measured = app_estimate.realtime_factor(jobs.values())
+    factor = measured if measured is not None else float(cfg.eta_realtime_factor)
+    eta = app_estimate.eta_seconds(duration, len(codes), factor)
+
+    return {
+        "duration_sec": round(duration, 2),
+        "langs": codes,
+        "billable_minutes": round(new_minutes, 2),
+        "used_minutes": priced["used_minutes"],
+        "cost": priced["cost"],
+        "rate": priced["rate"],
+        "bands": priced["bands"],
+        "eta_sec": int(round(eta)),
+        # The queue is single-consumer, so N languages run one after another.
+        # Say so rather than quoting single-language time for a batch.
+        "eta_per_lang_sec": int(round(eta / len(codes))) if codes else 0,
+        "eta_basis": "measured" if measured is not None else "default",
+        "eta_realtime_factor": round(factor, 2),
+        "title": meta.get("title") or "",
+        "thumbnail": meta.get("thumbnail") or "",
+        "channel": meta.get("channel") or "",
+        "source_type": "url" if (source or "").strip().startswith("http") else "upload",
+        "duration_gate_error": gate_error,
+        "estimate": True,
+        "disclaimer": (
+            "Estimate only. Minutes are measured from the real source length; "
+            "the cost applies the design's published hosted rates. This "
+            "server bills nobody."
+        ),
+    }
+
+
 @app.get("/api/audit")
 async def get_audit(limit: int = 200):
     return {"entries": app_audit.recent(limit=max(1, min(int(limit or 200), 1000))),
             "total": app_audit.count()}
+
+
+# ─────────────────────────────────────────────────────────────
+# API: Vendor admin console
+# ─────────────────────────────────────────────────────────────
+# Backs static/admin.html — the design's `3a` screens. All aggregation lives
+# in app/admin.py, which is pure; these routes only gather the inputs it
+# cannot reach on its own (disk sizes, GPU telemetry, per-stage metrics
+# files) and hand them over.
+#
+# Same honesty boundary as /api/billing/usage, and for the same reason: the
+# minutes are real, every dollar figure is an estimate at the design's
+# published rates, and this server bills nobody. app/admin.py's docstring
+# lists what the console shows, what it estimates, and what it refuses to
+# invent.
+#
+# No authentication, because nothing on this server has any — see the
+# loopback-bind rationale at the bottom of this file. In a hosted deployment
+# this surface is the one that must go behind staff SSO first: it reads the
+# revenue estimate, every API key record and the audit trail.
+
+# Per-stage durations are read from each job's metrics.json, one small file
+# per job. The fleet screen polls, so the walk is cached: without this a 5s
+# poll over a few hundred finished jobs is a few hundred file reads a second
+# for numbers that move once a job finishes.
+_ADMIN_STAGE_TTL = 30.0
+_admin_stage_cache: dict = {}
+
+
+def _admin_stage_samples(now: float) -> tuple:
+    """(recent, baseline) maps of stage id -> [seconds per source-second, …].
+
+    "Recent" is the last 24 hours and "baseline" is the 7 days before that,
+    which is the comparison the design's pool table draws ("stage p95s vs 7d
+    baseline"). Jobs are visited newest-first and capped, so an install with
+    thousands of finished jobs still answers in bounded time.
+
+    **Samples are normalised by source length, not raw stage seconds.** Every
+    stage's wall clock scales with how long the video was, so comparing raw
+    p95s across two windows mostly compares what got dubbed rather than how
+    fast it ran: measured on a real install, a day of full videos against a
+    week of short test clips reported *every* stage as 3-34x degraded, which
+    is a wall of false alarms and worse than no signal. Dividing by the source
+    duration asks the question the panel is actually for — is this stage
+    slower per unit of work than it was — and it is the same normalisation
+    `app/estimate.py` applies to whole jobs.
+
+    A job with no measured duration contributes nothing rather than a
+    division by zero or a guess.
+    """
+    hit = _admin_stage_cache.get("samples")
+    if hit and (now - hit[0]) < _ADMIN_STAGE_TTL:
+        return hit[1]
+
+    recent: dict = {}
+    baseline: dict = {}
+    cutoff_recent = now - 86400.0
+    cutoff_base = now - 8 * 86400.0
+
+    candidates = sorted(
+        (j for j in jobs.values() if (j.get("created") or 0) >= cutoff_base),
+        key=lambda j: -(j.get("created") or 0),
+    )[:400]
+
+    for job in candidates:
+        source_sec = _finite_seconds(job.get("duration"))
+        if source_sec <= 0:
+            continue
+        work = OUTPUT_DIR / (job.get("id") or "")
+        if not work.is_dir():
+            continue
+        try:
+            stages = (load_metrics(work).get("stages") or {})
+        except Exception:
+            continue
+        bucket = recent if (job.get("created") or 0) >= cutoff_recent else baseline
+        for stage_id, rec in stages.items():
+            # Only successful runs. A stage that raised after four seconds is
+            # not evidence that the stage got faster.
+            if (rec.get("status") or "") not in ("", "ok", "success", "complete"):
+                continue
+            secs = rec.get("duration_sec")
+            if isinstance(secs, (int, float)) and secs > 0:
+                bucket.setdefault(stage_id, []).append(float(secs) / source_sec)
+
+    _admin_stage_cache["samples"] = (now, (recent, baseline))
+    return recent, baseline
+
+
+async def _admin_storage_gb() -> float:
+    """Total output size in GB, or 0.0 if the walk fails.
+
+    Storage is never the reason an admin page fails to render, so this
+    swallows errors the way /api/billing/usage does.
+    """
+    try:
+        return float((await storage_stats()).get("total_gb") or 0.0)
+    except Exception as e:
+        log.warning(f"[admin] storage walk failed (non-fatal): {e}")
+        return 0.0
+
+
+@app.get("/api/admin/overview")
+async def admin_overview(window_days: int = 30):
+    """Screen `3a Business overview` — tiles, revenue series, attention list."""
+    now = time.time()
+    recent, baseline = _admin_stage_samples(now)
+    health = app_admin.stage_health(recent, baseline)
+    payload = app_admin.overview(
+        list(jobs.values()), app_apikeys.list_keys(),
+        days=max(1, int(window_days or 30)), now=now,
+        storage_gb=await _admin_storage_gb(),
+        stage_alerts=app_admin.stage_alerts(health),
+    )
+    payload["mode"] = cfg.mode
+    return payload
+
+
+@app.get("/api/admin/accounts")
+async def admin_accounts(window_days: int = 30):
+    """Screen `3a Customer accounts`, mapped onto API keys — see app/admin.py."""
+    return app_admin.accounts(
+        list(jobs.values()), app_apikeys.list_keys(),
+        mode=cfg.mode, days=max(1, int(window_days or 30)),
+        enforced=cfg.mode == "hosted",
+    )
+
+
+@app.get("/api/admin/account/{key_id}")
+async def admin_account(key_id: str):
+    """One key, with the audit entries that mention it.
+
+    The design's detail pane promises "every action here lands in the
+    audit log". It does — app/audit.py records key creation and revocation —
+    so the pane reads that trail back rather than claiming it exists.
+    """
+    rec = next((k for k in app_apikeys.list_keys() if k.get("id") == key_id), None)
+    if rec is None:
+        return JSONResponse({"error": "No such key"}, 404)
+    entries = [e for e in app_audit.recent(limit=1000)
+               if e.get("target") == key_id or key_id in str(e.get("detail") or "")]
+    return {
+        "key": rec,
+        "state": app_admin.key_state(rec),
+        "scopes": app_apikeys.SCOPES,
+        "audit": entries[:50],
+        "enforced": cfg.mode == "hosted",
+        "note": app_admin.accounts([], [])["note"],
+    }
+
+
+@app.get("/api/admin/revenue")
+async def admin_revenue(window_days: int = 30):
+    """Screen `3a Revenue ops` — rate card, unbilled work, per-month roll-up."""
+    payload = app_admin.revenue(
+        list(jobs.values()), days=max(1, int(window_days or 30)),
+        storage_gb=await _admin_storage_gb(),
+    )
+    payload["mode"] = cfg.mode
+    return payload
+
+
+@app.get("/api/admin/revenue.csv")
+async def admin_revenue_csv(window_days: int = 30):
+    """The design's `Export CSV ↓`, one row per job.
+
+    Built in memory: the row count is the job count, which is bounded by
+    what one machine has dubbed, and streaming would buy nothing.
+    """
+    days = max(1, int(window_days or 30))
+    now = time.time()
+    rows = app_admin.revenue_csv_rows(
+        list(jobs.values()), since=now - days * 86400, until=now)
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerows(rows)
+    stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%d")
+    return Response(
+        buf.getvalue(), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="gochidubb-usage-{days}d-{stamp}.csv"'},
+    )
+
+
+@app.get("/api/admin/fleet")
+async def admin_fleet():
+    """Screen `3a Fleet and abuse queue` — capacity, stage p95s, review queue."""
+    now = time.time()
+    recent, baseline = _admin_stage_samples(now)
+    gpu = gpu_snapshot() or {}
+    try:
+        gpu_name = (get_system_status().get("gpu") or {}).get("name") or ""
+    except Exception:
+        gpu_name = ""
+    return app_admin.fleet(
+        list(jobs.values()), app_apikeys.list_keys(), now=now,
+        queue_depth=_job_queue.qsize() if _job_queue is not None else 0,
+        gpu={k: round(v, 1) for k, v in gpu.items()} if gpu else {},
+        gpu_backend=gpu_backend(), gpu_name=gpu_name,
+        health=app_admin.stage_health(recent, baseline),
+        intake_paused=_intake_is_paused(),
+    )
+
+
+@app.post("/api/admin/intake")
+async def admin_set_intake(paused: bool = Form(...)):
+    """The design's `Pause new jobs ⏸` — and it really does pause them.
+
+    Pausing stops the worker taking anything new off the queue. A job already
+    running is left alone: killing work mid-pipeline to honour a pause would
+    throw away GPU time that has already been spent, and cancel is the
+    endpoint for that.
+
+    The pause is in-process and deliberately does not persist — see
+    `_intake_gate` — so a restart always comes back admitting work.
+    """
+    global _intake_paused_since
+    if _intake_gate is None:
+        return JSONResponse({"error": "Queue is not running"}, 503)
+    want = bool(paused)
+    if want:
+        if _intake_gate.is_set():
+            _intake_paused_since = time.time()
+        _intake_gate.clear()
+    else:
+        _intake_gate.set()
+        _intake_paused_since = 0.0
+    # Wake a worker that is parked in `_job_queue.get()` so the new state
+    # takes effect now rather than after the next job slips through.
+    if _intake_changed is not None:
+        _intake_changed.set()
+    app_audit.record("admin.intake", target="queue",
+                     detail="paused" if want else "resumed")
+    activity.record_system(
+        f"Job intake {'paused' if want else 'resumed'} from the admin console")
+    return {"ok": True, "paused": want, "since": _intake_paused_since,
+            "queue_depth": _job_queue.qsize() if _job_queue is not None else 0}
 
 
 @app.post("/api/models/pull")
@@ -3544,6 +4041,57 @@ async def voxcpm_warmup():
 # API: Dubbing
 # ─────────────────────────────────────────────────────────────
 
+# Preference order for an automatic model substitution: fast non-thinking
+# translation-specialized models first, then general purpose, then thinking
+# models last. gemma4:e4b/e2b work but hang on 12 GB GPUs due to thinking
+# mode — kept as last-resort only.
+_PREFERRED_TRANSLATION_MODELS = [
+    "aya-expanse:8b",      # Cohere multilingual, best EN↔RU
+    "mistral-nemo:12b",    # Mistral, strong for European langs
+    "qwen2.5:14b",         # Qwen non-thinking, very good
+    "qwen3:8b",            # Qwen3, thinking optional
+    "qwen2.5:7b",          # Qwen smaller, fast
+    "gemma3:12b",          # Gemma3 (no thinking) — good quality
+    "gemma3:4b",           # Gemma3 small
+    "llama3.2:3b",         # Tiny fallback
+    "qwen3:14b",           # Larger qwen3 (thinking optional)
+    "gemma4:e4b",          # Thinking — heavy on 12 GB GPU
+    "gemma4:e2b",          # Thinking — smaller but same issue
+]
+
+
+def _resolve_translation_model(model: str, installed: list) -> tuple:
+    """Pick a model that actually exists. Returns (model, error message).
+
+    The preference list is Ollama-shaped ("aya-expanse:8b"), but
+    `check_ollama()` delegates to `check_lm_studio()` when USE_LM_STUDIO=1 —
+    the documented default — and LM Studio ids are hyphenated
+    ("aya-expanse-8b"). Nothing in the list can ever match, so without the
+    last-resort below every batch route refused to start on a machine with a
+    perfectly good model loaded, and told the user to run an `ollama` command
+    that was not the runtime they were using.
+
+    So: honour the preference order when it matches, otherwise take whatever
+    is loaded. Refusing is reserved for there being nothing at all.
+    """
+    fallback = next((m for m in _PREFERRED_TRANSLATION_MODELS if m in installed), None)
+    if fallback is None and installed:
+        # Any real model beats refusing to run. Creator mode has no model
+        # picker at all — quick_test is its only submit path — so a refusal
+        # here strands a creator at the last step of the wizard with no
+        # control that could fix it.
+        fallback = installed[0]
+    if fallback:
+        log.warning(f"Requested model '{model}' not installed; "
+                    f"using '{fallback}' instead")
+        return fallback, None
+    if USE_LM_STUDIO:
+        return model, ("No translation model is loaded in LM Studio. Load one "
+                       "there, or set USE_LM_STUDIO=0 to use Ollama instead.")
+    return model, ("No translation model installed. Pull one via "
+                   "'ollama pull aya-expanse:8b' or use the Models panel.")
+
+
 @app.post("/api/dub")
 async def start_dub(
     source: str = Form(""),
@@ -3582,34 +4130,9 @@ async def start_dub(
     # a machine with no LLM installed can still run reuploads.
     _ok, _installed = (await check_ollama()) if mode == "dub" else (False, [])
     if _ok and model not in _installed:
-        # Preference order: fast non-thinking translation-specialized
-        # models first, then general purpose, then thinking models last.
-        # gemma4:e4b/e2b work but hang on 12 GB GPUs due to thinking
-        # mode — kept as last-resort fallback only.
-        _preferred = [
-            "aya-expanse:8b",      # Cohere multilingual, best EN↔RU
-            "mistral-nemo:12b",    # Mistral, strong for European langs
-            "qwen2.5:14b",         # Qwen non-thinking, very good
-            "qwen3:8b",            # Qwen3, thinking optional
-            "qwen2.5:7b",          # Qwen smaller, fast
-            "gemma3:12b",          # Gemma3 (no thinking) — good quality
-            "gemma3:4b",           # Gemma3 small
-            "llama3.2:3b",         # Tiny fallback
-            "qwen3:14b",           # Larger qwen3 (thinking optional)
-            "gemma4:e4b",          # Thinking — heavy on 12 GB GPU
-            "gemma4:e2b",          # Thinking — smaller but same issue
-        ]
-        _fallback = next((m for m in _preferred if m in _installed), None)
-        if _fallback is None and _installed:
-            _fallback = _installed[0]
-        if _fallback:
-            log.warning(f"Requested model '{model}' not installed; using '{_fallback}' instead")
-            model = _fallback
-        else:
-            return JSONResponse({
-                "error": "No translation model installed. Pull one via 'ollama pull aya-expanse:8b' "
-                         "or use the Models panel."
-            }, 400)
+        model, _model_err = _resolve_translation_model(model, _installed)
+        if _model_err:
+            return JSONResponse({"error": _model_err}, 400)
 
     job_id = uuid.uuid4().hex[:8]
     work = OUTPUT_DIR / job_id
@@ -3810,17 +4333,9 @@ async def start_batch_dub(
     # Validate Ollama model once (not per-job)
     _ok, _installed = await check_ollama()
     if _ok and model not in _installed:
-        _preferred = ["aya-expanse:8b", "mistral-nemo:12b", "qwen2.5:14b",
-                      "qwen3:8b", "qwen2.5:7b", "gemma3:12b", "gemma3:4b",
-                      "llama3.2:3b", "qwen3:14b", "gemma4:e4b", "gemma4:e2b"]
-        _fallback = next((m for m in _preferred if m in _installed), None)
-        if _fallback:
-            log.warning(f"Batch: '{model}' not installed; using '{_fallback}'")
-            model = _fallback
-        else:
-            return JSONResponse({
-                "error": "No translation model installed. Run: ollama pull aya-expanse:8b"
-            }, 400)
+        model, _model_err = _resolve_translation_model(model, _installed)
+        if _model_err:
+            return JSONResponse({"error": _model_err}, 400)
 
     # Save shared reference once — all batch jobs reuse it
     ref_path = ""
@@ -4455,12 +4970,22 @@ def _trim_video(src: Path, dst: Path, seconds: int) -> Path:
 
 # Default language picks for the Quick-Test feature. Frontend allows
 # per-run override; this is just the pre-selection.
-# Bounds on a multi-language batch. Two is the floor because one language is
-# just a normal dub. The ceiling is a guard against a mis-click queueing a
-# very long run, not a technical limit — each language is an independent job
-# and the runner processes them serially, so the only cost of more is time.
-MIN_TARGET_LANGS = 2
+# Bounds on a multi-language batch. One is the floor: a single-language dub
+# through this route is a perfectly ordinary request, and letting it through
+# is what gives every creator video a batch_id — /api/dub sets none, so a
+# one-language job submitted there cannot be grouped with anything later.
+# The ceiling is a guard against a mis-click queueing a very long run, not a
+# technical limit — each language is an independent job and the runner
+# processes them serially, so the only cost of more is time.
+MIN_TARGET_LANGS = 1
 MAX_TARGET_LANGS = 12
+
+# Showcase stitches N languages into one reel and redub's compare/showcase
+# modes exist to put languages side by side; one language makes neither of
+# them mean anything. They get their own floor rather than sharing the one
+# above, so lowering that could not quietly turn a one-language showcase
+# into a valid request.
+MIN_SHOWCASE_LANGS = 2
 
 _QUICK_TEST_DEFAULT_LANGS = ("es", "fr", "de", "ja", "pt")
 # Validation set for Quick-Test / Showcase / Redub target codes. Derived from
@@ -4494,6 +5019,7 @@ async def start_quick_test(
     scheduled_at: float = Form(0.0),
     voxcpm_cfg: float = Form(0.0),         # 0 = use the global setting
     voxcpm_steps: int = Form(0),           # 0 = use the global setting
+    background: bool = Form(False),        # return before the download runs
 ):
     """Multi-language dub: fan one source out into N dub jobs, one per target
     language, sharing a batch_id so the UI can show them together.
@@ -4502,6 +5028,13 @@ async def start_quick_test(
     as a single dub. `trim_seconds=0` (the default) dubs the whole video;
     a non-zero value trims a clip first, which is the cheap way to audition
     voices and languages before committing GPU time to the full thing.
+
+    `background=1` returns as soon as the jobs exist, in status "preparing",
+    and does the download and trim in a task. Without it the caller waits out
+    a full YouTube download inside its HTTP request — minutes for a long
+    video, and a proxy in front of this server will time the request out
+    before it finishes. The central download stays central either way: the
+    fan-out jobs share one file, which is why it lives in the handler at all.
     """
     # ── Validate inputs ───────────────────────────────────────────────
     voxcpm_cfg, voxcpm_steps, _vox_err = validate_voxcpm_overrides(
@@ -4537,17 +5070,9 @@ async def start_quick_test(
     # ── Validate Ollama model (same fallback logic as start_batch_dub) ─
     _ok, _installed = await check_ollama()
     if _ok and model not in _installed:
-        _preferred = ["aya-expanse:8b", "mistral-nemo:12b", "qwen2.5:14b",
-                      "qwen3:8b", "qwen2.5:7b", "gemma3:12b", "gemma3:4b",
-                      "llama3.2:3b", "qwen3:14b", "gemma4:e4b", "gemma4:e2b"]
-        _fallback = next((m for m in _preferred if m in _installed), None)
-        if _fallback:
-            log.warning(f"[multidub] '{model}' not installed; using '{_fallback}'")
-            model = _fallback
-        else:
-            return JSONResponse({
-                "error": "No translation model installed. Run: ollama pull aya-expanse:8b"
-            }, 400)
+        model, _model_err = _resolve_translation_model(model, _installed)
+        if _model_err:
+            return JSONResponse({"error": _model_err}, 400)
 
     # Populated from the yt-dlp probe below for URL sources; stays empty for
     # local uploads, which have no page to read metadata from.
@@ -4562,107 +5087,88 @@ async def start_quick_test(
             shutil.copyfileobj(reference.file, f)
         log.info(f"[multidub] Saved shared reference: {ref_path}")
 
-    # ── Materialize the source file locally ───────────────────────────
-    # File uploads write straight to uploads/. URLs go through yt-dlp first
-    # so the trim step is centralized — we don't fan out N downloads.
-    src_path: Path
-    src_label: str
+    # ── Identify the source ───────────────────────────────────────────
+    # An upload is already local. A URL is probed now — through the same
+    # TTL cache /api/estimate uses, so a wizard that just priced this link
+    # pays nothing for the probe — and downloaded later, once, centrally:
+    # the fan-out jobs all read the same file.
+    upload_path: Optional[Path] = None
+    url = ""
     if video and video.filename:
         ext = Path(video.filename).suffix or ".mp4"
-        src_path = UPLOAD_DIR / f"qt_{uuid.uuid4().hex[:8]}{ext}"
-        with open(src_path, "wb") as f:
+        upload_path = UPLOAD_DIR / f"qt_{uuid.uuid4().hex[:8]}{ext}"
+        with open(upload_path, "wb") as f:
             shutil.copyfileobj(video.file, f)
         src_label = video.filename
     else:
-        from pipeline.downloader import download_video
         url = source.strip()
         src_label = url[:60] + ("..." if len(url) > 60 else "")
-        # Probe before downloading, exactly as the single-dub route does.
-        # Without this the fan-out jobs carried no meta at all, so there was
-        # nothing for the translate stage to render into the target language
-        # and the Results metadata panel came up empty.
-        try:
-            source_info = await asyncio.to_thread(probe_metadata, url)
-            if source_info:
-                src_meta = curate_metadata(source_info)
-                if src_meta.get("title"):
-                    src_label = src_meta["title"][:60]
-        except Exception as e:
-            log.warning(f"[multidub] metadata probe failed (non-fatal): {e}")
-        try:
-            dl_dir = UPLOAD_DIR / f"qt_{uuid.uuid4().hex[:8]}"
-            dl_dir.mkdir(parents=True, exist_ok=True)
-            src_path = Path(download_video(url, str(dl_dir)))
-        except Exception as e:
-            return JSONResponse(
-                {"error": f"Could not download URL: {e}"}, 400)
+        # Without this the fan-out jobs carried no meta at all, so the
+        # translate stage had nothing to render into the target language and
+        # the Results metadata panel came up empty.
+        src_meta = await _probe_meta_cached(url)
+        if src_meta.get("title"):
+            src_label = src_meta["title"][:60]
 
-    # ── Trim (optional) ───────────────────────────────────────────────
-    if trim_seconds:
-        trimmed_path = src_path.parent / f"{src_path.stem}_qt{trim_seconds}s.mp4"
-        try:
-            _trim_video(src_path, trimmed_path, trim_seconds)
-        except Exception as e:
-            err_msg = ""
-            if hasattr(e, "stderr") and getattr(e, "stderr", None):
-                err_msg = e.stderr.decode("utf-8", errors="replace")[-300:]
-            log.warning(f"[multidub] trim failed: {e} :: {err_msg}")
-            return JSONResponse(
-                {"error": "Could not trim video", "detail": err_msg or str(e)}, 500)
-    else:
-        trimmed_path = src_path
-
-    # ── Fan out: one job per language, all sharing one batch_id ───────
     batch_id = f"qt_{uuid.uuid4().hex[:8]}"
     _scope = f"{trim_seconds}s clip" if trim_seconds else "full video"
     label_final = batch_label or f"{len(langs)} languages · {_scope}"
-    job_ids: list = []
 
-    for idx, lang in enumerate(langs):
-        jid = uuid.uuid4().hex[:8]
-        jobs[jid] = {
-            "id": jid,
-            "status": "queued",
-            "progress": 0,
-            "source": str(trimmed_path),
-            "source_type": "file",
-            "source_label": f"{src_label} -> {lang.upper()}",
-            "target_lang": lang,
-            "model": model,
-            "speaker_mode": speaker_mode,
-            "context_hint": context_hint,
-            "voice_style": voice_style,
-            "voice_preset": voice_preset,
-            "voice_mode": ("upload" if ref_path else
-                          ("custom" if voice_style.strip() else "preset")),
-            "tts_speed": tts_speed,
-            "voxcpm_cfg": voxcpm_cfg,
-            "voxcpm_steps": voxcpm_steps,
-            "whisper_model": whisper_model,
-            "keep_bg": keep_bg,
-            "wizard_mode": wizard_mode,
-            "lip_sync": lip_sync,
-            "auto_denoise": auto_denoise,
-            # Every sibling shares the source's metadata; the translate stage
-            # then renders its own meta_translated per target language.
-            "meta": dict(src_meta) if src_meta else {},
-            "title": src_meta.get("title") or "",
-            "trim_seconds": trim_seconds,
-            "batch_id": batch_id,
-            "batch_label": label_final,
-            # Stored value kept as "quick_test" so batches created before
-            # this became a first-class multi-language mode keep rendering
-            # and rebuilding correctly; the UI maps it to a display label.
-            "batch_kind": "quick_test",
-            "batch_position": idx,
-            "batch_total": len(langs),
-            "created": time.time(),
-            "scheduled_at": scheduled_at,
-            "_pending_args": None,
-        }
-        save_job(jobs[jid])
-        await enqueue_job(jid, {
-            "source": str(trimmed_path),
+    def _create_jobs(status: str, src: str) -> list:
+        """One job per language, all sharing one batch_id."""
+        ids = []
+        for idx, lang in enumerate(langs):
+            jid = uuid.uuid4().hex[:8]
+            jobs[jid] = {
+                "id": jid,
+                "status": status,
+                "progress": 0,
+                "source": src,
+                "source_type": "file",
+                "source_label": f"{src_label} -> {lang.upper()}",
+                "target_lang": lang,
+                "source_lang": source_lang,
+                "model": model,
+                "speaker_mode": speaker_mode,
+                "context_hint": context_hint,
+                "voice_style": voice_style,
+                "voice_preset": voice_preset,
+                "voice_mode": ("upload" if ref_path else
+                               ("custom" if voice_style.strip() else "preset")),
+                "tts_speed": tts_speed,
+                "voxcpm_cfg": voxcpm_cfg,
+                "voxcpm_steps": voxcpm_steps,
+                "whisper_model": whisper_model,
+                "keep_bg": keep_bg,
+                "wizard_mode": wizard_mode,
+                "lip_sync": lip_sync,
+                "auto_denoise": auto_denoise,
+                # Every sibling shares the source's metadata; the translate
+                # stage then renders its own meta_translated per language.
+                "meta": dict(src_meta) if src_meta else {},
+                "title": src_meta.get("title") or "",
+                "trim_seconds": trim_seconds,
+                "batch_id": batch_id,
+                "batch_label": label_final,
+                # Stored value kept as "quick_test" so batches created before
+                # this became a first-class multi-language mode keep rendering
+                # and rebuilding correctly; the UI maps it to a display label.
+                "batch_kind": "quick_test",
+                "batch_position": idx,
+                "batch_total": len(langs),
+                "created": time.time(),
+                "scheduled_at": scheduled_at,
+                "step_detail": ("Fetching your video…" if status == "preparing"
+                                else ""),
+                "_pending_args": None,
+            }
+            save_job(jobs[jid])
+            ids.append(jid)
+        return ids
+
+    def _pipeline_args(lang: str, path: Path) -> dict:
+        return {
+            "source": str(path),
             "source_lang": source_lang,
             "target_lang": lang,
             "model": model,
@@ -4683,8 +5189,165 @@ async def start_quick_test(
             "auto_denoise": auto_denoise,
             "voxcpm_cfg": voxcpm_cfg,
             "voxcpm_steps": voxcpm_steps,
-        })
-        job_ids.append(jid)
+        }
+
+    async def _materialize():
+        """(path, error dict, http status). Every blocking call runs in a
+        thread — this used to run download_video() straight inside the async
+        handler, which froze the whole server for the length of a YouTube
+        download and made the submit request look dead."""
+        if upload_path is not None:
+            src = upload_path
+        else:
+            dl_dir = UPLOAD_DIR / f"qt_{uuid.uuid4().hex[:8]}"
+            try:
+                dl_dir.mkdir(parents=True, exist_ok=True)
+                src = Path(await asyncio.to_thread(
+                    download_video, url, str(dl_dir)))
+            except Exception as e:
+                # The directory is created before the download, so a failure
+                # leaves an empty one behind on every bad URL. Nothing else
+                # ever cleans uploads/, so they accumulate silently.
+                try:
+                    if dl_dir.is_dir() and not any(dl_dir.iterdir()):
+                        dl_dir.rmdir()
+                except OSError:
+                    pass
+                return None, {"error": f"Could not download URL: {e}"}, 400
+        if not trim_seconds:
+            return src, None, 0
+        dst = src.parent / f"{src.stem}_qt{trim_seconds}s.mp4"
+        try:
+            await asyncio.to_thread(_trim_video, src, dst, trim_seconds)
+        except Exception as e:
+            err_msg = ""
+            if hasattr(e, "stderr") and getattr(e, "stderr", None):
+                err_msg = e.stderr.decode("utf-8", errors="replace")[-300:]
+            log.warning(f"[multidub] trim failed: {e} :: {err_msg}")
+            return None, {"error": "Could not trim video",
+                          "detail": err_msg or str(e)}, 500
+        return dst, None, 0
+
+    async def _fan_out(ids: list, final_path: Path) -> None:
+        for jid, lang in zip(ids, langs):
+            j = jobs.get(jid)
+            if not j or j.get("status") == "cancelled" or j.get("cancel_requested"):
+                # Cancelled while the download was still running.
+                if j and j.get("status") != "cancelled":
+                    j["status"] = "cancelled"
+                    j["step_detail"] = "Cancelled while preparing"
+                    save_job(j)
+                continue
+            j["source"] = str(final_path)
+            save_job(j)
+            await enqueue_job(jid, _pipeline_args(lang, final_path))
+
+    # ── Background submit ─────────────────────────────────────────────
+    if background:
+        try:
+            job_ids = _create_jobs("preparing", "")
+        except Exception as e:
+            # save_job failing part-way leaves the siblings it already
+            # registered in the in-memory store as "preparing" — a status
+            # nothing can delete. The caller gets a 500 and would otherwise
+            # never learn those exist.
+            for jid in [j for j, v in list(jobs.items())
+                        if v.get("batch_id") == batch_id]:
+                jobs.pop(jid, None)
+            log.exception(f"[multidub] {batch_id}: could not create jobs")
+            return JSONResponse(
+                {"error": f"Could not create jobs: {e}"}, 500)
+
+        def _abandon(ids: list, detail: str) -> None:
+            """Move every still-preparing sibling to a terminal status.
+
+            Nothing else will. A job left in "preparing" never reaches a
+            pipeline, never times out, and is skipped by bulk delete
+            (_UNDELETABLE_STATUSES) — so it sits on the home screen claiming
+            to be working until the server restarts. Single delete does
+            still remove it, which is the only reason this is a defect
+            rather than an emergency.
+            """
+            for jid in ids:
+                j = jobs.get(jid)
+                if not j or j.get("status") != "preparing":
+                    continue
+                j["status"] = "error"
+                j["error"] = detail
+                j["step_detail"] = ""
+                try:
+                    save_job(j)
+                except Exception as e:
+                    # The in-memory store is the source of truth during a
+                    # live run, so the status change above already frees the
+                    # job. Letting a failed persist abort the loop would
+                    # strand every sibling after this one — which is the
+                    # exact failure this function exists to prevent.
+                    log.warning(f"[multidub] could not persist {jid}: {e}")
+
+        async def _prepare(ids: list = job_ids) -> None:
+            # Everything below runs detached in a task: an exception here is
+            # not returned to anyone, it is swallowed by the event loop. So
+            # the whole body is guarded — the failure mode without this is
+            # silent, permanent, and undeletable.
+            try:
+                final_path, err, _code = await _materialize()
+                if err:
+                    detail = (err.get("detail") or err.get("error")
+                              or "Preparation failed")
+                    _abandon(ids, detail)
+                    log.warning(f"[multidub] {batch_id}: preparation failed "
+                                f"— {detail}")
+                    return
+                if all((jobs.get(j) or {}).get("status") == "cancelled"
+                       for j in ids):
+                    # Every sibling was cancelled while this downloaded.
+                    # Nothing will ever read the file, and uploads/ has no
+                    # other sweeper.
+                    _discard_download(final_path)
+                    log.info(f"[multidub] {batch_id}: all jobs cancelled "
+                             f"while preparing — download discarded")
+                    return
+                await _fan_out(ids, final_path)
+                log.info(f"[multidub] {batch_id}: prepared and enqueued "
+                         f"{len(ids)} job(s) ({_scope}, langs={langs})")
+            except asyncio.CancelledError:
+                _abandon(ids, "Server shut down while preparing this video.")
+                raise
+            except Exception as e:
+                log.exception(f"[multidub] {batch_id}: preparation crashed")
+                _abandon(ids, f"Preparation failed: {e}")
+            finally:
+                # A sibling can also be left behind by _fan_out itself —
+                # enqueue_job raising halfway through leaves the ones after
+                # it untouched. Nothing is still legitimately "preparing" by
+                # the time this task ends.
+                _abandon(ids, "Preparation ended without starting this job.")
+
+        _spawn_background(_prepare())
+        log.info(f"[multidub] {batch_id}: {len(job_ids)} job(s) accepted, "
+                 f"preparing in background ({_scope}, langs={langs})")
+        return {
+            "ok": True,
+            "batch_id": batch_id,
+            "batch_kind": "quick_test",
+            "job_ids": job_ids,
+            "count": len(job_ids),
+            "background": True,
+            "status": "preparing",
+            # Not known yet — the source has not been fetched.
+            "trimmed_file": None,
+            "trim_seconds": trim_seconds,
+            "target_langs": langs,
+        }
+
+    # ── Synchronous submit (unchanged semantics) ──────────────────────
+    trimmed_path, err, code = await _materialize()
+    if err:
+        return JSONResponse(err, code)
+
+    job_ids = _create_jobs("queued", str(trimmed_path))
+    await _fan_out(job_ids, trimmed_path)
 
     log.info(f"[multidub] {batch_id}: enqueued {len(job_ids)} jobs "
              f"({_scope}, langs={langs})")
@@ -4695,6 +5358,7 @@ async def start_quick_test(
         "batch_kind": "quick_test",
         "job_ids": job_ids,
         "count": len(job_ids),
+        "background": False,
         "trimmed_file": f"/uploads/{trimmed_path.name}",
         "trim_seconds": trim_seconds,
         "target_langs": langs,
@@ -5340,8 +6004,8 @@ async def start_showcase(
             {"error": f"trim_seconds must be between 15 and 120 (got {trim_seconds})"}, 400)
 
     langs = [c.strip() for c in target_langs.split(",") if c.strip()]
-    if not (MIN_TARGET_LANGS <= len(langs) <= MAX_TARGET_LANGS):
-        return JSONResponse({"error": f"Pick {MIN_TARGET_LANGS}-{MAX_TARGET_LANGS} "
+    if not (MIN_SHOWCASE_LANGS <= len(langs) <= MAX_TARGET_LANGS):
+        return JSONResponse({"error": f"Pick {MIN_SHOWCASE_LANGS}-{MAX_TARGET_LANGS} "
                                       f"target languages (got {len(langs)})"}, 400)
     unknown = [c for c in langs if c not in _QUICK_TEST_KNOWN_LANGS]
     if unknown:
@@ -5352,17 +6016,9 @@ async def start_showcase(
     # Validate ollama model with fallback
     _ok, _installed = await check_ollama()
     if _ok and model not in _installed:
-        _preferred = ["aya-expanse:8b", "mistral-nemo:12b", "qwen2.5:14b",
-                      "qwen3:8b", "qwen2.5:7b", "gemma3:12b", "gemma3:4b",
-                      "llama3.2:3b", "qwen3:14b", "gemma4:e4b", "gemma4:e2b"]
-        _fallback = next((m for m in _preferred if m in _installed), None)
-        if _fallback:
-            log.warning(f"[showcase] '{model}' not installed; using '{_fallback}'")
-            model = _fallback
-        else:
-            return JSONResponse({
-                "error": "No translation model installed. Run: ollama pull aya-expanse:8b"
-            }, 400)
+        model, _model_err = _resolve_translation_model(model, _installed)
+        if _model_err:
+            return JSONResponse({"error": _model_err}, 400)
 
     # Shared reference (one upload, reused by all jobs)
     ref_path = ""
@@ -5383,20 +6039,27 @@ async def start_showcase(
             shutil.copyfileobj(video.file, f)
         src_label = video.filename
     else:
-        from pipeline.downloader import download_video
         url = source.strip()
         src_label = url[:60] + ("..." if len(url) > 60 else "")
         try:
             dl_dir = UPLOAD_DIR / f"sc_{uuid.uuid4().hex[:8]}"
             dl_dir.mkdir(parents=True, exist_ok=True)
-            src_path = Path(download_video(url, str(dl_dir)))
+            # In a thread, not inline: called directly inside this async
+            # handler it froze the entire event loop — every other request,
+            # including the UI's own polling — for the length of the
+            # download. (/api/quick_test had the same bug and goes further,
+            # returning before the download even starts; a showcase is
+            # trimmed to 15-120s and is not the consumer front door, so it
+            # keeps the simpler synchronous shape.)
+            src_path = Path(await asyncio.to_thread(
+                download_video, url, str(dl_dir)))
         except Exception as e:
             return JSONResponse({"error": f"Could not download URL: {e}"}, 400)
 
     # Trim
     trimmed_path = src_path.parent / f"{src_path.stem}_sc{trim_seconds}s.mp4"
     try:
-        _trim_video(src_path, trimmed_path, trim_seconds)
+        await asyncio.to_thread(_trim_video, src_path, trimmed_path, trim_seconds)
     except Exception as e:
         err_msg = ""
         if hasattr(e, "stderr") and getattr(e, "stderr", None):
@@ -5572,8 +6235,8 @@ async def redub_job(
     if mode == "single" and len(langs) != 1:
         return JSONResponse({"error": "mode=single requires exactly 1 language"}, 400)
     if mode in ("compare", "showcase") and not (
-            MIN_TARGET_LANGS <= len(langs) <= MAX_TARGET_LANGS):
-        return JSONResponse({"error": f"mode={mode} needs {MIN_TARGET_LANGS}-"
+            MIN_SHOWCASE_LANGS <= len(langs) <= MAX_TARGET_LANGS):
+        return JSONResponse({"error": f"mode={mode} needs {MIN_SHOWCASE_LANGS}-"
                                       f"{MAX_TARGET_LANGS} langs (got {len(langs)})"}, 400)
     unknown = [c for c in langs if c not in _QUICK_TEST_KNOWN_LANGS]
     if unknown:
@@ -5620,17 +6283,10 @@ async def redub_job(
     chosen_model = model or orig.get("model", "aya-expanse:8b")
     _ok, _installed = await check_ollama()
     if _ok and chosen_model not in _installed:
-        _preferred = ["aya-expanse:8b", "mistral-nemo:12b", "qwen2.5:14b",
-                      "qwen3:8b", "qwen2.5:7b", "gemma3:12b", "gemma3:4b",
-                      "llama3.2:3b", "qwen3:14b", "gemma4:e4b", "gemma4:e2b"]
-        _fallback = next((m for m in _preferred if m in _installed), None)
-        if _fallback:
-            log.warning(f"[redub] '{chosen_model}' not installed; using '{_fallback}'")
-            chosen_model = _fallback
-        else:
-            return JSONResponse({
-                "error": "No translation model installed",
-            }, 400)
+        chosen_model, _model_err = _resolve_translation_model(
+            chosen_model, _installed)
+        if _model_err:
+            return JSONResponse({"error": _model_err}, 400)
 
     # ── Build settings (inherit from original, accept overrides) ──────
     settings = {
@@ -6687,7 +7343,7 @@ STAGE_RETRY_OPTIONS = {
 # Statuses that mean "the pipeline currently owns this job" — retrying
 # under them would race the running stage over the same files.
 _BUSY_STATUSES = {
-    "queued", "running", "resuming", "downloading", "extracting",
+    "preparing", "queued", "running", "resuming", "downloading", "extracting",
     "transcribing", "diarizing", "translating", "synthesizing",
     "assembling", "merging",
 }
@@ -6889,6 +7545,69 @@ def build_stage_report(job_id: str) -> dict:
         "quality_overall": qual.get("overall"),
         "stages": stages,
         "notices": merge_notices(*[s["notices"] for s in stages]),
+    }
+
+
+def _read_user_glossary() -> dict:
+    """Raw contents of presets/user_glossary.json, or {} if absent/broken."""
+    if not USER_GLOSSARY_FILE.exists():
+        return {}
+    try:
+        with open(USER_GLOSSARY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        log.warning(f"[glossary] could not read for flags: {e}")
+        return {}
+
+
+@app.get("/api/dub/{job_id}/flags")
+async def get_job_flags(job_id: str, max_flags: int = 5):
+    """The handful of spans worth a human's attention before recording.
+
+    Recomputed on every call rather than stored, so it always reflects edits
+    already applied through /edit_translations — and so the heuristic in
+    pipeline/flags.py can be tuned without invalidating anything on disk.
+    An empty `flags` list is the expected result for a clean transcript.
+    """
+    job = jobs.get(job_id)
+    if not job:
+        return JSONResponse({"error": "Job not found"}, 404)
+    cp = _load_checkpoint(job_id, "translation_done")
+    if not cp:
+        return JSONResponse(
+            {"error": "No translation checkpoint yet — nothing to review"}, 404)
+
+    target_lang = cp.get("target_lang") or job.get("target_lang") or ""
+    source_lang = (cp.get("effective_src") or cp.get("source_lang")
+                   or job.get("source_lang") or "")
+    if source_lang == "auto":
+        source_lang = ""
+    try:
+        flags = flag_segments(
+            cp.get("segments") or [],
+            target_lang=target_lang,
+            source_lang=source_lang,
+            glossary=_read_user_glossary(),
+            # Not `max_flags or 5`: zero is a real request for none, and `0 or
+            # 5` would quietly answer it with the default five instead.
+            max_flags=max(0, min(int(max_flags), 20)),
+        )
+    except Exception as e:
+        log.warning(f"[flags] job={job_id} failed: {e}")
+        return JSONResponse({"error": f"Could not compute flags: {e}"}, 500)
+
+    return {
+        "job_id": job_id,
+        "target_lang": target_lang,
+        "source_lang": source_lang,
+        "count": len(flags),
+        "flags": flags,
+        # The original audio, for the review screen's "hear this bit" —
+        # #t=start,end on this file lands on the right moment because VAD
+        # writes its trimmed copy to a different name and segment times are
+        # remapped back to the original timeline.
+        "audio_url": f"/outputs/{job_id}/audio_16k.wav",
     }
 
 
@@ -8602,6 +9321,10 @@ async def set_glossary(body: str = Form(...)):
         with open(USER_GLOSSARY_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         total_terms = sum(len(d.get("terms", {})) for d in domains)
+        # The translator caches the flattened glossary for the life of the
+        # process. Without this the save is inert until a restart — which is
+        # exactly what "we'll remember this for future videos" must not mean.
+        clear_glossary_cache()
         log.info(f"[glossary] Saved {len(domains)} domain(s), {total_terms} term(s) total")
         return {
             "ok": True,
@@ -8613,6 +9336,118 @@ async def set_glossary(body: str = Form(...)):
         return JSONResponse({"error": str(e)}, 500)
 
 
+# One writer at a time. Per-term saves come from a review screen where the
+# user is confirming several terms in a row, and read-modify-write of a whole
+# JSON file from two overlapping requests loses one of them.
+_glossary_write_lock = asyncio.Lock()
+
+# Domain a per-term save lands in when the caller does not name one. Kept
+# separate from hand-authored domains so a user editing the JSON by hand can
+# see which entries the review screen created.
+_GLOSSARY_REVIEW_DOMAIN = "creator-review"
+
+# A glossary entry is a word or a short phrase somebody confirmed on a review
+# card. These caps are far above anything real and far below anything that
+# could crowd out a translation prompt.
+_GLOSSARY_MAX_TERM = 200
+_GLOSSARY_MAX_DOMAIN = 64
+# Domain names become JSON keys and are shown in the Settings editor. No
+# traversal is possible through a dict key, but there is no reason to store
+# "../../etc/passwd" either.
+_GLOSSARY_DOMAIN_RE = re.compile(r"^[\w .\-]{1,64}$", re.UNICODE)
+
+
+@app.post("/api/glossary/term")
+async def set_glossary_term(term: str = Form(""),
+                            translation: str = Form(""),
+                            target_lang: str = Form(""),
+                            domain: str = Form("")):
+    """Merge one term into the glossary, server-side.
+
+    The review screen saves terms one at a time. POST /api/glossary is a
+    whole-file replace, so doing this from the browser would mean
+    read-modify-write across the network — two confirmations in quick
+    succession and one silently loses. The merge happens here instead, under
+    a lock, and the translator's cache is cleared so the *next* language of
+    the same batch actually picks the decision up.
+    """
+    # Form("") rather than Form(...): a missing or blank field is a plain
+    # mistake with a readable answer, and Form(...) made FastAPI answer it
+    # with a 422 pydantic blob before any of the messages below could run.
+    term = (term or "").strip()
+    translation = (translation or "").strip()
+    lang = (target_lang or "").strip().lower()
+    if not term or not translation:
+        return JSONResponse({"error": "term and translation are required"}, 400)
+    if not lang:
+        return JSONResponse({"error": "target_lang is required"}, 400)
+    if lang not in _QUICK_TEST_KNOWN_LANGS:
+        return JSONResponse({"error": f"Unknown language code: {lang}"}, 400)
+    # Bounds, because every term here is rendered into the prompt of every
+    # later translation for this language (_glossary_block, 60-term budget).
+    # An unbounded term is a way to corrupt translations, not just to fill
+    # a disk — and nothing a human confirms on a review card is this long.
+    if len(term) > _GLOSSARY_MAX_TERM:
+        return JSONResponse(
+            {"error": f"Term is too long ({len(term)} characters, "
+                      f"maximum {_GLOSSARY_MAX_TERM})."}, 400)
+    if len(translation) > _GLOSSARY_MAX_TERM:
+        return JSONResponse(
+            {"error": f"Translation is too long ({len(translation)} "
+                      f"characters, maximum {_GLOSSARY_MAX_TERM})."}, 400)
+    domain_name = (domain or "").strip() or _GLOSSARY_REVIEW_DOMAIN
+    if len(domain_name) > _GLOSSARY_MAX_DOMAIN or not _GLOSSARY_DOMAIN_RE.match(
+            domain_name):
+        return JSONResponse(
+            {"error": "Domain must be 1-64 characters of letters, digits, "
+                      "spaces, dots, dashes or underscores."}, 400)
+
+    async with _glossary_write_lock:
+        data = _read_user_glossary() or {}
+        domains = data.get("domains")
+        if not isinstance(domains, list):
+            domains = []
+        target = None
+        for d in domains:
+            if (isinstance(d, dict) and d.get("name") == domain_name
+                    and (d.get("target_lang") or "").lower() == lang):
+                target = d
+                break
+        if target is None:
+            target = {"name": domain_name, "triggers": [],
+                      "target_lang": lang, "terms": {}}
+            domains.append(target)
+        if not isinstance(target.get("terms"), dict):
+            target["terms"] = {}
+        previous = target["terms"].get(term)
+        target["terms"][term] = translation
+        data["domains"] = domains
+
+        USER_GLOSSARY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = USER_GLOSSARY_FILE.with_suffix(".json.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, USER_GLOSSARY_FILE)
+        except Exception as e:
+            tmp.unlink(missing_ok=True)
+            return JSONResponse({"error": str(e)}, 500)
+        clear_glossary_cache(lang)
+
+    log.info(f"[glossary] {domain_name}/{lang}: {term!r} -> {translation!r}"
+             + (f" (was {previous!r})" if previous else ""))
+    return {
+        "ok": True,
+        "term": term,
+        "translation": translation,
+        "target_lang": lang,
+        "domain": domain_name,
+        "replaced": previous,
+        "total_terms": sum(len(d.get("terms", {})) for d in domains
+                           if isinstance(d, dict)),
+    }
+
+
 @app.delete("/api/glossary")
 async def delete_glossary():
     """Remove the user glossary file entirely. Built-in BJJ terms still
@@ -8620,6 +9455,7 @@ async def delete_glossary():
     if USER_GLOSSARY_FILE.exists():
         try:
             USER_GLOSSARY_FILE.unlink()
+            clear_glossary_cache()
             log.info("[glossary] User glossary file removed")
             return {"ok": True}
         except Exception as e:
@@ -8663,6 +9499,24 @@ async def cancel_job(job_id: str):
         save_job(j)
         log.info(f"[scheduler] Job {job_id} cancelled before scheduled start")
         return {"ok": True, "cancelled_from": "scheduled"}
+
+    if status == "preparing":
+        # Its source is still downloading in a background task. Flip the
+        # status now rather than waiting for that to finish: _fan_out skips
+        # anything already cancelled, so the job will never start, and
+        # "cancelled" is terminal, so the card stops claiming to be working
+        # and bulk delete will take it. Same shape as "scheduled" above.
+        #
+        # The download itself keeps running — yt-dlp is a blocking
+        # subprocess inside a worker thread with no cancellation channel —
+        # but nothing waits on it and _prepare discards the file if every
+        # sibling in the batch is gone.
+        j["status"] = "cancelled"
+        j["cancel_requested"] = True
+        j["step_detail"] = "Cancelled while preparing"
+        save_job(j)
+        log.info(f"[multidub] Job {job_id} cancelled while preparing")
+        return {"ok": True, "cancelled_from": "preparing"}
 
     if status == "queued":
         # Drain queue, drop target job, push rest back. asyncio.Queue
@@ -8714,7 +9568,8 @@ async def delete_job(job_id: str):
 # Statuses whose output directory is being written to right now. Deleting one
 # rmtree's the directory out from under a live ffmpeg or TTS worker, which
 # fails the job in a way that looks like a pipeline bug rather than a deletion.
-_UNDELETABLE_STATUSES = {"running", "processing", "queued", "downloading"}
+_UNDELETABLE_STATUSES = {"running", "processing", "queued", "downloading",
+                         "preparing"}
 
 
 @app.post("/api/jobs/bulk_delete")
@@ -8960,12 +9815,36 @@ async def cleanup_storage(
     }
 
 
+# The keys a job list actually needs to render a card. The rest of a job
+# dict is dead weight on a poll: _strip_large_fields (app/db.py) drops the
+# transcript but not meta["description"], which curate_metadata caps at
+# 10,000 characters — per job, on every request.
+_COMPACT_JOB_KEYS = (
+    "id", "status", "progress", "step_detail", "error",
+    "target_lang", "source_label", "title", "duration",
+    "created", "started_at", "completed_at",
+    "batch_id", "batch_label", "batch_kind", "batch_position", "batch_total",
+    "output_url", "srt_url",
+    "has_checkpoint", "latest_checkpoint_stage",
+)
+_COMPACT_META_KEYS = ("title", "thumbnail", "duration", "channel", "webpage_url")
+
+
+def _compact_job(job: dict) -> dict:
+    out = {k: job[k] for k in _COMPACT_JOB_KEYS if k in job}
+    meta = job.get("meta") or {}
+    if isinstance(meta, dict):
+        out["meta"] = {k: meta[k] for k in _COMPACT_META_KEYS if k in meta}
+    return out
+
+
 @app.get("/api/jobs")
 async def list_jobs(
     status: str | None = None,
     batch_id: str | None = None,
     limit: int = 0,
     since: float = 0,
+    compact: bool = False,
 ):
     # Annotate each job with checkpoint info so the History UI can
     # decide whether to show a Resume button. This is intentionally
@@ -8986,7 +9865,8 @@ async def list_jobs(
     for j in sorted_jobs:
         info = _job_checkpoint_info(j["id"])
         # Shallow-copy so we don't mutate the in-memory job store
-        enriched.append({**j, **info})
+        row = {**j, **info}
+        enriched.append(_compact_job(row) if compact else row)
     return {"jobs": enriched}
 
 
@@ -9000,7 +9880,18 @@ async def list_supported_languages():
     is unavailable. The CLI/MCP `languages` listing reads this instead of
     hardcoding a stale subset.
     """
-    return {"languages": list(EdgeTTSFallback.VOICE_MAP.keys())}
+    codes = list(EdgeTTSFallback.VOICE_MAP.keys())
+    # `languages` stays a bare code list — tools/gochidubb_client.py returns
+    # it verbatim and the CLI joins it into a string, so changing its shape
+    # would break both. Names are added alongside, read from the translator's
+    # LANGUAGE_NAMES rather than copied, so a newly registered language shows
+    # up here without a second list to remember to update.
+    names = {c: LANGUAGE_NAMES.get(c, c) for c in codes}
+    return {
+        "languages": codes,
+        "names": names,
+        "catalog": [{"code": c, "name": names[c]} for c in codes],
+    }
 
 
 @app.get("/api/download/{job_id}")
@@ -9013,14 +9904,83 @@ async def download(job_id: str):
     return FileResponse(path, filename=f"dubbed_{job_id}.mp4")
 
 
+# ── Which front door ─────────────────────────────────────────────────
+# Creator mode and Pro mode are two surfaces on the same account, the same
+# jobs table and the same meter — a mode, not a tier. GET / honours a
+# preference between them, and every failure mode of reading that preference
+# resolves to Pro, which is what this route has always served. An existing
+# user must never be stranded on a page they did not ask for by a missing
+# file, an unreadable one, or a value nobody wrote.
+
+def _ui_mode() -> str:
+    """"creator" only on an explicit, readable preference; "pro" otherwise."""
+    try:
+        if not PREFS_FILE.exists():
+            return "pro"
+        with open(PREFS_FILE, "r", encoding="utf-8") as f:
+            prefs = json.load(f)
+        if isinstance(prefs, dict) and prefs.get("ui_mode") == "creator":
+            # A preference pointing at a page that is not on disk would be a
+            # blank screen with no way back except knowing /pro exists.
+            if (STATIC_DIR / "creator.html").exists():
+                return "creator"
+            log.warning("[ui] ui_mode=creator but static/creator.html is "
+                        "missing — serving Pro mode")
+    except Exception as e:
+        log.warning(f"[ui] could not read ui_mode preference ({e}) — "
+                    f"serving Pro mode")
+    return "pro"
+
+
 @app.get("/")
 async def index():
+    if _ui_mode() == "creator":
+        return FileResponse(str(STATIC_DIR / "creator.html"))
+    return FileResponse(str(STATIC_DIR / "index.html"))
+
+
+@app.get("/pro")
+async def pro_index():
+    """Pro mode, unconditionally — the escape hatch.
+
+    Never redirects and never reads the preference: if someone's preference
+    is wrong, or the creator page is broken, this is how they get their tool
+    back. /creator is unconditional in the same way, in the other direction.
+    """
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
 # ── Stage reuse (beta) ───────────────────────────────────────────────
 # Kept on their own /api/beta/ prefix and served by their own page, so the
 # feature can be evaluated — or removed — without touching the main UI.
+
+@app.get("/creator")
+async def creator_index():
+    """Creator mode — the consumer front door.
+
+    Its own page rather than a mode inside index.html: that page loads React
+    and Babel from a CDN and transpiles ~6,000 lines of JSX in the browser on
+    every load, which is the wrong first paint for the screen a new user
+    lands on.
+
+    Unconditional, like /pro: it serves creator.html whatever the stored
+    preference says, so each mode always has a direct address that works.
+    """
+    return FileResponse(str(STATIC_DIR / "creator.html"))
+
+
+@app.get("/admin")
+async def admin_index():
+    """The vendor admin console — the design's `3a` screens.
+
+    Unconditional, like /pro and /creator. It is a separate surface from the
+    customer workspace (in the design, a separate host behind staff SSO), so
+    it gets its own address rather than a tab inside either mode: a page that
+    reads the revenue estimate, every API key and the audit trail should not
+    be one mis-click away from the screen a creator uses.
+    """
+    return FileResponse(str(STATIC_DIR / "admin.html"))
+
 
 @app.get("/beta")
 async def beta_index():

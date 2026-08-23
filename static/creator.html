@@ -1,0 +1,1646 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>Creator mode · GoChiDUBB</title>
+<!-- No CDN. index.html pulls React, Babel and Google Fonts from unpkg, which
+     means Pro mode does not work offline in a product whose pitch is that
+     everything runs on your machine. This page is the front door; it must
+     paint with nothing but the server that serves it. Geist is used when the
+     machine has it and falls back to the system UI face when it does not. -->
+<link rel="stylesheet" href="/static/creator.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header id="topbar"></header>
+<main id="main" tabindex="-1"></main>
+<div id="live" role="status" aria-live="polite" class="sr-only"></div>
+<div id="sticky"></div>
+
+<script>
+"use strict";
+
+// ═══════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════
+
+const $ = (s, root) => (root || document).querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => (
+  {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+/** 743 -> "12:23"; used for source length. */
+function fmtDur(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m >= 60) return `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+/** Spoken duration, for copy: "about 20 minutes". */
+function fmtAbout(sec) {
+  sec = Math.max(0, Math.round(Number(sec) || 0));
+  if (sec < 90) return "about a minute";
+  const m = Math.round(sec / 60);
+  if (m < 60) return `about ${m} minute${m === 1 ? "" : "s"}`;
+  const h = Math.floor(m / 60), rest = m % 60;
+  if (!rest) return `about ${h} hour${h === 1 ? "" : "s"}`;
+  return `about ${h}h ${rest}m`;
+}
+const money = n => "$" + (Number(n) || 0).toFixed(2);
+// Per-minute rates are published to three decimals ($0.065). Rendering them
+// through money() rounds that to $0.07 — a price that does not exist.
+const rateStr = n => "$" + (Number(n) || 0).toFixed(3).replace(/0$/, "");
+
+// Display names come from GET /api/languages (`names`), which reads
+// pipeline/translator.py::LANGUAGE_NAMES. CLAUDE.md is explicit that there is
+// one place every dubbable language is registered; a second list here would be
+// a copy to keep in sync, so there isn't one. A code with no name shows as the
+// code, which is what the pipeline does too.
+const langName = c => (state.langNames[c] || String(c || "").toUpperCase());
+
+// The chips the wizard offers before "+ N more". Kept short on purpose —
+// a 65-item wall is the opposite of picking sane defaults.
+const POPULAR = ["es", "pt", "fr", "de", "ja", "hi", "id", "ar"];
+
+// Status vocabulary from server.py, collapsed into the four states a creator
+// can act on. Anything not listed is mid-pipeline, i.e. "running".
+const S_DONE = new Set(["complete"]);
+const S_ATTN = new Set(["awaiting_translation_review"]);
+const S_FAIL = new Set(["error", "cancelled", "interrupted"]);
+// Stopped, not queued: a paused job will never resume on its own, so it must
+// not be drawn as if the machine is going to get to it. Its own state, with
+// its own way out — see reviewable().
+const S_STOP = new Set(["paused"]);
+const S_WAIT = new Set(["queued", "scheduled", "uploaded", "preparing"]);
+
+function jobState(j) {
+  const s = j.status || "";
+  if (S_DONE.has(s)) return "done";
+  if (S_ATTN.has(s)) return "attn";
+  if (S_FAIL.has(s)) return "fail";
+  if (S_STOP.has(s)) return "stopped";
+  if (S_WAIT.has(s)) return "wait";
+  return "run";
+}
+
+/** Jobs the review screen can actually act on. Everything else that reaches
+ *  #/review/<id> — a finished job, a failed one, one still running — gets a
+ *  screen describing what it is, never a live record button. */
+const reviewable = j => !!j && (S_ATTN.has(j.status || "") || S_STOP.has(j.status || ""));
+const isActive = j => { const k = jobState(j); return k !== "done" && k !== "fail"; };
+// Narrower than isActive: a job the server will move on its own. A job that
+// is paused or waiting for the creator's OK will never change while we watch
+// it, and polling for one is a request every four seconds forever.
+const isMoving = j => jobState(j) === "run"
+  || ["queued", "scheduled", "uploaded", "preparing"].includes(j.status || "");
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let body = null;
+  try { body = await r.json(); } catch (_) { /* non-JSON error page */ }
+  if (!r.ok) {
+    const err = new Error((body && (body.error || body.detail)) || `${r.status} ${r.statusText}`);
+    err.status = r.status;
+    err.body = body;
+    throw err;
+  }
+  return body;
+}
+
+/** A request that never reached the server at all — fetch rejected, so there
+ *  is no HTTP status. Distinct from a server that answered with an error:
+ *  this one means the app on this machine is down, and the only honest thing
+ *  to draw is "can't reach it", never a cached or invented figure. */
+const isOffline = e => !!e && e.status === undefined;
+
+// ═══════════════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════════════
+
+const state = {
+  route: { name: "home", param: "" },
+  loading: true,
+  error: "",
+  jobs: [],
+  usage: null,
+  languages: [],
+  langNames: {},
+  voices: [],
+  filter: "all",
+  offline: false,
+  langsOpen: false,
+  notify: false,
+  model: "",
+  wizard: null,
+  review: null,
+};
+
+function newWizard() {
+  return {
+    step: 1,
+    url: "",
+    file: null,
+    fileDur: 0,
+    meta: null,            // {title, thumbnail, channel, duration_sec}
+    langs: ["es", "pt", "ja"],
+    voiceKind: "mine",     // "mine" | "pro"
+    preset: "",            // voice_preset id
+    refFile: null,         // uploaded reference clip
+    review: true,          // "Let me check the translation first" — ON by default
+    estimate: null,
+    estimating: false,
+    submitting: false,
+    error: "",       // a request that failed
+    gateError: "",   // a 200 that refused the video (too long for this server)
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Data loading
+// ═══════════════════════════════════════════════════════════════════
+
+async function loadJobs() {
+  // compact=1 is being added server-side; an older server ignores the param
+  // and simply returns the fat rows.
+  const d = await api("/api/jobs?limit=80&compact=1");
+  state.jobs = (d.jobs || []).filter(j => (j.batch_kind || "") !== "showcase");
+}
+
+async function loadUsage() {
+  // On-demand only. /api/billing/usage walks every output dir — never poll it.
+  state.usage = await api("/api/billing/usage?window_days=30");
+}
+
+async function loadLanguages() {
+  const d = await api("/api/languages");
+  // `catalog` is the ordered [{code, name}] list; `names` is the same data as
+  // a map; `languages` is the bare-code list every older client reads. Any one
+  // of the three is enough to render the chips.
+  const catalog = Array.isArray(d.catalog) ? d.catalog : null;
+  state.languages = catalog ? catalog.map(x => x.code) : (d.languages || []);
+  state.langNames = { ...(d.names || {}) };
+  if (catalog) for (const x of catalog) if (x && x.name) state.langNames[x.code] = x.name;
+}
+
+/** Which translation model to name on the submit.
+ *
+ *  /api/quick_test defaults to "aya-expanse:8b" and validates it against the
+ *  models the configured backend reports. On an LM Studio install those ids
+ *  are spelled differently ("aya-expanse-8b"), nothing in the server's
+ *  Ollama-shaped preference list matches, and every submit is refused with
+ *  "No translation model installed" — which a creator can do nothing about,
+ *  because Creator mode deliberately has no model picker. So: if the server
+ *  reports a list, pick from it silently; if it reports none (an Ollama
+ *  install, where /api/lm_studio/models returns []), send nothing and let the
+ *  server's own default and fallback chain do the choosing.
+ */
+const _MODEL_PREFS = ["aya-expanse", "aya", "qwen3", "qwen2.5", "gemma", "mistral", "llama"];
+
+async function loadModels() {
+  try {
+    const d = await api("/api/lm_studio/models");
+    const usable = (d.models || []).filter(m => m && !/embed/i.test(m));
+    for (const want of _MODEL_PREFS) {
+      const hit = usable.find(m => m.toLowerCase().includes(want));
+      if (hit) { state.model = hit; return; }
+    }
+    state.model = usable[0] || "";
+  } catch (_) {
+    state.model = "";   // server picks
+  }
+}
+
+async function loadVoices() {
+  const d = await api("/api/voice_presets");
+  state.voices = d.presets || [];
+}
+
+async function bootstrap() {
+  try {
+    await Promise.all([loadJobs(), loadUsage(), loadLanguages(), loadVoices(), loadModels()]);
+  } catch (e) {
+    state.offline = isOffline(e);
+    state.error = state.offline ? "" : (e.message || String(e));
+  }
+  state.loading = false;
+  render();
+  schedulePoll();
+}
+
+// ── Polling: only while something is actually running ──────────────
+
+let pollTimer = 0;
+function schedulePoll() {
+  clearTimeout(pollTimer);
+  if (state.route.name !== "home") return;
+  if (!state.jobs.some(isMoving)) return;
+  pollTimer = setTimeout(async () => {
+    const before = new Map(state.jobs.map(j => [j.id, j.status]));
+    try {
+      await loadJobs();
+      announceCompletions(before);
+      state.offline = false;
+      if (state.route.name === "home") render();
+    } catch (e) {
+      // The poll doubles as a liveness check, so the banner appears and
+      // clears itself without the creator having to reload anything.
+      state.offline = isOffline(e);
+      if (state.route.name === "home") render();
+    }
+    schedulePoll();
+  }, 4000);
+}
+
+function announceCompletions(before) {
+  for (const j of state.jobs) {
+    const was = before.get(j.id);
+    if (was && was !== "complete" && j.status === "complete") {
+      const msg = `${langName(j.target_lang)} is ready for "${groupTitle({ jobs: [j] })}".`;
+      $("#live").textContent = msg;
+      if (state.notify && "Notification" in window && Notification.permission === "granted") {
+        try { new Notification("Your dub is ready", { body: msg }); } catch (_) {}
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Grouping — one card per video, one chip per language
+// ═══════════════════════════════════════════════════════════════════
+
+function groups() {
+  const by = new Map();
+  for (const j of state.jobs) {
+    const key = j.batch_id || j.id;
+    if (!by.has(key)) by.set(key, { key, jobs: [] });
+    by.get(key).jobs.push(j);
+  }
+  const out = [...by.values()];
+  for (const g of out) {
+    g.jobs.sort((a, b) => (a.batch_position || 0) - (b.batch_position || 0));
+    const first = g.jobs[0];
+    g.created = Math.max(...g.jobs.map(j => j.created || 0));
+    g.duration = first.duration || 0;
+    g.thumb = (first.meta && first.meta.thumbnail) || "";
+    g.done = g.jobs.filter(j => jobState(j) === "done").length;
+    g.attn = g.jobs.filter(j => jobState(j) === "attn");
+    g.stopped = g.jobs.filter(j => jobState(j) === "stopped");
+    // Both states are dead ends until the creator does something, and the
+    // same screen is the way out of both.
+    g.needsYou = g.attn.concat(g.stopped);
+    g.failed = g.jobs.filter(j => jobState(j) === "fail").length;
+    // A background download that failed leaves a red chip and no reason
+    // unless we say it. Trimmed — the full traceback is Pro mode's job.
+    const firstErr = g.jobs.find(j => jobState(j) === "fail" && j.error);
+    g.failReason = firstErr ? tidyError(firstErr.error) : "";
+    g.running = g.jobs.find(j => jobState(j) === "run") || null;
+    g.active = g.jobs.some(isActive);
+    // One progress story for the whole video, not eight stage names.
+    g.progress = Math.round(
+      g.jobs.reduce((a, j) => a + (jobState(j) === "done" ? 100 : clamp(j.progress || 0, 0, 99)), 0) / g.jobs.length);
+  }
+  out.sort((a, b) => b.created - a.created);
+  return out;
+}
+
+/** Pipeline errors are written for whoever is reading the log, and they carry
+ *  shell commands, model ids and stage names. Rather than stripping known
+ *  prefixes — a list that is always one new error message behind — nothing
+ *  reaches the screen unless it matches something we have deliberately worded
+ *  for a creator. Anything unrecognised falls back to the generic line.
+ */
+const _ERROR_MESSAGES = [
+  [/unavailable|private video|removed|age.?restrict|sign in to confirm|members.only|not available in your/i,
+   "We couldn't get that video — it may be private, removed, or blocked where you are."],
+  [/could not download|download failed|unsupported url|no video formats|http error [45]\d\d/i,
+   "We couldn't download that video. Check the link and try again."],
+  [/translation .*(failed|source language)|no translation model|ollama|lm.?studio/i,
+   "The translation didn't come through, so nothing was recorded. Worth trying again."],
+  [/interrupted by server (restart|shutdown)|stale.from.restart/i,
+   "This stopped when the app restarted. Start it again whenever you're ready."],
+  [/cancelled|canceled/i, "You stopped this one."],
+  [/out of memory|cuda|vram|allocat/i,
+   "This machine ran out of memory part-way through. A shorter video usually gets through."],
+  [/no space left|disk (full|space)/i, "This machine ran out of disk space."],
+  [/timed out|timeout/i, "This took too long and stopped."],
+  [/no speech|no audio|silent/i, "We couldn't find any speech in that video."],
+];
+
+function tidyError(raw) {
+  const t = String(raw || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  for (const [re, msg] of _ERROR_MESSAGES) if (re.test(t)) return msg;
+  return "Something went wrong with this one.";
+}
+
+function groupTitle(g) {
+  const j = g.jobs[0];
+  // source_label before batch_label: a card here is one video, and the batch
+  // label is often the server's own ("Quick test · 60s · 6 langs") — machine
+  // vocabulary the creator never chose, for a thing they think of by its name.
+  const t = (j.meta && j.meta.title) || j.source_label || j.batch_label || "Untitled video";
+  // "<title> -> JA" is how quick_test labels siblings and "-> ZH [redub]" is
+  // what a redub adds on top; they stack, so strip the whole repeated tail.
+  return prettyTitle(String(t).replace(/(\s*->\s*[A-Za-z-]{2,7}(?:\s*\[redub\])?)+$/, ""));
+}
+
+/** Jobs started before metadata was curated fall back to source_label, which
+ *  is a raw URL or an absolute path. Neither is a title a creator recognises. */
+function prettyTitle(t) {
+  if (/^https?:\/\//i.test(t)) {
+    try {
+      const u = new URL(t);
+      const id = u.searchParams.get("v") || u.pathname.split("/").filter(Boolean).pop() || "";
+      return `${u.hostname.replace(/^www\./, "")}${id ? " · " + id : ""}`;
+    } catch (_) { /* fall through */ }
+  }
+  if (t.includes("/") || t.includes("\\")) t = t.split(/[/\\]/).filter(Boolean).pop() || t;
+  // yt-dlp names its output "<the real title> [<videoId>].<container>". Both of
+  // those tails are ours, not the creator's — a bracketed id and a container
+  // extension are plumbing on a screen whose first rule is no jargon. Only
+  // strip the extension when something is left, so "test.webm" stays itself
+  // rather than becoming "test" for a file the creator actually named that.
+  const stripped = t.replace(/\s*\[[A-Za-z0-9_-]{6,}\]\s*(\.[A-Za-z0-9]{2,5})?$/, "");
+  return stripped.trim() || t;
+}
+
+function thumbHTML(g, big) {
+  const cls = "thumb" + (big ? " thumb--lg" : "");
+  const sliver = g.active && g.progress > 0
+    ? `<i class="thumb__sliver" style="width:${g.progress}%"></i>` : "";
+  if (g.thumb) {
+    return `<div class="${cls}"><img src="${esc(g.thumb)}" alt="" loading="lazy">${sliver}</div>`;
+  }
+  return `<div class="${cls}"><span class="thumb__glyph" aria-hidden="true">▶</span>${sliver}</div>`;
+}
+
+/** A language chip that pairs colour with a glyph — colour is never alone. */
+function langChip(j) {
+  const k = jobState(j);
+  const name = langName(j.target_lang);
+  if (k === "done") return `<span class="chip chip--ok"><span class="chip__glyph" aria-hidden="true">✓</span>${esc(name)}<span class="sr-only"> — ready</span></span>`;
+  if (k === "attn") return `<span class="chip chip--warn"><span class="chip__glyph" aria-hidden="true">!</span>${esc(name)}<span class="sr-only"> — needs your OK</span></span>`;
+  if (k === "fail") return `<span class="chip chip--bad"><span class="chip__glyph" aria-hidden="true">✕</span>${esc(name)}<span class="sr-only"> — did not finish</span></span>`;
+  if (k === "stopped") return `<span class="chip chip--warn"><span class="chip__glyph" aria-hidden="true">⏸</span>${esc(name)}<span class="sr-only"> — stopped, needs you to pick it up</span></span>`;
+  if (k === "run") return `<span class="chip"><span class="chip__glyph" aria-hidden="true">•••</span>${esc(name)}<span class="sr-only"> — in progress</span></span>`;
+  return `<span class="chip"><span class="chip__glyph" aria-hidden="true">·</span>${esc(name)}<span class="sr-only"> — waiting its turn</span></span>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Chrome
+// ═══════════════════════════════════════════════════════════════════
+
+function topbarHTML() {
+  if (state.route.name === "new") return wizardBarHTML();
+  if (state.route.name === "review") return reviewBarHTML();
+
+  const mins = state.usage ? Math.round(state.usage.minutes) : null;
+  const tab = (href, label, name) =>
+    `<a class="tab" href="${href}"${state.route.name === name ? ' aria-current="page"' : ""}>${label}</a>`;
+  return `<div class="topbar">
+    <a class="brand" href="#/" aria-label="GoChiDUBB — your videos"><span class="logo" aria-hidden="true">gd</span>
+      <span class="wordmark">GoChiDUBB</span></a>
+    <nav class="tabs" aria-label="Sections">
+      ${tab("#/", "My videos", "home")}
+      ${tab("#/voices", "Voices", "voices")}
+      ${tab("#/usage", "Plan &amp; usage", "usage")}
+    </nav>
+    <div class="topbar__right">
+      ${mins !== null ? `<span class="usage-note">${mins} min dubbed this month</span>` : ""}
+      <a class="btn btn--primary" href="#/new"><span aria-hidden="true">＋</span> Dub a video</a>
+    </div>
+  </div>`;
+}
+
+function mobileTabsHTML() {
+  const tab = (href, label, name) =>
+    `<a class="tab" href="${href}"${state.route.name === name ? ' aria-current="page"' : ""}>${label}</a>`;
+  return `<nav class="tabs tabs--mobile" aria-label="Sections">
+    ${tab("#/", "My videos", "home")}
+    ${tab("#/voices", "Voices", "voices")}
+    ${tab("#/usage", "Plan &amp; usage", "usage")}
+  </nav>`;
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+// Screen 1 — Creator home
+// ═══════════════════════════════════════════════════════════════════
+
+function homeHTML() {
+  if (state.loading) return `<div class="shell"><p class="muted">Loading your videos…</p></div>`;
+  // An empty job list because the server is down is not the same as an empty
+  // job list because you haven't dubbed anything, and "No videos yet" during
+  // an outage reads as data loss.
+  if (state.offline && !state.jobs.length) return offlineHTML();
+
+  const all = groups();
+  const active = all.filter(g => g.active);
+  const shown = all.filter(g =>
+    state.filter === "all" ? true :
+    state.filter === "ready" ? g.done === g.jobs.length :
+    g.active);
+
+  const filterBtn = (v, label) =>
+    `<button type="button" class="filter" data-act="filter" data-v="${v}"
+      aria-pressed="${state.filter === v}">${label}</button>`;
+
+  return `<div class="shell">
+    ${mobileTabsHTML()}
+    ${state.offline ? `<p class="banner banner--bad"><span aria-hidden="true">✕</span>
+      <span><strong>Lost contact with GoChiDUBB.</strong> What's on this page is
+      the last thing we saw, so it may be out of date. We'll keep trying.</span></p>` : ""}
+    ${state.error ? `<p class="banner banner--bad">${esc(state.error)}</p>` : ""}
+
+    <div class="home-top">
+      ${active.length ? activeCardHTML(active[0]) : idleCardHTML(all)}
+      ${spendHTML()}
+    </div>
+
+    <div class="section-head">
+      <h2>Your videos</h2>
+      <div class="filters" role="group" aria-label="Filter videos">
+        ${filterBtn("all", "All")}${filterBtn("ready", "Ready")}${filterBtn("active", "In progress")}
+      </div>
+    </div>
+
+    ${all.length === 0 ? `<div class="card empty">
+        <p><strong>No videos yet.</strong></p>
+        <p class="muted">Paste a YouTube link or drop a file and pick the languages you want.</p>
+        <a class="btn btn--primary btn--lg" href="#/new"><span aria-hidden="true">＋</span> Dub a video</a>
+      </div>` : `<div class="grid">
+        ${shown.map(videoCardHTML).join("")}
+        <a class="newtile" href="#/new">
+          <span class="newtile__plus" aria-hidden="true">＋</span>
+          <span class="newtile__label">Dub a video</span>
+          <span class="muted">paste a link or drop a file</span>
+        </a>
+      </div>`}
+
+    <div class="autodub">
+      <div>
+        <strong>Auto-dub new uploads</strong>
+        <p>Connect your channel and every new video gets your languages automatically.
+           You approve before anything publishes.</p>
+      </div>
+      <span class="chip chip--warn" style="margin-left:auto"><span class="chip__glyph" aria-hidden="true">◷</span>Not available yet</span>
+      <button type="button" class="btn" disabled>Connect channel</button>
+    </div>
+  </div>`;
+}
+
+/** The whole screen when we could not reach the server at all. Deliberately
+ *  shows no jobs, no minutes and no dollar figure: during an outage we know
+ *  nothing, and a confident number would be invented. */
+function offlineHTML() {
+  return `<div class="shell">
+    ${mobileTabsHTML()}
+    <section class="card empty">
+      <p><strong>Can't reach GoChiDUBB.</strong></p>
+      <p class="muted">The app on this machine isn't answering. Nothing has been
+        lost — your videos and voices are on disk, and anything that was
+        recording keeps going. This page will keep trying.</p>
+      <button type="button" class="btn btn--primary btn--lg" data-act="retry">Try again</button>
+    </section>
+  </div>`;
+}
+
+function activeCardHTML(g) {
+  const doneNames = g.jobs.filter(x => jobState(x) === "done").map(x => langName(x.target_lang));
+  const needsReview = g.attn.length > 0;
+  const j = g.running || g.attn[0] || g.stopped[0] || g.jobs[0];
+  // Every mid-pipeline status collapses into one sentence — no stage names.
+  // "preparing" is the exception worth naming: with background=1 the jobs
+  // exist before the video has been fetched, and "waiting its turn" would be
+  // a lie about what is happening.
+  const preparing = g.jobs.some(x => x.status === "preparing");
+  const stopped = g.stopped.length ? g.stopped[0] : null;
+  const headline = needsReview
+    ? `Ready for your OK on ${langName(g.attn[0].target_lang)}`
+    : stopped
+      ? `${langName(stopped.target_lang)} is stopped`
+      : preparing
+        ? "Fetching your video…"
+        : jobState(j) === "wait"
+          ? `${langName(j.target_lang)} is waiting its turn`
+          : `Making your ${langName(j.target_lang)} voice…`;
+
+  return `<section class="card active-card" aria-label="Video in progress">
+    <div class="active-row">
+      ${thumbHTML(g)}
+      <div style="min-width:0;flex:1">
+        <p class="active-title">${needsReview ? "" : '<span class="dot" aria-hidden="true"></span>'}${esc(headline)}</p>
+        <p class="active-sub">${esc(groupTitle(g))}${
+          doneNames.length ? ` · ${esc(doneNames.join(" and "))} already done` : ""}</p>
+      </div>
+    </div>
+    <div class="bar" role="progressbar" aria-label="Progress for ${esc(groupTitle(g))}"
+         aria-valuenow="${g.progress}" aria-valuemin="0" aria-valuemax="100"><i style="width:${g.progress}%"></i></div>
+    <div class="spread">
+      <p class="muted" style="font-size:12.5px">
+        ${needsReview
+          ? "Paused until you take a look — nothing has been recorded yet."
+          : stopped
+            ? "Stopped part-way. It won't start again on its own."
+            : "You can close this page — it keeps running."}
+        ${g.jobs.length > 1 && !stopped ? " Languages record one after another." : ""}
+      </p>
+      <div class="rowflex">
+        ${(stopped || needsReview) ? "" : notifyBtnHTML()}
+        ${needsReview
+          ? `<a class="btn btn--primary" href="#/review/${esc(g.attn[0].id)}">Review it →</a>`
+          : stopped
+            ? `<a class="btn btn--primary" href="#/review/${esc(stopped.id)}">Pick it back up →</a>`
+            : (doneNames.length ? `<a class="btn" href="${esc(g.jobs.find(x => jobState(x) === "done").output_url || "#")}" target="_blank" rel="noopener">Watch preview</a>` : "")}
+      </div>
+    </div>
+  </section>`;
+}
+
+function idleCardHTML(all) {
+  const last = all.find(g => g.done > 0);
+  return `<section class="card active-card" aria-label="Nothing in progress">
+    <div class="active-row">
+      ${last ? thumbHTML(last) : `<div class="thumb"><span class="thumb__glyph" aria-hidden="true">▶</span></div>`}
+      <div style="min-width:0;flex:1">
+        <p class="active-title">Nothing is recording right now</p>
+        <p class="active-sub">${last
+          ? `Last finished: ${esc(groupTitle(last))}`
+          : "Your dubs will show their progress here."}</p>
+      </div>
+    </div>
+    <div class="spread">
+      <p class="muted" style="font-size:12.5px">One video, as many languages as you like.</p>
+      <a class="btn btn--primary" href="#/new"><span aria-hidden="true">＋</span> Dub a video</a>
+    </div>
+  </section>`;
+}
+
+function notifyBtnHTML() {
+  if (!("Notification" in window)) return "";
+  if (state.notify) return `<span class="chip chip--ok"><span class="chip__glyph" aria-hidden="true">✓</span>We'll ping you</span>`;
+  return `<button type="button" class="btn btn--sm" data-act="notify">Notify me when it's ready</button>`;
+}
+
+function spendHTML() {
+  const u = state.usage;
+  return `<section class="spend" aria-label="This month">
+    <span class="spend__k">This month</span>
+    <span class="spend__v">${u ? money(u.cost) : "—"}</span>
+    <span class="spend__sub">${u ? `${Math.round(u.minutes)} minutes dubbed` : "no usage yet"}</span>
+    <span class="spend__foot">Pay-as-you-go · no subscription</span>
+  </section>`;
+}
+
+function videoCardHTML(g) {
+  const readyJob = g.jobs.find(x => jobState(x) === "done");
+  const meta = `${g.duration ? fmtDur(g.duration) + " · " : ""}${g.done} of ${g.jobs.length} language${g.jobs.length === 1 ? "" : "s"} ready`;
+  return `<article class="vcard">
+    ${thumbHTML(g, true)}
+    <div class="vcard__body">
+      <h3 class="vcard__title">${esc(groupTitle(g))}</h3>
+      <p class="vcard__meta">${esc(meta)}</p>
+      <div class="vcard__chips">
+        ${g.jobs.map(langChip).join("")}
+        ${g.attn.length ? `<span class="chip chip--accent"><span class="chip__glyph" aria-hidden="true">!</span>Review</span>`
+          : g.stopped.length ? `<span class="chip chip--accent"><span class="chip__glyph" aria-hidden="true">⏸</span>Needs you</span>` : ""}
+      </div>
+      <div class="vcard__actions">
+        ${g.attn.length
+          ? `<a class="btn btn--primary btn--sm" href="#/review/${esc(g.attn[0].id)}">Review ${esc(langName(g.attn[0].target_lang))}</a>`
+          : g.stopped.length
+            ? `<a class="btn btn--primary btn--sm" href="#/review/${esc(g.stopped[0].id)}">Pick up ${esc(langName(g.stopped[0].target_lang))}</a>`
+            : ""}
+        ${readyJob && readyJob.output_url
+          ? `<a class="btn btn--sm" href="${esc(readyJob.output_url)}" target="_blank" rel="noopener"
+               aria-label="Watch ${esc(groupTitle(g))} in ${esc(langName(readyJob.target_lang))}">Watch</a>
+             <a class="btn btn--sm" href="${esc(readyJob.output_url)}" download
+               aria-label="Download ${esc(groupTitle(g))} in ${esc(langName(readyJob.target_lang))}">Download</a>`
+          : ""}
+        ${g.failed ? `<span class="chip chip--bad"><span class="chip__glyph" aria-hidden="true">✕</span>${g.failed} didn't finish</span>` : ""}
+      </div>
+      ${g.failReason ? `<p class="muted-3" style="font-size:11.5px">${esc(g.failReason)}</p>` : ""}
+    </div>
+  </article>`;
+}
+
+// ── Voices tab (the top bar draws it, so it has to go somewhere real) ──
+
+function voicesHTML() {
+  const files = state.voices.filter(v => v.type === "file");
+  const styles = styleVoices();
+  return `<div class="shell">
+    ${mobileTabsHTML()}
+    <div class="section-head"><h2>Your voice</h2></div>
+    ${files.length ? `<div class="picker">${files.map(v => voiceRowHTML(v, false)).join("")}</div>`
+      : `<div class="card empty"><p><strong>No voice saved yet.</strong></p>
+         <p class="muted">Add a clip of yourself when you dub a video and it gets saved here.</p></div>`}
+    <div class="section-head"><h2>Other voices</h2></div>
+    <div class="picker">${styles.map(v => voiceRowHTML(v, false)).join("")}</div>
+  </div>`;
+}
+
+function voiceRowHTML(v, selectable) {
+  const sel = selectable && state.wizard && state.wizard.preset === v.id;
+  return `<div class="picker__row"${sel ? ' aria-current="true"' : ""}>
+    <div style="min-width:0">
+      <div class="picker__name">${esc(v.name || v.id)}</div>
+      <div class="muted" style="font-size:12px">${esc(v.description || v.style || "")}</div>
+    </div>
+    <div class="rowflex" style="margin-left:auto">
+      ${v.type === "file"
+        ? `<button type="button" class="btn btn--sm" data-act="play-voice" data-id="${esc(v.id)}"
+             aria-label="Hear this voice: ${esc(v.name || v.id)}"><span aria-hidden="true">▶</span> Hear this voice</button>`
+        : ""}
+      ${selectable ? `<button type="button" class="btn btn--sm${sel ? " btn--primary" : ""}"
+          data-act="pick-voice" data-id="${esc(v.id)}">${sel ? "Selected" : "Use this"}</button>` : ""}
+    </div>
+  </div>`;
+}
+
+// ── Plan & usage tab ───────────────────────────────────────────────
+
+function usageHTML() {
+  const u = state.usage;
+  if (!u) return `<div class="shell"><p class="muted">Loading…</p></div>`;
+  const byLang = Object.entries(u.by_lang || {});
+  return `<div class="shell">
+    ${mobileTabsHTML()}
+    <div class="home-top">
+      <section class="card stack">
+        <div>
+          <span class="caps">Rate right now</span>
+          <p class="mono" style="font-size:22px;font-weight:600">${rateStr(u.rate)}</p>
+          <p class="muted" style="font-size:12.5px">per minute of video, per language</p>
+        </div>
+        ${u.next_tier ? `<p class="muted" style="font-size:12.5px">${Math.round(u.next_tier.minutes)} more minutes this month and the rate drops to ${rateStr(u.next_tier.next_rate)}.</p>` : ""}
+      </section>
+      ${spendHTML()}
+    </div>
+    ${byLang.length ? `<section class="card stack-sm">
+      <span class="caps">Minutes by language (last ${u.window_days} days)</span>
+      ${byLang.map(([c, m]) => `<div class="line"><span>${esc(langName(c))}</span><span class="mono">${m}</span></div>`).join("")}
+    </section>` : ""}
+    <p class="banner"><span aria-hidden="true">ⓘ</span><span>${esc(u.disclaimer || "Estimate only.")}</span></p>
+
+    <section class="autodub">
+      <div>
+        <strong>Pro mode</strong>
+        <p>The same account, the same videos, the same voices — with every
+           option in the pipeline laid out. You can switch back any time.</p>
+      </div>
+      <button type="button" class="btn" data-act="switch-mode" data-mode="pro"
+        style="margin-left:auto">Switch to Pro mode</button>
+    </section>
+  </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Screen 2 — Dub a video (wizard)
+// ═══════════════════════════════════════════════════════════════════
+
+function wizardBarHTML() {
+  const w = state.wizard;
+  const seg = n => `<i data-on="${w.step >= n ? 1 : 0}"></i>`;
+  const step = (n, label) => {
+    const st = w.step === n ? "current" : w.step > n ? "done" : "todo";
+    return `<span class="step" data-state="${st}">
+      <span class="step__n" aria-hidden="true">${w.step > n ? "✓" : n}</span>
+      <span>${label}</span></span>`;
+  };
+  return `<div class="wizbar">
+    <button type="button" class="btn btn--ghost" data-act="cancel-wizard">
+      <span aria-hidden="true">✕</span> Cancel</button>
+    <div class="stepbar" role="progressbar" aria-label="Step ${w.step} of 3"
+         aria-valuenow="${w.step}" aria-valuemin="1" aria-valuemax="3">${seg(1)}${seg(2)}${seg(3)}</div>
+    <nav class="stepper" aria-label="Progress">
+      ${step(1, "Video")}<span class="step__line" data-done="${w.step > 1 ? 1 : 0}"></span>
+      ${step(2, "Languages &amp; voice")}<span class="step__line" data-done="${w.step > 2 ? 1 : 0}"></span>
+      ${step(3, "Confirm")}
+    </nav>
+    <span class="usage-note" style="margin-left:auto">saved automatically</span>
+  </div>`;
+}
+
+function wizardHTML() {
+  const w = state.wizard;
+  return `<div class="shell">
+    ${w.gateError ? `<p class="banner banner--bad"><span aria-hidden="true">✕</span>
+      <span><strong>This video is too long for this machine.</strong> ${esc(w.gateError)}</span></p>` : ""}
+    ${w.error ? `<p class="banner banner--bad">${esc(w.error)}</p>` : ""}
+    ${w.estimate && w.estimate.source_type === "url" && !w.estimate.duration_sec && !w.gateError
+      ? `<p class="banner"><span aria-hidden="true">ⓘ</span><span>We couldn't read that link, so we can't tell you the
+         length or the price yet. Check it's right — or start anyway, and we'll
+         tell you straight away if it doesn't work.</span></p>` : ""}
+    <div class="wizard">
+      <div class="wizcol">
+        ${w.step === 1 ? wizStep1() : w.step === 2 ? wizStep2() : wizStep3()}
+      </div>
+      ${railHTML()}
+    </div>
+  </div>`;
+}
+
+function wizStep1() {
+  const w = state.wizard;
+  return `<div class="stack">
+    <div>
+      <h1>Which video?</h1>
+      <p class="lede">Paste a link or drop a file. We'll read the title and length
+        so you know the price before anything starts.</p>
+    </div>
+    <form class="stack-sm" data-act="resolve-url">
+      <label class="caps" for="src">Video link</label>
+      <div class="rowflex">
+        <input class="field" id="src" name="src" type="url" inputmode="url"
+               placeholder="https://www.youtube.com/watch?v=…"
+               value="${esc(w.url)}" style="flex:1;min-width:180px">
+        <button type="submit" class="btn btn--primary">${w.estimating ? "Reading…" : "Use this link"}</button>
+      </div>
+    </form>
+    <p class="muted" style="text-align:center;font-size:12.5px">or</p>
+    <div class="drop" id="drop">
+      <strong>Drop a video file here</strong>
+      <span class="muted" style="font-size:12.5px">mp4, mov, mkv, or an audio file</span>
+      <label class="btn" for="file">Choose a file</label>
+      <input id="file" type="file" accept="video/*,audio/*" class="sr-only" data-act="file">
+      ${w.file ? `<p class="chip chip--ok"><span class="chip__glyph" aria-hidden="true">✓</span>${esc(w.file.name)}</p>` : ""}
+    </div>
+    ${w.meta ? `<div class="card rowflex">
+      ${w.meta.thumbnail ? `<img src="${esc(w.meta.thumbnail)}" alt="" width="112" height="64"
+           style="width:112px;height:64px;object-fit:cover;border-radius:8px">` : ""}
+      <div style="min-width:0">
+        <strong>${esc(w.meta.title || "Your video")}</strong>
+        <p class="muted" style="font-size:12.5px">${esc(fmtDur(w.meta.duration_sec))}${
+          w.meta.channel ? " · " + esc(w.meta.channel) : ""}</p>
+      </div>
+    </div>` : ""}
+  </div>`;
+}
+
+function wizStep2() {
+  const w = state.wizard;
+  const chip = c => {
+    const on = w.langs.includes(c);
+    return `<button type="button" class="langchip" data-act="lang" data-c="${esc(c)}"
+      aria-pressed="${on}"><span class="langchip__mark" aria-hidden="true">${on ? "✓" : "＋"}</span>${esc(langName(c))}</button>`;
+  };
+  const rest = state.languages.filter(c => !POPULAR.includes(c));
+  const extraSelected = w.langs.filter(c => !POPULAR.includes(c));
+  const files = state.voices.filter(v => v.type === "file");
+  const styles = styleVoices();
+
+  return `<div class="stack">
+    <div>
+      <h1>Which languages?</h1>
+      <p class="lede">Your voice, speaking each one. Pick as many as you like —
+        we'll tell you the price before anything starts.</p>
+    </div>
+
+    <section class="stack-sm" aria-labelledby="lg1">
+      <span class="caps" id="lg1">Popular with travel channels</span>
+      <div class="langs">
+        ${POPULAR.map(chip).join("")}
+        ${extraSelected.map(chip).join("")}
+        ${rest.length ? `<button type="button" class="langchip" data-act="more-langs"
+          aria-expanded="${state.langsOpen}">
+          <span class="langchip__mark" aria-hidden="true">${state.langsOpen ? "−" : "＋"}</span>
+          ${state.langsOpen ? "fewer" : rest.length + " more"}</button>` : ""}
+      </div>
+      ${state.langsOpen ? `<div class="langs" style="margin-top:6px">
+        ${rest.filter(c => !extraSelected.includes(c)).map(chip).join("")}</div>` : ""}
+      <p class="muted" style="font-size:12.5px">
+        ${w.langs.length} selected${w.langs.length < 1 ? " — pick at least one" : ""}</p>
+    </section>
+
+    <section class="stack-sm" aria-labelledby="vc1">
+      <span class="caps" id="vc1">Whose voice?</span>
+      <div class="voicecards">
+        <button type="button" class="voicecard" data-act="voicekind" data-v="mine"
+                aria-pressed="${w.voiceKind === "mine"}">
+          <span class="voicecard__head">
+            <span class="voicecard__name">My voice</span>
+            <span class="chip chip--ok"><span class="chip__glyph" aria-hidden="true">✓</span>ready</span>
+          </span>
+          <p>${w.refFile
+            ? "Cloned from the clip you added — sounds like you in every language."
+            : "Cloned from this video — sounds like you in every language. Add a clean clip below if the video has music under it."}</p>
+        </button>
+        <button type="button" class="voicecard" data-act="voicekind" data-v="pro"
+                aria-pressed="${w.voiceKind === "pro"}">
+          <span class="voicecard__head"><span class="voicecard__name">A different voice</span></span>
+          <p>${styles.length} preset voices, if you'd rather not use the one in your video.</p>
+        </button>
+      </div>
+      ${w.voiceKind === "mine" ? `<div class="stack-sm">
+        ${files.length ? `<div class="picker">${files.map(v => voiceRowHTML(v, true)).join("")}</div>` : ""}
+        <div class="rowflex">
+          <label class="btn" for="ref">${w.refFile ? "Use a different clip" : "Upload a clip of your voice"}</label>
+          <input id="ref" type="file" accept="audio/*,video/*" class="sr-only" data-act="ref">
+          ${w.refFile ? `<span class="chip chip--ok"><span class="chip__glyph" aria-hidden="true">✓</span>${esc(w.refFile.name)}</span>` : ""}
+        </div>
+      </div>` : `<div class="picker">${styles.map(v => voiceRowHTML(v, true)).join("")}</div>`}
+    </section>
+
+    <section class="toggle">
+      <button type="button" class="toggle__btn" role="switch" data-act="review-toggle"
+              aria-checked="${w.review}" aria-labelledby="rvl"></button>
+      <div>
+        <span class="toggle__label" id="rvl">Let me check the translation first</span>
+        <p class="toggle__hint">We'll pause and show you the names we're least sure
+          about, and anything we couldn't hear clearly. Recommended for your first video.</p>
+      </div>
+    </section>
+  </div>`;
+}
+
+function wizStep3() {
+  const w = state.wizard;
+  const voiceLabel = w.voiceKind === "mine"
+    ? (w.refFile ? `Your voice (from ${w.refFile.name})`
+       : (w.preset ? presetName(w.preset) : "Your voice, taken from the video"))
+    : (w.preset ? presetName(w.preset) : "A preset voice (we'll pick one)");
+  const row = (k, v) => `<div class="line"><span>${esc(k)}</span><span>${esc(v)}</span></div>`;
+  return `<div class="stack">
+    <div>
+      <h1>Ready when you are</h1>
+      <p class="lede">Nothing has started yet. Check this over and press start.</p>
+    </div>
+    <section class="card stack-sm">
+      ${row("Video", (w.meta && w.meta.title) || (w.file && w.file.name) || w.url || "—")}
+      ${row("Length", w.meta ? fmtDur(w.meta.duration_sec) : "—")}
+      ${row("Languages", w.langs.map(langName).join(", ") || "—")}
+      ${row("Voice", voiceLabel)}
+      ${row("Check the translation first", w.review ? "Yes — we'll pause for your OK" : "No — record straight through")}
+    </section>
+    ${w.langs.length > 1 ? `<p class="banner"><span aria-hidden="true">ⓘ</span>
+      <span>Languages record one after another on this machine, so the last one
+      finishes last. You can close this page — it keeps running.</span></p>` : ""}
+    <div class="rowflex">
+      <button type="button" class="btn" data-act="step" data-n="2">← Change something</button>
+    </div>
+  </div>`;
+}
+
+/** Creator mode and Pro mode are two surfaces on one account — same jobs,
+ *  same voices, same meter, no second login. Record the choice so "/" lands
+ *  there next time, then go. Navigation is not conditional on the save: a
+ *  failed write means the preference doesn't stick, which is recoverable; a
+ *  button that does nothing is not. /pro is unconditional, so it works even
+ *  if the preference is wrong. */
+async function switchUiMode(mode) {
+  try {
+    const fd = new FormData();
+    fd.append("prefs", JSON.stringify({ ui_mode: mode }));
+    await api("/api/preferences", { method: "POST", body: fd });
+  } catch (_) {}
+  window.location.href = mode === "creator" ? "/creator" : "/pro";
+}
+
+/** The pickable alternatives to the creator's own voice. "auto" is excluded:
+ *  it is not a voice you choose, it is what "My voice" already does — the
+ *  pipeline clones the speaker out of the source video. */
+function styleVoices() {
+  return state.voices.filter(v => v.type !== "file" && v.id !== "auto");
+}
+
+function presetName(id) {
+  const v = state.voices.find(x => x.id === id);
+  return v ? (v.name || v.id) : id;
+}
+
+function railHTML() {
+  const w = state.wizard;
+  const est = w.estimate;
+  const primaryLabel = w.step === 3
+    ? (w.submitting ? "Starting…" : "Start dubbing →")
+    : "Continue →";
+  const canGo = !w.gateError && (
+                w.step === 1 ? !!(w.meta || w.file || w.url.trim())
+              : w.step === 2 ? w.langs.length >= 1
+              : !w.submitting);
+
+  const priceBlock = est ? `
+    <div class="lines">
+      <div class="line"><span>${w.langs.length} language${w.langs.length === 1 ? "" : "s"} × ${fmtDur(est.duration_sec)}</span>
+        <span>${money(est.cost)}</span></div>
+      <div class="line"><span>Your voice</span><span>included</span></div>
+      <div class="line"><span>Subtitles (.srt)</span><span>included</span></div>
+    </div>
+    <div class="total"><span class="total__k">Total today</span><span class="total__v">${money(est.cost)}</span></div>
+    <p class="reassure">Charged when your first language is ready.
+      If something goes wrong, you're not charged for it.</p>`
+    : `<p class="muted" style="font-size:12.5px">${
+        w.estimating ? "Working out the price…" : "Add a video to see the price."}</p>`;
+
+  const etaLine = est && est.eta_sec
+    ? `<p class="muted rail__eta" style="font-size:12px;text-align:center">Estimated ${fmtAbout(est.eta_sec)} for ${
+        w.langs.length === 1 ? "it" : `all ${w.langs.length} languages`}${est.eta_basis === "measured"
+          ? ", based on how long your last few videos took"
+          : ". That's a rough first guess — it gets accurate once a few videos have run here"}.</p>`
+    : "";
+
+  return `<aside class="rail" aria-label="Price">
+    ${w.meta && w.meta.thumbnail ? `<img src="${esc(w.meta.thumbnail)}" alt="" style="width:100%;height:150px;object-fit:cover">` : ""}
+    <div class="rail__body">
+      ${w.meta ? `<div>
+        <p class="rail__title">${esc(w.meta.title || "Your video")}</p>
+        <p class="rail__meta">${esc(fmtDur(w.meta.duration_sec))}${w.meta.channel ? " · " + esc(w.meta.channel) : ""}</p>
+      </div>` : ""}
+      ${priceBlock}
+      <button type="button" class="btn btn--primary btn--lg btn--block" data-act="wiz-next"
+        ${canGo ? "" : "disabled"}>${primaryLabel}</button>
+      ${etaLine}
+      ${est && est.estimate ? `<p class="muted-3" style="font-size:11px;text-align:center">Prices are an estimate — this machine bills nobody.</p>` : ""}
+    </div>
+  </aside>`;
+}
+
+function wizardStickyHTML() {
+  const w = state.wizard;
+  const est = w.estimate;
+  const primaryLabel = w.step === 3 ? (w.submitting ? "Starting…" : "Start dubbing →") : "Continue →";
+  const canGo = !w.gateError && (
+                w.step === 1 ? !!(w.meta || w.file || w.url.trim())
+              : w.step === 2 ? w.langs.length >= 1
+              : !w.submitting);
+  return `<div class="stickybar">
+    ${est ? `<div class="stickybar__price">
+      <span>${w.langs.length} language${w.langs.length === 1 ? "" : "s"}</span>
+      <span class="total__v">${money(est.cost)}</span></div>` : ""}
+    <button type="button" class="btn btn--primary btn--lg" data-act="wiz-next"
+      ${canGo ? "" : "disabled"}>${primaryLabel}</button>
+    ${est && est.eta_sec ? `<p class="stickybar__note">Estimated ${fmtAbout(est.eta_sec)}. You can close this page.</p>` : ""}
+  </div>`;
+}
+
+// ── Wizard behaviour ───────────────────────────────────────────────
+
+async function refreshEstimate() {
+  const w = state.wizard;
+  if (!w.langs.length) { w.estimate = null; return; }
+  const dur = w.meta ? w.meta.duration_sec : w.fileDur;
+  if (!dur && !w.url.trim()) { w.estimate = null; return; }
+
+  w.estimating = true;
+  render();
+  const qs = new URLSearchParams({ langs: w.langs.join(",") });
+  if (w.file) qs.set("duration_sec", String(Math.round(dur || 0)));
+  else qs.set("source", w.url.trim());
+  try {
+    const d = await api(`/api/estimate?${qs}`);
+    // A 200 carrying duration_gate_error is a refusal, not a failure: the
+    // video priced fine, it is just longer than this server will accept.
+    // Nothing may start until the creator picks a different one.
+    w.gateError = d.duration_gate_error || "";
+    w.estimate = d;
+    // The URL path is also how we learn the title/thumbnail/length.
+    if (!w.file) {
+      w.meta = { title: d.title || w.url, thumbnail: d.thumbnail || "",
+                 channel: d.channel || "", duration_sec: d.duration_sec || 0 };
+    } else if (!w.meta) {
+      w.meta = { title: w.file.name, thumbnail: "", channel: "", duration_sec: dur || 0 };
+    }
+  } catch (e) {
+    w.error = e.message || String(e);
+  }
+  w.estimating = false;
+  render();
+}
+
+/** Read a local file's duration without uploading it — the estimate needs
+ *  only the number of seconds. */
+function probeLocalDuration(file) {
+  return new Promise(resolve => {
+    const v = document.createElement("video");
+    v.preload = "metadata";
+    v.onloadedmetadata = () => { const d = v.duration; URL.revokeObjectURL(v.src); resolve(isFinite(d) ? d : 0); };
+    v.onerror = () => { URL.revokeObjectURL(v.src); resolve(0); };
+    v.src = URL.createObjectURL(file);
+  });
+}
+
+async function submitDub() {
+  const w = state.wizard;
+  w.submitting = true; w.error = ""; render();
+
+  const fd = new FormData();
+  if (w.file) fd.append("video", w.file);
+  else fd.append("source", w.url.trim());
+  if (w.refFile) fd.append("reference", w.refFile);
+  fd.append("target_langs", w.langs.join(","));
+  fd.append("trim_seconds", "0");                       // 0 = the whole video
+  // Without this the handler downloads the source inside the request, which
+  // blocks the event loop for minutes and makes Start look dead. With it the
+  // jobs exist in "preparing" before the response comes back.
+  fd.append("background", "1");
+  fd.append("wizard_mode", w.review ? "review_translation" : "auto");
+  if (state.model) fd.append("model", state.model);
+  if (w.preset) fd.append("voice_preset", w.preset);
+  if (w.meta && w.meta.title) fd.append("batch_label", w.meta.title);
+
+  try {
+    await api("/api/quick_test", { method: "POST", body: fd });
+    state.wizard = null;
+    await loadJobs();
+    location.hash = "#/";
+    $("#live").textContent = "Started. Your languages are queued.";
+  } catch (e) {
+    w.error = e.message || String(e);
+    w.submitting = false;
+    render();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Screen 3 — Review before recording
+// ═══════════════════════════════════════════════════════════════════
+
+function reviewBarHTML() {
+  const r = state.review;
+  // Both of these POST /continue, which starts a real TTS run. They may only
+  // exist once a job that is genuinely waiting has finished loading: not over
+  // an error screen, not while loading (a fast click would approve a review
+  // nobody saw), and never on a finished job, where recording again would
+  // overwrite output that already exists.
+  const armed = !!r && !r.loading && !r.error && reviewable(r.job);
+  return `<div class="wizbar">
+    <a class="btn btn--ghost" href="#/"><span aria-hidden="true">←</span> Your videos</a>
+    <span style="font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+      ${r && r.job ? esc(groupTitle({ jobs: [r.job] })) : "Review"}</span>
+    ${armed ? `<span class="chip chip--warn"><span class="chip__glyph" aria-hidden="true">◷</span>${
+      r.job.status === "paused" ? "stopped part-way" : "paused for your OK"}</span>` : ""}
+    ${armed ? `<div class="topbar__right">
+      <button type="button" class="btn" data-act="record" data-skip="1">Skip review</button>
+      <button type="button" class="btn btn--primary" data-act="record">Looks good — record it →</button>
+    </div>` : ""}
+  </div>`;
+}
+
+function reviewHTML() {
+  const r = state.review;
+  if (!r || r.loading) return `<div class="shell"><p class="muted">Loading the translation…</p></div>`;
+  if (r.error) return `<div class="shell"><p class="banner banner--bad">${esc(r.error)}</p>
+    <a class="btn" href="#/">← Back to your videos</a></div>`;
+
+  if (!reviewable(r.job)) return notReviewableHTML(r.job);
+
+  const open = r.flags.filter(f => !r.decided[f.idx]);
+  const lang = langName(r.job.target_lang);
+
+  return `<div class="shell">
+    <div class="review">
+      <div class="railcol">
+        <div class="stack-sm">
+          <span class="caps">Languages</span>
+          <div class="langlist">${r.siblings.map(j => {
+            const cur = j.id === r.job.id;
+            const k = jobState(j);
+            return `<div class="langlist__item"${cur ? ' aria-current="true"' : ""}>
+              <span aria-hidden="true">${k === "done" ? "✓" : k === "attn" ? "!" : "·"}</span>
+              <span>${esc(langName(j.target_lang))}</span>
+              ${cur && open.length && k === "attn" ? `<span class="chip chip--warn langlist__badge">${open.length}</span>` : ""}
+              <span class="sr-only">${k === "done" ? "ready" : k === "attn" ? "needs your OK" : "waiting"}</span>
+            </div>`;
+          }).join("")}</div>
+        </div>
+        <div class="card">
+          <strong style="font-size:13.5px">${open.length
+            ? `Only ${open.length} thing${open.length === 1 ? "" : "s"} to check`
+            : "Nothing to check"}</strong>
+          <p class="muted" style="font-size:12.5px;margin-top:4px">
+            ${open.length
+              ? "We flagged the words we're least sure about. Everything else is already fine."
+              : "We checked the names in this translation and didn't find anything worth your time."}</p>
+        </div>
+      </div>
+
+      <div class="stack">
+        ${r.flags.length === 0 ? `<section class="confident">
+            <h2>Nothing to check — we're confident</h2>
+            <p class="muted">We went through the ${lang ? esc(lang) : ""} translation looking for
+              names that usually need a human, and anything we couldn't hear clearly.
+              Nothing needed you.</p>
+            <button type="button" class="btn btn--primary btn--lg" data-act="record">Record it →</button>
+            <p class="muted-3" style="font-size:12px">Nothing has been recorded yet.</p>
+          </section>`
+        : `<h1 style="font-size:22px;font-weight:600">${
+             open.length ? `${numWord(open.length)} thing${open.length === 1 ? "" : "s"} we'd like you to confirm`
+                         : "All confirmed"}</h1>
+           ${r.flags.map(f => flagCardHTML(f, lang)).join("")}`}
+
+        ${r.flags.length === 0 ? "" : `<div class="footcard">
+          <div>
+            <strong>Nothing has been recorded yet.</strong>
+            <p>Once you approve we start recording ${esc(lang)}. It takes a while —
+              you can close this page, it keeps running.</p>
+          </div>
+          <button type="button" class="btn btn--primary btn--lg" data-act="record">Looks good — record it →</button>
+        </div>`}
+      </div>
+    </div>
+  </div>`;
+}
+
+/** #/review/<id> for a job that is not waiting on anyone. Reachable with the
+ *  Back button after any review, so it has to say what the job really is —
+ *  and offer to watch it, never to record over it. */
+function notReviewableHTML(job) {
+  const k = jobState(job);
+  const lang = langName(job.target_lang);
+  const title = esc(groupTitle({ jobs: [job] }));
+  const body = k === "done"
+    ? { head: `${lang} is already done`,
+        note: "This one has been recorded. Nothing here needs your OK.",
+        actions: job.output_url
+          ? `<a class="btn btn--primary btn--lg" href="${esc(job.output_url)}" target="_blank" rel="noopener"
+               aria-label="Watch ${title} in ${esc(lang)}">Watch it →</a>
+             <a class="btn" href="${esc(job.output_url)}" download
+               aria-label="Download ${title} in ${esc(lang)}">Download</a>`
+          : "" }
+    : k === "fail"
+      ? { head: `${lang} didn't finish`,
+          note: tidyError(job.error) || "Something went wrong with this one.",
+          actions: "" }
+      : { head: `${lang} is still working`,
+          note: "There's nothing to check yet. We'll tell you on your videos page when it needs you.",
+          actions: "" };
+  return `<div class="shell">
+    <section class="confident">
+      <h2>${esc(body.head)}</h2>
+      <p class="muted">${esc(body.note)}</p>
+      <div class="rowflex" style="justify-content:center">
+        ${body.actions}
+        <a class="btn${body.actions ? "" : " btn--primary btn--lg"}" href="#/">← Your videos</a>
+      </div>
+    </section>
+  </div>`;
+}
+
+function numWord(n) {
+  return ["Nothing", "One", "Two", "Three", "Four", "Five"][n] || String(n);
+}
+
+const KIND_LABEL = { name: "a name", joke: "a joke", term: "a term", unclear: "hard to hear" };
+
+function highlight(text, span, cls) {
+  const t = String(text || "");
+  if (!span) return esc(t);
+  // A span covering nearly the whole line (what the "hard to hear" detector
+  // returns) highlights everything, which highlights nothing.
+  if (span.length > t.length * 0.8) return esc(t);
+  const i = t.indexOf(span);
+  if (i < 0) return esc(t);
+  return esc(t.slice(0, i)) + `<mark class="${cls}">` + esc(span) + `</mark>` + esc(t.slice(i + span.length));
+}
+
+function flagCardHTML(f, lang) {
+  const r = state.review;
+  const decided = r.decided[f.idx];
+  const editing = r.editing === f.idx;
+  const variants = (f.variants || []).filter(v => v && v !== f.target_span);
+  // A glossary miss is not the same question as the others. The creator already
+  // chose a spelling; this line simply didn't use it. So the primary action is
+  // to apply their own earlier decision — offering "Keep it as it is" first
+  // would be inviting them to keep the spelling they already rejected.
+  const isMiss = f.reason === "glossary_miss" && !!f.target_span;
+  const primary = f.kind === "joke" ? "Love it"
+    : f.kind === "name" ? "Keep the name as-is"
+    : f.kind === "unclear" ? "Sounds right"
+    : "Keep it as it is";
+
+  return `<article class="flagcard${decided ? " is-decided" : ""}">
+    <div class="flagcard__head">
+      <span class="chip chip--line">${esc(KIND_LABEL[f.kind] || f.kind)}</span>
+      <span class="mono muted-3" style="font-size:12px">${fmtDur(f.start)}</span>
+      ${decided ? `<span class="chip chip--ok"><span class="chip__glyph" aria-hidden="true">✓</span>${esc(decided)}</span>` : ""}
+      <button type="button" class="btn btn--sm" data-act="hear" data-start="${f.start}" data-end="${f.end}"
+        aria-label="Hear this bit at ${fmtDur(f.start)}"><span aria-hidden="true">▶</span> Hear this bit</button>
+    </div>
+
+    <p class="quote"><span class="quote__k">You said</span>${highlight(f.source_text, f.source_span, "src")}</p>
+    <p class="quote"><span class="quote__k">In ${esc(lang)}</span>${highlight(f.translated_text, f.target_span, "tgt")}
+      ${f.reason === "idiom_ratio" ? `<span class="aside"> — we kept the humour, not the words</span>` : ""}
+      ${f.reason === "name_inconsistent" ? `<span class="aside"> — it also came out as "${esc((f.variants || []).filter(v => v !== f.target_span)[0] || "")}" elsewhere</span>` : ""}
+      ${isMiss ? `<span class="aside"> — you chose “${esc(f.target_span)}” before, and this line didn't use it</span>` : ""}
+    </p>
+
+    ${editing ? `<form class="rowflex" data-act="save-own" data-idx="${f.idx}">
+        <label class="sr-only" for="own${f.idx}">How it should read</label>
+        <input class="field" id="own${f.idx}" name="own" value="${esc(f.target_span || f.translated_text)}" style="flex:1;min-width:160px">
+        <button type="submit" class="btn btn--primary">Save</button>
+        <button type="button" class="btn" data-act="edit" data-idx="">Cancel</button>
+      </form>`
+    : `<div class="choices">
+        ${isMiss
+          ? `<button type="button" class="btn btn--primary" data-act="use-variant"
+               data-idx="${f.idx}" data-v="${esc(f.target_span)}">Use “${esc(f.target_span)}”</button>
+             <button type="button" class="btn" data-act="keep" data-idx="${f.idx}">Leave this one</button>`
+          : `<button type="button" class="btn btn--primary" data-act="keep" data-idx="${f.idx}">${primary}</button>`}
+        ${(isMiss ? [] : variants).map(v => `<button type="button" class="btn" data-act="use-variant"
+          data-idx="${f.idx}" data-v="${esc(v)}">Use “${esc(v)}” instead</button>`).join("")}
+        <button type="button" class="btn" data-act="edit" data-idx="${f.idx}">Write my own</button>
+        ${f.kind === "unclear" || !(f.source_span || "").trim() ? ""
+          : `<span class="remember">we'll remember this for future videos</span>`}
+      </div>`}
+  </article>`;
+}
+
+function reviewStickyHTML() {
+  const r = state.review;
+  if (!r || r.loading || r.error || !reviewable(r.job)) return "";
+  // The review bar's actions are hidden on a phone, so both live here.
+  return `<div class="stickybar">
+    <p class="stickybar__note"><strong>Nothing has been recorded yet.</strong></p>
+    <button type="button" class="btn btn--primary btn--lg" data-act="record">Looks good — record it →</button>
+    <button type="button" class="btn btn--ghost" data-act="record" data-skip="1">Skip review and record</button>
+  </div>`;
+}
+
+async function loadReview(jobId) {
+  state.review = { loading: true, error: "", job: null, flags: [], decided: {},
+                   editing: null, siblings: [], audioUrl: "" };
+  render();
+  const r = state.review;
+  try {
+    const job = await api(`/api/job/${encodeURIComponent(jobId)}`);
+    r.job = job.job || job;
+    const bid = r.job.batch_id;
+    if (bid) {
+      const d = await api(`/api/jobs?batch_id=${encodeURIComponent(bid)}`);
+      r.siblings = (d.jobs || []).filter(j => !bid || j.batch_id === bid);
+    }
+    if (!r.siblings.length) r.siblings = [r.job];
+
+    const fl = await api(`/api/dub/${encodeURIComponent(jobId)}/flags`);
+    r.flags = fl.flags || [];
+    r.audioUrl = fl.audio_url || `/outputs/${jobId}/audio_16k.wav`;
+  } catch (e) {
+    r.error = e.message || String(e);
+  }
+  r.loading = false;
+  render();
+}
+
+/** Record a confirmed rendering so the other languages — and the next video —
+ *  inherit it. This is what "we'll remember this for future videos" means, and
+ *  it is the whole retention loop: a name_inconsistent flag exists precisely
+ *  because the translator rendered one name two ways, so a decision that isn't
+ *  written down means every sibling language re-derives the same question.
+ *
+ *  Never throws. A glossary that didn't save is a promise quietly unkept; a
+ *  glossary failure that discarded the creator's decision would be worse. */
+async function teachGlossary(flag, rendering) {
+  // "unclear" flags are a garbled line, not a term — there is nothing to
+  // remember, and writing the whole sentence in would poison the glossary.
+  const term = (flag.source_span || "").trim();
+  if (!term || !rendering || flag.kind === "unclear") return true;
+  try {
+    const gd = new FormData();
+    gd.append("term", term);
+    gd.append("translation", rendering);
+    gd.append("target_lang", state.review.job.target_lang || "");
+    await api(`/api/glossary/term`, { method: "POST", body: gd });
+    return true;
+  } catch (e) {
+    console.warn("glossary write failed", e);
+    return false;
+  }
+}
+
+/** Apply one decision: rewrite the flagged span inside the segment's
+ *  translation, then teach the glossary so the other languages inherit it. */
+async function applyChoice(flag, replacement, label) {
+  const r = state.review;
+  const jobId = r.job.id;
+  const before = flag.target_span || "";
+  const next = before && flag.translated_text.includes(before)
+    ? flag.translated_text.replace(before, replacement)
+    : replacement;
+
+  try {
+    const fd = new FormData();
+    fd.append("edits", JSON.stringify({ [String(flag.idx)]: next }));
+    await api(`/api/dub/${encodeURIComponent(jobId)}/edit_translations`, { method: "POST", body: fd });
+    flag.translated_text = next;
+    flag.target_span = replacement;
+  } catch (e) {
+    r.error = e.message || String(e);
+  }
+  // Outside the try: a glossary failure must not lose the edit that already
+  // saved, and teachGlossary swallows its own errors for the same reason.
+  const remembered = await teachGlossary(flag, replacement);
+  r.decided[flag.idx] = label;
+  r.editing = null;
+  $("#live").textContent = remembered
+    ? `Saved. ${label}. We'll use it in your other languages too.`
+    : `Saved. ${label}.`;
+  render();
+}
+
+async function recordIt() {
+  const r = state.review;
+  try {
+    await api(`/api/dub/${encodeURIComponent(r.job.id)}/continue`, { method: "POST", body: new FormData() });
+    $("#live").textContent = "Recording started. You can close this page.";
+    state.review = null;
+    await loadJobs();
+    location.hash = "#/";
+  } catch (e) {
+    r.error = e.message || String(e);
+    render();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Audio
+// ═══════════════════════════════════════════════════════════════════
+
+let player = null;
+let playStop = 0;
+
+function playClip(src, start, end) {
+  if (!player) { player = new Audio(); player.preload = "none"; }
+  const same = player.src && player.src.indexOf(src) >= 0;
+  if (!same) player.src = src;
+  player.currentTime = Number(start) || 0;
+  clearTimeout(playStop);
+  const dur = Math.max(0.4, (Number(end) || 0) - (Number(start) || 0));
+  player.play().then(() => {
+    playStop = setTimeout(() => player.pause(), dur * 1000 + 250);
+  }).catch(() => {
+    $("#live").textContent = "Couldn't play that clip.";
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Render + routing
+// ═══════════════════════════════════════════════════════════════════
+
+/** What the creator is in the middle of typing, so a render can put it back.
+ *  Replacing innerHTML destroys the focused field, and a render can be
+ *  triggered by something they did not do — the first data load landing, or a
+ *  poll tick — so without this, typing into the link box while the page is
+ *  still loading silently loses what you typed. */
+function captureInput() {
+  const el = document.activeElement;
+  if (!el || !el.id || (el.tagName !== "INPUT" && el.tagName !== "TEXTAREA")) return null;
+  let start = null, end = null;
+  // selectionStart throws on input types that don't support selection (url,
+  // email, number) in some browsers; the value alone is still worth keeping.
+  try { start = el.selectionStart; end = el.selectionEnd; } catch (_) {}
+  return { id: el.id, value: el.value, start, end };
+}
+
+function restoreInput(keep) {
+  if (!keep) return;
+  const el = document.getElementById(keep.id);
+  if (!el) return;
+  if (el.value !== keep.value) el.value = keep.value;
+  el.focus();
+  if (keep.start !== null) {
+    try { el.setSelectionRange(keep.start, keep.end); } catch (_) {}
+  }
+}
+
+function render() {
+  const keep = captureInput();
+  $("#topbar").innerHTML = topbarHTML();
+  const r = state.route;
+  let body = "", sticky = "";
+  if (r.name === "new") { body = wizardHTML(); sticky = wizardStickyHTML(); }
+  else if (r.name === "review") { body = reviewHTML(); sticky = reviewStickyHTML(); }
+  else if (r.name === "voices") { body = voicesHTML(); }
+  else if (r.name === "usage") { body = usageHTML(); }
+  else {
+    body = homeHTML();
+    sticky = `<div class="stickybar">
+      ${state.usage ? `<p class="stickybar__note">${Math.round(state.usage.minutes)} min dubbed · ${money(state.usage.cost)} this month</p>` : ""}
+      <a class="btn btn--primary btn--lg" href="#/new"><span aria-hidden="true">＋</span> Dub a video</a>
+    </div>`;
+  }
+  $("#main").innerHTML = body;
+  $("#sticky").innerHTML = sticky;
+  restoreInput(keep);
+}
+
+function parseHash() {
+  const h = (location.hash || "#/").replace(/^#/, "");
+  const parts = h.split("/").filter(Boolean);
+  if (!parts.length) return { name: "home", param: "" };
+  if (parts[0] === "new") return { name: "new", param: "" };
+  if (parts[0] === "review") return { name: "review", param: parts[1] || "" };
+  if (parts[0] === "voices") return { name: "voices", param: "" };
+  if (parts[0] === "usage") return { name: "usage", param: "" };
+  return { name: "home", param: "" };
+}
+
+function onRoute() {
+  const next = parseHash();
+  const changed = next.name !== state.route.name || next.param !== state.route.param;
+  state.route = next;
+  if (next.name === "new" && !state.wizard) state.wizard = newWizard();
+  if (next.name === "review") {
+    if (changed || !state.review || (state.review.job && state.review.job.id !== next.param)) {
+      loadReview(next.param);
+      window.scrollTo(0, 0);
+      return;
+    }
+  }
+  render();
+  if (changed) window.scrollTo(0, 0);
+  schedulePoll();
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// One delegated listener per event type — no re-binding after a render
+// ═══════════════════════════════════════════════════════════════════
+
+document.addEventListener("click", async ev => {
+  const t = ev.target.closest("[data-act]");
+  if (!t || t.tagName === "FORM") return;
+  const act = t.dataset.act;
+  const w = state.wizard, r = state.review;
+
+  if (act === "filter") { state.filter = t.dataset.v; render(); return; }
+
+  if (act === "retry") {
+    t.disabled = true;
+    state.loading = true; state.offline = false; render();
+    bootstrap();
+    return;
+  }
+
+  if (act === "notify") {
+    if (!("Notification" in window)) return;
+    let perm = Notification.permission;
+    if (perm === "default") perm = await Notification.requestPermission();
+    state.notify = perm === "granted";
+    if (!state.notify) $("#live").textContent = "Your browser blocked notifications — the page still updates on its own.";
+    render();
+    return;
+  }
+
+  if (act === "switch-mode") { switchUiMode(t.dataset.mode); return; }
+
+  if (act === "cancel-wizard") { state.wizard = null; location.hash = "#/"; return; }
+
+  if (act === "step") { w.step = Number(t.dataset.n); render(); return; }
+
+  if (act === "lang") {
+    const c = t.dataset.c;
+    const i = w.langs.indexOf(c);
+    if (i >= 0) w.langs.splice(i, 1); else w.langs.push(c);
+    render();
+    refreshEstimate();
+    return;
+  }
+  if (act === "more-langs") { state.langsOpen = !state.langsOpen; render(); return; }
+
+  if (act === "voicekind") {
+    w.voiceKind = t.dataset.v;
+    w.preset = "";
+    render();
+    return;
+  }
+  if (act === "pick-voice") { w.preset = (w.preset === t.dataset.id) ? "" : t.dataset.id; render(); return; }
+  if (act === "play-voice") { playClip(`/api/voice_presets/${encodeURIComponent(t.dataset.id)}/audio`, 0, 12); return; }
+
+  if (act === "review-toggle") { w.review = !w.review; render(); return; }
+
+  if (act === "wiz-next") {
+    if (w.step === 1) {
+      if (!w.meta && (w.url.trim() || w.file)) await refreshEstimate();
+      w.step = 2; render(); refreshEstimate(); return;
+    }
+    if (w.step === 2) { w.step = 3; render(); return; }
+    submitDub();
+    return;
+  }
+
+  if (act === "hear") {
+    playClip(r.audioUrl, t.dataset.start, t.dataset.end);
+    return;
+  }
+  if (act === "edit") {
+    r.editing = t.dataset.idx === "" ? null : Number(t.dataset.idx);
+    render();
+    return;
+  }
+  if (act === "keep") {
+    const f = r.flags.find(x => String(x.idx) === t.dataset.idx);
+    // Confirming a spelling is a decision, not a dismissal: the flag exists
+    // because the translator was inconsistent, so an unrecorded "keep" leaves
+    // every other language free to make the same mistake again. Settle it
+    // optimistically — the creator has answered, the screen should move on.
+    r.decided[f.idx] = "kept as it was";
+    r.editing = null;
+    $("#live").textContent = "Kept as it was.";
+    render();
+    teachGlossary(f, f.target_span || "").then(ok => {
+      if (ok && f.kind !== "unclear" && (f.source_span || "").trim()) {
+        $("#live").textContent =
+          "Kept as it was. We'll use it in your other languages too.";
+      }
+    });
+    return;
+  }
+  if (act === "use-variant") {
+    const f = r.flags.find(x => String(x.idx) === t.dataset.idx);
+    applyChoice(f, t.dataset.v, `changed to “${t.dataset.v}”`);
+    return;
+  }
+  if (act === "record") {
+    // The buttons are already gated, but this POST starts an irreversible
+    // run over real output, so it re-checks rather than trusting the DOM.
+    if (!r || r.loading || r.error || !reviewable(r.job)) return;
+    t.disabled = true;
+    recordIt();
+    return;
+  }
+});
+
+document.addEventListener("submit", ev => {
+  const f = ev.target.closest("[data-act]");
+  if (!f) return;
+  ev.preventDefault();
+  if (f.dataset.act === "resolve-url") {
+    state.wizard.url = new FormData(f).get("src") || "";
+    state.wizard.file = null;
+    state.wizard.meta = null;
+    state.wizard.gateError = "";
+    refreshEstimate();
+    return;
+  }
+  if (f.dataset.act === "save-own") {
+    const idx = Number(f.dataset.idx);
+    const flag = state.review.flags.find(x => x.idx === idx);
+    const val = String(new FormData(f).get("own") || "").trim();
+    if (!val) return;
+    applyChoice(flag, val, "changed to your wording");
+  }
+});
+
+document.addEventListener("change", async ev => {
+  const t = ev.target.closest("[data-act]");
+  if (!t) return;
+  const w = state.wizard;
+  if (t.dataset.act === "file") {
+    const file = t.files && t.files[0];
+    if (!file) return;
+    w.file = file; w.url = ""; w.meta = null; w.gateError = "";
+    w.fileDur = await probeLocalDuration(file);
+    w.meta = { title: file.name, thumbnail: "", channel: "", duration_sec: w.fileDur };
+    refreshEstimate();
+  }
+  if (t.dataset.act === "ref") {
+    w.refFile = (t.files && t.files[0]) || null;
+    w.preset = "";
+    render();
+  }
+});
+
+// Keep the URL field's value without re-rendering on every keystroke —
+// a render here would blow away the caret.
+document.addEventListener("input", ev => {
+  if (ev.target.id === "src" && state.wizard) state.wizard.url = ev.target.value;
+});
+
+// Drag-and-drop onto the wizard's drop zone.
+document.addEventListener("dragover", ev => {
+  const d = ev.target.closest && ev.target.closest("#drop");
+  if (!d) return;
+  ev.preventDefault();
+  d.classList.add("is-drag");
+});
+document.addEventListener("dragleave", ev => {
+  const d = ev.target.closest && ev.target.closest("#drop");
+  if (d) d.classList.remove("is-drag");
+});
+document.addEventListener("drop", async ev => {
+  const d = ev.target.closest && ev.target.closest("#drop");
+  if (!d) return;
+  ev.preventDefault();
+  d.classList.remove("is-drag");
+  const file = ev.dataTransfer.files && ev.dataTransfer.files[0];
+  if (!file || !state.wizard) return;
+  const w = state.wizard;
+  w.file = file; w.url = ""; w.meta = null;
+  w.fileDur = await probeLocalDuration(file);
+  w.meta = { title: file.name, thumbnail: "", channel: "", duration_sec: w.fileDur };
+  refreshEstimate();
+});
+
+window.addEventListener("hashchange", onRoute);
+
+state.route = parseHash();
+if (state.route.name === "new") state.wizard = newWizard();
+render();
+bootstrap().then(() => { if (state.route.name === "review") onRoute(); });
+</script>
+</body>
+</html>

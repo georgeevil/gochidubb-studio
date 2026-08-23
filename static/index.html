@@ -295,6 +295,21 @@ const _lsSet = (key, v) => {
   try { localStorage.setItem('gochidubb_pref_' + key, String(v)); } catch (_) {}
 };
 
+// Creator mode and Pro mode are two surfaces on one account — same jobs, same
+// meter, no second login. Record the choice so GET / lands here next time,
+// then go. Navigation is not conditional on the save: a failed write means the
+// preference doesn't stick, which is recoverable; a button that does nothing
+// is not. /creator and /pro are both unconditional, so either address always
+// works even if the preference is wrong.
+const switchUiMode = async (mode) => {
+  try {
+    const body = new FormData();
+    body.append('prefs', JSON.stringify({ ui_mode: mode }));
+    await fetch('/api/preferences', { method: 'POST', body });
+  } catch (_) {}
+  window.location.href = mode === 'creator' ? '/creator' : '/pro';
+};
+
 // ═══════════════════════════════════════════════════════════════════
 // ICONS (simplified for brevity - full set in original)
 // ═══════════════════════════════════════════════════════════════════
@@ -753,6 +768,29 @@ function LeftRail({ view, setView, runningJob, awaitingReviewCount, system,
       </div>
 
       <div style={{ padding: 12, borderTop: '1px solid var(--line)' }}>
+        {/* A mode, not a tier: same account, same jobs, same meter. Phrased
+            as a switch rather than an upgrade or a downgrade — nobody using
+            the full tool should read the simpler surface as a demotion. */}
+        <button
+          onClick={() => switchUiMode('creator')}
+          title="Same account, same jobs — a simpler surface for making videos"
+          style={{
+            width: '100%', display: 'flex', alignItems: 'center', gap: 8,
+            padding: '8px 10px', marginBottom: 10, borderRadius: 6,
+            background: 'var(--bg-1)', border: '1px solid var(--line)',
+            color: 'var(--ink-2)', textAlign: 'left',
+          }}>
+          <span style={{ color: 'var(--ink-3)', flexShrink: 0 }}>{I.result}</span>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            <div style={{ fontSize: 11 }}>Switch to Creator mode</div>
+            <div className="mono" style={{ fontSize: 9, color: 'var(--ink-4)', marginTop: 1,
+                                           whiteSpace: 'nowrap', overflow: 'hidden',
+                                           textOverflow: 'ellipsis' }}>
+              Same jobs, simpler
+            </div>
+          </div>
+          <span style={{ color: 'var(--ink-4)', flexShrink: 0 }}>{I.arrow}</span>
+        </button>
         <div style={{ padding: 10, background: 'var(--bg-1)', border: '1px solid var(--line)', borderRadius: 6 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
             <span style={{ color: 'var(--ink-3)' }}>{I.cpu}</span>

@@ -1,0 +1,607 @@
+/* Creator mode — the consumer front door.
+ *
+ * This is a LIGHT surface and deliberately does not extend static/theme.css:
+ * theme.css is a flat dark :root with no theme switch, and the two palettes
+ * disagree on what --ink, --line and --accent mean. Token names below are
+ * taken verbatim from docs/design/creator-mode-spec.md so the design doc and
+ * this file stay greppable against each other.
+ */
+
+:root {
+  --paper: #faf9f5;      /* page ground */
+  --paper-2: #f2f0e8;    /* recessed ground */
+  --card: #ffffff;       /* card surface */
+  --line: #e2e0d6;       /* hairline */
+  --line-2: #e8e6db;     /* softer hairline */
+  --line-3: #d9d7cb;     /* button border */
+  --fill: #f0eee4;       /* neutral chip fill */
+  --ink: #1a1a1f;        /* primary text */
+  --ink-2: #77756c;      /* secondary text */
+  --ink-3: #a3a199;      /* tertiary text */
+  --accent: #c8f542;     /* primary action — ink text ON accent, never white */
+  --accent-ink: #5c7a0f; /* accent-coloured text, links, focus rings */
+  --ok-fill: #e9f5c0;
+  --ok-ink: #3f5208;
+  --warn-fill: #fdf0d8;
+  --warn-ink: #7a4c0f;
+  --ink-dark: #1a1a1f;   /* dark cards (spend tile, logo mark) */
+
+  /* Not in the spec: failure needs to be distinguishable from "needs your
+     attention", and the warn pair is already spoken for by the review gate. */
+  --bad-fill: #fbe7e2;
+  --bad-ink: #8a3123;
+
+  --sans: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --mono: 'JetBrains Mono', ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, monospace;
+
+  --r-chip: 7px;
+  --r-card: 11px;
+  --r-frame: 14px;
+
+  --pad: 28px;
+  --topbar-h: 62px;
+}
+
+* { box-sizing: border-box; }
+
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: -0.005em;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Nothing on a consumer page should ever be reachable only sideways. */
+  overflow-x: hidden;
+}
+
+h1, h2, h3, p, figure, ul, ol { margin: 0; }
+ul, ol { padding: 0; list-style: none; }
+img { max-width: 100%; display: block; }
+a { color: var(--accent-ink); }
+
+/* Keyboard focus. The accent is a light-on-light hazard as a ring against
+   white, so the ring uses the darker accent-ink instead. */
+:focus-visible {
+  outline: 2px solid var(--accent-ink);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+main:focus { outline: none; }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+
+.skip-link {
+  position: absolute; left: 8px; top: -60px; z-index: 100;
+  background: var(--ink); color: var(--paper);
+  padding: 10px 14px; border-radius: 8px; font-weight: 600;
+  text-decoration: none; transition: top .12s;
+}
+.skip-link:focus { top: 8px; }
+
+/* ── Buttons ─────────────────────────────────────────────────────── */
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  min-height: 38px;
+  padding: 8px 14px;
+  border-radius: 9px;
+  border: 1px solid var(--line-3);
+  background: var(--card);
+  color: var(--ink);
+  font: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background .12s, border-color .12s, color .12s;
+}
+.btn:hover { background: var(--paper-2); border-color: var(--ink-3); }
+.btn:disabled, .btn[aria-disabled="true"] {
+  opacity: .55; cursor: not-allowed; background: var(--card);
+  border-color: var(--line);
+}
+.btn:disabled:hover, .btn[aria-disabled="true"]:hover { background: var(--card); }
+
+.btn--primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--ink);          /* never white on the accent */
+  font-weight: 600;
+}
+.btn--primary:hover { background: #d3f95f; border-color: #d3f95f; }
+.btn--primary:disabled, .btn--primary[aria-disabled="true"] {
+  background: var(--fill); border-color: var(--line-3); color: var(--ink-3);
+}
+.btn--ghost { border-color: transparent; background: transparent; color: var(--ink-2); }
+.btn--ghost:hover { background: var(--paper-2); border-color: transparent; color: var(--ink); }
+.btn--block { width: 100%; }
+.btn--lg { min-height: 46px; font-size: 14px; padding: 12px 18px; }
+.btn--sm { min-height: 32px; padding: 5px 10px; font-size: 12px; }
+
+.btn--danger { color: var(--bad-ink); }
+
+/* ── Chips ───────────────────────────────────────────────────────── */
+
+.chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 8px;
+  border-radius: var(--r-chip);
+  background: var(--fill);
+  color: var(--ink-2);
+  font-size: 11.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.chip--ok { background: var(--ok-fill); color: var(--ok-ink); }
+.chip--warn { background: var(--warn-fill); color: var(--warn-ink); }
+.chip--bad { background: var(--bad-fill); color: var(--bad-ink); }
+.chip--accent { background: var(--accent); color: var(--ink); font-weight: 600; }
+.chip--line { background: var(--card); border: 1px solid var(--line); }
+/* Colour is never the only signal: every state chip also carries a glyph. */
+.chip__glyph { font-size: 10px; line-height: 1; }
+
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.caps {
+  font-size: 10px; font-weight: 600; letter-spacing: .13em;
+  text-transform: uppercase; color: var(--ink-3);
+}
+.muted { color: var(--ink-2); }
+.muted-3 { color: var(--ink-3); }
+
+/* ── Top bar ─────────────────────────────────────────────────────── */
+
+.topbar {
+  position: sticky; top: 0; z-index: 40;
+  height: var(--topbar-h);
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 14px;
+  padding: 0 var(--pad);
+}
+.brand { display: flex; align-items: center; gap: 9px; text-decoration: none; color: var(--ink); }
+.logo {
+  width: 28px; height: 28px; border-radius: 8px;
+  background: var(--ink-dark); color: var(--accent);
+  display: grid; place-items: center;
+  font-family: var(--mono); font-size: 12px; font-weight: 700;
+  flex: none;
+}
+.wordmark { font-weight: 600; font-size: 14.5px; letter-spacing: -0.01em; }
+
+.tabs { display: flex; gap: 2px; margin-left: 10px; }
+/* Same three tabs, moved into the page on a phone where the 62px bar has no
+   room for them beside the mark and the primary action. */
+.tabs--mobile { display: none; }
+.tab {
+  padding: 7px 12px; border-radius: 8px; border: 1px solid transparent;
+  background: none; font: inherit; font-size: 13px; font-weight: 500;
+  color: var(--ink-2); cursor: pointer; text-decoration: none;
+}
+.tab:hover { color: var(--ink); background: var(--paper-2); }
+.tab[aria-current="page"] { background: var(--fill); color: var(--ink); font-weight: 600; }
+
+.topbar__right { margin-left: auto; display: flex; align-items: center; gap: 12px; }
+.usage-note { font-size: 12.5px; color: var(--ink-2); }
+
+/* ── Page frame ──────────────────────────────────────────────────── */
+
+.shell {
+  max-width: 1240px; margin: 0 auto;
+  padding: 22px var(--pad) 64px;
+  display: flex; flex-direction: column; gap: 18px;
+}
+
+.card {
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: var(--r-card);
+  padding: 16px;
+}
+
+.section-head {
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+}
+.section-head h2 { font-size: 15px; font-weight: 600; }
+
+.banner {
+  border-radius: var(--r-card);
+  padding: 10px 14px;
+  font-size: 12.5px;
+  background: var(--warn-fill); color: var(--warn-ink);
+  display: flex; gap: 8px; align-items: flex-start;
+}
+.banner--bad { background: var(--bad-fill); color: var(--bad-ink); }
+
+/* ── Home: active job ────────────────────────────────────────────── */
+
+.home-top { display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 16px; align-items: stretch; }
+
+.active-card { display: flex; flex-direction: column; gap: 12px; }
+.active-row { display: flex; gap: 14px; align-items: flex-start; }
+
+.thumb {
+  width: 112px; height: 64px; flex: none;
+  border-radius: 8px; overflow: hidden;
+  background: var(--ink-dark);
+  position: relative;
+  display: grid; place-items: center;
+  color: rgba(255,255,255,.55);
+}
+.thumb img { width: 100%; height: 100%; object-fit: cover; }
+.thumb--lg { width: 100%; height: 118px; border-radius: 0; }
+.thumb__sliver {
+  position: absolute; left: 0; bottom: 0; height: 3px;
+  background: var(--accent);
+}
+.thumb__glyph { position: absolute; font-size: 18px; }
+
+.dot {
+  width: 7px; height: 7px; border-radius: 50%; flex: none;
+  background: var(--accent-ink); display: inline-block;
+  animation: pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .35 } }
+@media (prefers-reduced-motion: reduce) { .dot { animation: none } }
+
+.active-title { font-size: 15px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.active-sub { font-size: 12.5px; color: var(--ink-2); margin-top: 2px; }
+
+.bar {
+  height: 5px; border-radius: 3px; background: var(--fill); overflow: hidden;
+}
+.bar > i { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .4s; }
+
+.spend {
+  background: var(--ink-dark); color: #fff;
+  border-radius: var(--r-card); padding: 16px;
+  display: flex; flex-direction: column; gap: 4px;
+}
+.spend__k { font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: rgba(255,255,255,.5); font-weight: 600; }
+.spend__v { font-family: var(--mono); font-size: 30px; font-weight: 600; letter-spacing: -0.02em; }
+.spend__sub { font-size: 12.5px; color: rgba(255,255,255,.62); }
+.spend__foot { margin-top: auto; padding-top: 10px; font-size: 11.5px; color: var(--accent); }
+
+/* ── Home: video grid ────────────────────────────────────────────── */
+
+.filters { display: flex; gap: 6px; margin-left: auto; }
+.filter {
+  padding: 5px 11px; border-radius: 999px; border: 1px solid var(--line);
+  background: var(--card); font: inherit; font-size: 12px; color: var(--ink-2);
+  cursor: pointer; min-height: 30px;
+}
+.filter[aria-pressed="true"] { background: var(--fill); color: var(--ink); font-weight: 600; border-color: var(--line-3); }
+
+.grid {
+  display: grid; gap: 14px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+}
+
+.vcard {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--r-card); overflow: hidden;
+  display: flex; flex-direction: column;
+}
+.vcard__body { padding: 12px; display: flex; flex-direction: column; gap: 8px; flex: 1; }
+.vcard__title {
+  font-size: 13.5px; font-weight: 600; line-height: 1.35;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  overflow: hidden; overflow-wrap: anywhere;
+}
+.vcard__meta { font-size: 12px; color: var(--ink-2); }
+.vcard__chips { display: flex; flex-wrap: wrap; gap: 5px; }
+.vcard__actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; padding-top: 4px; }
+
+.newtile {
+  border: 1px dashed var(--line-3); border-radius: var(--r-card);
+  background: transparent; color: var(--ink-2);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; min-height: 190px; padding: 16px; text-align: center;
+  font: inherit; cursor: pointer; text-decoration: none;
+}
+.newtile:hover { border-color: var(--accent-ink); color: var(--ink); background: var(--card); }
+.newtile__plus { font-size: 22px; line-height: 1; }
+.newtile__label { font-weight: 600; color: var(--ink); font-size: 13.5px; }
+
+.autodub {
+  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  background: var(--paper-2); border: 1px solid var(--line-2);
+  border-radius: var(--r-card); padding: 14px 16px;
+}
+.autodub p { font-size: 12.5px; color: var(--ink-2); max-width: 58ch; }
+
+.empty {
+  text-align: center; padding: 42px 20px; color: var(--ink-2);
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+}
+
+/* ── Wizard ──────────────────────────────────────────────────────── */
+
+.wizbar {
+  position: sticky; top: 0; z-index: 40;
+  height: var(--topbar-h); background: var(--card);
+  border-bottom: 1px solid var(--line);
+  display: flex; align-items: center; gap: 14px; padding: 0 var(--pad);
+}
+.stepper { display: flex; align-items: center; gap: 8px; margin: 0 auto; }
+.step { display: flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-3); }
+.step__n {
+  width: 21px; height: 21px; border-radius: 50%; flex: none;
+  display: grid; place-items: center;
+  font-family: var(--mono); font-size: 11px; font-weight: 600;
+  background: var(--fill); color: var(--ink-3);
+}
+.step[data-state="current"] { color: var(--ink); font-weight: 600; }
+.step[data-state="current"] .step__n { background: var(--accent); color: var(--ink); }
+.step[data-state="done"] { color: var(--ink-2); }
+.step[data-state="done"] .step__n { background: var(--ok-fill); color: var(--ok-ink); }
+.step__line { width: 34px; height: 2px; background: var(--line); border-radius: 2px; }
+.step__line[data-done="1"] { background: var(--accent); }
+
+/* Phone stepper: a 3-segment progress bar, per the mobile artboard. */
+.stepbar { display: none; gap: 4px; flex: 1; }
+.stepbar > i { flex: 1; height: 4px; border-radius: 2px; background: var(--line); }
+.stepbar > i[data-on="1"] { background: var(--accent); }
+
+.wizard { display: grid; grid-template-columns: minmax(0, 1fr) 352px; gap: 26px; align-items: start; }
+.wizcol { display: flex; flex-direction: column; gap: 22px; min-width: 0; }
+.wizcol h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.02em; }
+.wizcol .lede { font-size: 13.5px; color: var(--ink-2); margin-top: 6px; max-width: 56ch; }
+
+.field {
+  width: 100%; padding: 11px 12px; min-height: 44px;
+  border: 1px solid var(--line-3); border-radius: 9px;
+  background: var(--card); color: var(--ink);
+  font: inherit; font-size: 14px;
+}
+.field::placeholder { color: var(--ink-3); }
+.field:focus { border-color: var(--accent-ink); outline: none; }
+.field:focus-visible { outline: 2px solid var(--accent-ink); outline-offset: 1px; }
+
+.drop {
+  border: 1px dashed var(--line-3); border-radius: var(--r-card);
+  padding: 24px; text-align: center; background: var(--card);
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+.drop.is-drag { border-color: var(--accent-ink); background: var(--ok-fill); }
+
+.langs { display: flex; flex-wrap: wrap; gap: 8px; }
+.langchip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 9px 13px; min-height: 38px;
+  border-radius: 9px; border: 1px solid var(--line-3);
+  background: var(--card); color: var(--ink);
+  font: inherit; font-size: 13px; font-weight: 500; cursor: pointer;
+}
+.langchip:hover { border-color: var(--ink-3); }
+.langchip[aria-pressed="true"] {
+  background: var(--accent); border-color: var(--accent);
+  color: var(--ink); font-weight: 600;
+}
+.langchip__mark { font-size: 11px; width: 10px; text-align: center; }
+
+.voicecards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+.voicecard {
+  text-align: left; background: var(--card);
+  border: 1px solid var(--line-3); border-radius: var(--r-card);
+  padding: 14px; display: flex; flex-direction: column; gap: 8px;
+  font: inherit; color: inherit; cursor: pointer;
+}
+.voicecard[aria-pressed="true"] { border: 2px solid var(--accent); padding: 13px; }
+.voicecard__head { display: flex; align-items: center; gap: 8px; }
+.voicecard__name { font-size: 14px; font-weight: 600; }
+.voicecard p { font-size: 12.5px; color: var(--ink-2); }
+
+.picker { display: flex; flex-direction: column; gap: 8px; }
+.picker__row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--card);
+}
+.picker__row[aria-current="true"] { border-color: var(--accent-ink); background: var(--ok-fill); }
+.picker__name { font-weight: 500; font-size: 13px; }
+
+.toggle {
+  display: flex; align-items: flex-start; gap: 12px;
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--r-card); padding: 14px;
+}
+.toggle__btn {
+  width: 44px; height: 26px; flex: none; border-radius: 999px;
+  border: 1px solid var(--line-3); background: var(--fill);
+  position: relative; cursor: pointer; padding: 0;
+}
+.toggle__btn::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: var(--card); border: 1px solid var(--line-3);
+  transition: transform .14s;
+}
+.toggle__btn[aria-checked="true"] { background: var(--accent); border-color: var(--accent); }
+.toggle__btn[aria-checked="true"]::after { transform: translateX(18px); border-color: rgba(0,0,0,.2); }
+.toggle__label { font-size: 13.5px; font-weight: 600; }
+.toggle__hint { font-size: 12.5px; color: var(--ink-2); margin-top: 3px; }
+
+/* Price rail */
+.rail {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--r-card); overflow: hidden;
+  position: sticky; top: calc(var(--topbar-h) + 16px);
+}
+.rail__body { padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+.rail__title { font-size: 13.5px; font-weight: 600; line-height: 1.35; overflow-wrap: anywhere; }
+.rail__meta { font-size: 12px; color: var(--ink-2); }
+.lines { display: flex; flex-direction: column; gap: 7px; font-size: 12.5px; }
+.line { display: flex; justify-content: space-between; gap: 10px; }
+.line span:last-child { color: var(--ink-2); }
+.total {
+  display: flex; justify-content: space-between; align-items: baseline;
+  border-top: 1px solid var(--line); padding-top: 11px;
+}
+.total__k { font-size: 13px; font-weight: 600; }
+.total__v { font-family: var(--mono); font-size: 21px; font-weight: 600; }
+.reassure { font-size: 12px; color: var(--ink-2); background: var(--paper-2); border-radius: 8px; padding: 10px; }
+
+/* ── Review screen ───────────────────────────────────────────────── */
+
+.review { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 24px; align-items: start; }
+.railcol { display: flex; flex-direction: column; gap: 14px; position: sticky; top: calc(var(--topbar-h) + 16px); }
+.langlist { display: flex; flex-direction: column; gap: 3px; }
+.langlist__item {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px; border-radius: 8px; font-size: 13px; color: var(--ink-2);
+}
+.langlist__item[aria-current="true"] { background: var(--fill); color: var(--ink); font-weight: 600; }
+.langlist__badge { margin-left: auto; }
+
+.flagcard {
+  background: var(--card); border: 1px solid var(--line);
+  border-radius: var(--r-card); padding: 16px;
+  display: flex; flex-direction: column; gap: 11px;
+}
+.flagcard.is-decided { border-color: var(--ok-ink); }
+.flagcard__head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.flagcard__head .btn { margin-left: auto; }
+.quote { font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; }
+.quote__k { font-size: 11.5px; color: var(--ink-3); font-weight: 600; display: block; margin-bottom: 2px; }
+mark.src { background: #f5f3e8; color: var(--ink); padding: 1px 3px; border-radius: 4px; }
+mark.tgt { background: var(--ok-fill); color: var(--ok-ink); padding: 1px 3px; border-radius: 4px; font-weight: 600; }
+.aside { color: var(--ink-3); font-size: 12.5px; }
+.choices { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.remember { font-size: 11.5px; color: var(--ink-3); }
+
+.confident {
+  background: var(--card); border: 1px solid var(--line); border-radius: var(--r-card);
+  padding: 28px; text-align: center; display: flex; flex-direction: column;
+  align-items: center; gap: 10px;
+}
+.confident h2 { font-size: 18px; font-weight: 600; }
+
+.footcard {
+  background: var(--paper-2); border: 1px solid var(--line-2);
+  border-radius: var(--r-card); padding: 16px;
+  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+}
+.footcard strong { font-size: 14px; }
+.footcard p { font-size: 12.5px; color: var(--ink-2); max-width: 54ch; }
+.footcard .btn { margin-left: auto; }
+
+/* ── Sticky action bar (the phone artboards pin the primary action) ── */
+
+.stickybar { display: none; }
+
+/* ── Misc ────────────────────────────────────────────────────────── */
+
+.rowflex { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.spread { display: flex; gap: 10px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.stack { display: flex; flex-direction: column; gap: 12px; }
+.stack-sm { display: flex; flex-direction: column; gap: 7px; }
+
+.spinner {
+  width: 15px; height: 15px; border-radius: 50%; flex: none;
+  border: 2px solid var(--line-3); border-top-color: var(--accent-ink);
+  animation: spin .7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg) } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s } }
+
+.demo-flag {
+  font-size: 11px; color: var(--warn-ink); background: var(--warn-fill);
+  border-radius: 6px; padding: 2px 7px; font-weight: 600;
+}
+
+/* ── Phones and narrow windows ───────────────────────────────────────
+   Creators film and publish on a phone, so this is not a fallback. The
+   two-column layouts collapse, the price rail and the approve button
+   become a fixed bar at the bottom of the viewport, and every control
+   grows to a 48px touch target. Verified down to 330px. */
+
+@media (max-width: 900px) {
+  :root { --pad: 14px; }
+
+  .home-top, .wizard, .review { grid-template-columns: minmax(0, 1fr); }
+
+  .shell { padding-bottom: 108px; gap: 16px; }
+
+  .topbar { gap: 8px; }
+  .topbar .tabs { display: none; }       /* re-drawn inside the page instead */
+  .tabs--mobile {
+    display: flex; gap: 4px; margin: 0 0 2px;
+    overflow-x: auto; -webkit-overflow-scrolling: touch;
+  }
+  .tabs--mobile .tab { text-align: center; min-height: 40px; display: grid; place-items: center; }
+  .topbar .usage-note { display: none; } /* the spend tile already says it */
+  .topbar__right .btn--primary { display: none; } /* pinned at the bottom instead */
+
+  /* The review bar's two actions do not fit beside a title at 330px; the
+     sticky bar at the bottom carries both. */
+  .wizbar .topbar__right { display: none; }
+
+  .stepper { display: none; }
+  .stepbar { display: flex; }
+
+  /* The rail is content on a phone, not a sidebar — it stops being sticky
+     so it cannot pin itself over the form, and it gives up its copy of the
+     primary action because the bar at the bottom of the viewport has it. */
+  .rail, .railcol { position: static; }
+  .rail .btn--primary, .rail__eta { display: none; }
+
+  .tabs--mobile .tab { flex: 0 1 auto; white-space: nowrap; font-size: 12.5px; padding: 7px 11px; }
+
+  .grid { grid-template-columns: minmax(0, 1fr); }
+
+  .btn { min-height: 44px; padding: 10px 15px; }
+  .btn--lg { min-height: 50px; }
+  .btn--sm { min-height: 36px; }
+  .langchip { min-height: 44px; padding: 12px 14px; }
+  .filter { min-height: 36px; }
+
+  .choices { flex-direction: column; align-items: stretch; }
+  .choices .btn { width: 100%; }
+  .choices .remember { text-align: center; }
+
+  .footcard .btn { margin-left: 0; width: 100%; }
+  .flagcard__head .btn { margin-left: 0; width: 100%; }
+  .flagcard__head { gap: 7px; }
+
+  .stickybar {
+    display: flex; flex-direction: column; gap: 8px;
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 45;
+    background: var(--card); border-top: 1px solid var(--line);
+    padding: 10px var(--pad) calc(10px + env(safe-area-inset-bottom));
+  }
+  .stickybar .btn { min-height: 48px; width: 100%; }
+  /* The bar's secondary action is a way out, not a target — it does not need
+     the same weight as the one thing the screen is asking for. */
+  .stickybar .btn--ghost { min-height: 40px; }
+  .stickybar__note { font-size: 12px; color: var(--ink-2); text-align: center; }
+  .stickybar__price { display: flex; justify-content: space-between; align-items: baseline; }
+
+  .spend { flex-direction: row; align-items: baseline; flex-wrap: wrap; gap: 10px; }
+  .spend__foot { margin-top: 0; padding-top: 0; width: 100%; }
+
+  .thumb { width: 92px; height: 54px; }
+  .wizcol h1 { font-size: 21px; }
+}
+
+@media (max-width: 480px) {
+  /* The rail's note card and the sticky bar both say the job is paused. */
+  .wizbar .chip--warn { display: none; }
+}
+
+@media (max-width: 380px) {
+  .wordmark { display: none; }        /* the mark alone still identifies it */
+  .langs { gap: 6px; }
+  .langchip { padding: 12px 11px; font-size: 12.5px; }
+  .spend__v { font-size: 26px; }
+}

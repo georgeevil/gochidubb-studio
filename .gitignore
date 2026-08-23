@@ -10,8 +10,16 @@ __pycache__/
 .env.*
 !.env.example
 .claude/settings.local.json
+# Claude Code agent worktrees — checkouts of this same repo, not content.
+.claude/worktrees/
 # Persisted UserConfig — holds hf_token in plaintext (app/config.py)
 config-user.json
+# Per-user UI state (server.py PREFS_FILE) — last-used models, voice,
+# and the creator/pro mode choice. Local to one install, like the above.
+user_prefs.json
+# User's own glossary — names, brands and personal terms they corrected
+# during review. Private to one creator; never in the repo.
+presets/user_glossary.json
 # Platform credentials store — VK token etc. (app/secrets.py)
 secrets.json
 # API keys (salted hashes) and webhook subscriptions incl. signing secrets.

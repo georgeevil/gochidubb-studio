@@ -124,3 +124,89 @@ def test_every_band_is_reported_even_when_unreached():
     assert [b["minutes"] for b in r["bands"][1:]] == [0, 0]
     # And the unreached bands still advertise their rate.
     assert [b["rate"] for b in r["bands"]] == [0.080, 0.065, 0.050]
+
+
+# ── marginal_cost — what the wizard quotes before Start ───────────────
+
+def test_marginal_cost_is_a_difference_not_a_standalone_price():
+    """The bug this pins: pricing the new minutes from zero.
+
+    A workspace 480 minutes into the month buying 40 more pays the first
+    rate for 20 of them and the second for the other 20. Pricing 40 minutes
+    standalone charges all 40 at the first rate — $3.20 in the wizard,
+    $2.90 on the meter, for the same job.
+    """
+    r = billing.marginal_cost(480, 40)
+    assert r["cost"] == pytest.approx(20 * 0.080 + 20 * 0.065)
+    assert r["cost"] != pytest.approx(billing.price_minutes(40)["cost"])
+
+
+def test_marginal_cost_from_zero_matches_a_standalone_price():
+    r = billing.marginal_cost(0, 36)
+    assert r["cost"] == pytest.approx(billing.price_minutes(36)["cost"])
+
+
+def test_marginal_plus_used_equals_the_new_total():
+    """Adding the quote to this month's bill must land on next month's
+    reading of the same meter — no rounding drift between the two."""
+    used, new = 1900.0, 250.0
+    r = billing.marginal_cost(used, new)
+    assert r["total_cost"] == pytest.approx(billing.price_minutes(used + new)["cost"])
+    assert r["cost"] + billing.price_minutes(used)["cost"] == pytest.approx(
+        r["total_cost"], abs=0.01)
+
+
+def test_marginal_bands_describe_only_the_new_minutes():
+    r = billing.marginal_cost(480, 40)
+    assert [b["minutes"] for b in r["bands"]] == [20, 20, 0]
+    assert sum(b["cost"] for b in r["bands"]) == pytest.approx(r["cost"])
+
+
+def test_marginal_rate_is_where_the_purchase_starts():
+    r = billing.marginal_cost(480, 40)
+    assert r["rate"] == 0.080                       # first new minute
+    assert r["effective_rate"] == pytest.approx(r["cost"] / 40)
+
+
+def test_marginal_cost_of_nothing_is_free():
+    r = billing.marginal_cost(120, 0)
+    assert r["cost"] == 0
+    assert r["rate"] == 0.080
+    assert r["estimate"] is True
+
+
+def test_marginal_cost_ignores_negative_input():
+    assert billing.marginal_cost(-10, -10)["cost"] == 0
+
+
+def test_marginal_cost_is_what_the_meter_will_move_by():
+    """`cost` is the difference of two *displayed* totals, not of the raw
+    arithmetic — so it is exactly what the meter's headline changes by.
+
+    Pinned because it is tempting to "fix" the cent of disagreement with
+    the band breakdown by recomputing `cost` unrounded, which would make
+    the wizard quote a number the meter then contradicts.
+    """
+    used, new = 490.0, 20.0
+    r = billing.marginal_cost(used, new)
+    meter_before = billing.price_minutes(used)["cost"]
+    meter_after = billing.price_minutes(used + new)["cost"]
+    assert r["cost"] == pytest.approx(meter_after - meter_before, abs=1e-9)
+
+
+def test_marginal_bands_are_a_decomposition_not_the_quote():
+    """The bands may disagree with `cost` by a cent, by design.
+
+    They are the exact unrounded split of the same minutes, rounded once
+    each for display; `cost` is a difference of already-rounded totals. A
+    caller must render `cost` as the total rather than summing the bands.
+    """
+    for used, new in [(490.0, 20.0), (0.0, 36.2), (1990.0, 25.0),
+                      (123.45, 67.89)]:
+        r = billing.marginal_cost(used, new)
+        band_sum = sum(b["cost"] for b in r["bands"])
+        # Same money, to within the rounding that separates them.
+        assert abs(band_sum - r["cost"]) <= 0.01 + 1e-9, (used, new)
+        # And the minutes always reconcile exactly — only money rounds.
+        assert sum(b["minutes"] for b in r["bands"]) == pytest.approx(
+            r["new_minutes"], abs=0.02)

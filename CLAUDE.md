@@ -109,4 +109,9 @@ All three respect `GOCHIDUBB_URL` (default `http://localhost:8910`) so any of th
 
 There is no full integration test suite — most of the pipeline is tested by running end-to-end. Pytest coverage focuses on pure functions (segment post-processing, VAD math, translator prompt building, assembler timing). Fixtures in `tests/conftest.py` provide realistic sample segments (`sample_segments`, `continuation_segments`, `micro_segments`, `long_segments`) — reuse them when adding tests for `pipeline/segment_post.py` or `pipeline/assembler.py`. `temp_audio_file` generates a valid 0.5s WAV without needing external files.
 
+`tests/test_creator_routes.py` is the only suite that drives `server.app` itself, via `TestClient`. Two things about it are load-bearing:
+
+- **It uses `TestClient(app)` without the context manager on purpose.** The lifespan is what calls `init_db()` and `load_all_jobs()`, so skipping it leaves `app.db._DB_PATH` as None and `save_job_sync` a no-op — a test run cannot touch the real `gochidubb.db`.
+- **That also means background tasks are cancelled the moment a request ends.** Without the context manager the event-loop portal is torn down per request, so anything `asyncio.create_task` spawned dies with it — measured, a **1 ms** delay inside the task is enough for it to be cancelled instead of finishing. A test that spawns a real task there passes only when its stub wins that race, and would silently stop covering the real path the moment the stub got slower. Don't race it: `server._spawn_background` is a seam for exactly this — patch it to capture the coroutine and run it with `asyncio.run()`. No sleeps, no polling.
+
 CI (`.github/workflows/lint.yml`) runs `ruff check .` + `python -m compileall` only. Landing a green CI is not evidence a feature works.
