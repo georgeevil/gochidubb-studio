@@ -395,10 +395,21 @@ def _numbering_responder(prefix="ES:", drop_line=None, unnumbered=False):
 
 @pytest.fixture
 def batching(monkeypatch):
-    """Deterministic batch sizing, no glossary, no dedupe surprises."""
+    """Deterministic batch sizing, no glossary, no dedupe surprises.
+
+    `LM_STUDIO_MAX_CONCURRENT` is pinned off because it is read from the
+    environment at import time, and whether the repo's `.env` has been loaded
+    by then depends on whether some *other* test imported `server` first
+    (server.py calls load_dotenv before importing this module). That made the
+    whole class order-dependent: run alone the setting was 0, run after a
+    route test it was 2, and the tests that assert on cross-batch context
+    only hold at a concurrency of 1. Tests that care about the ceiling set it
+    themselves — see TestConcurrencyCeiling.
+    """
     monkeypatch.setattr(T, "TRANSLATE_BATCH_SIZE", 4)
     monkeypatch.setattr(T, "TRANSLATE_BATCH_CHARS", 100_000)
     monkeypatch.setattr(T, "TRANSLATE_CONTEXT_LINES", 2)
+    monkeypatch.setattr(T, "LM_STUDIO_MAX_CONCURRENT", 0)
     monkeypatch.setattr(T, "_GLOSSARY_CACHE", {"ru": {}})
 
 
@@ -444,6 +455,58 @@ class TestUntranslatedRepliesAreRejected:
             segs, "es", model="m", max_concurrent=1))
 
         assert out[0]["translated_text"] == "Gracias por todo lo que has hecho por mí"
+
+
+class TestConcurrencyCeiling:
+    """LM_STUDIO_MAX_CONCURRENT is a ceiling on the caller, never a floor.
+
+    It used to be assigned unconditionally, so a caller asking for 1 got
+    whatever the config said. That is not a harmless speed-up: above a
+    concurrency of 1 the next batch is built before the previous one has
+    returned, so `prev_context` can only offer bare source lines and the
+    continuity prompt the caller asked for silently disappears.
+    `tools/gochidubb_benchmark.py` passes max_concurrent=1 for exactly that
+    prompt, and on any machine using this repo's .env (which sets 2) it had
+    been measuring a different one.
+    """
+
+    def test_a_config_ceiling_never_raises_the_callers_choice(
+            self, stub, batching, monkeypatch):
+        monkeypatch.setattr(T, "USE_LM_STUDIO", True)
+        monkeypatch.setattr(T, "LM_STUDIO_MAX_CONCURRENT", 4)
+        stub.native_body = _numbering_responder()
+        segs = _segs(*[f"line {i}" for i in range(8)])
+
+        _run(stub, T.translate_segments(segs, "es", model="m", max_concurrent=1))
+
+        # Still serial, so batch 2 sees batch 1's *translations*. Under the
+        # bug the batches overlapped and this was the bare source line.
+        second = stub.requests[1][1]["input"]
+        assert "ES: line 3" in second
+
+    def test_the_ceiling_still_lowers_a_caller_that_asks_for_more(
+            self, stub, batching, monkeypatch, caplog):
+        monkeypatch.setattr(T, "USE_LM_STUDIO", True)
+        monkeypatch.setattr(T, "LM_STUDIO_MAX_CONCURRENT", 1)
+        stub.native_body = _numbering_responder()
+        segs = _segs(*[f"line {i}" for i in range(8)])
+
+        with caplog.at_level("INFO", logger="pipeline.translator"):
+            _run(stub, T.translate_segments(segs, "es", model="m",
+                                            max_concurrent=8))
+        assert "Limiting translation concurrency to 1" in caplog.text
+
+    def test_no_ceiling_is_announced_when_none_was_applied(
+            self, stub, batching, monkeypatch, caplog):
+        """The log line used to fire on a value that changed nothing."""
+        monkeypatch.setattr(T, "USE_LM_STUDIO", True)
+        monkeypatch.setattr(T, "LM_STUDIO_MAX_CONCURRENT", 4)
+        stub.native_body = _numbering_responder()
+
+        with caplog.at_level("INFO", logger="pipeline.translator"):
+            _run(stub, T.translate_segments(_segs("line 0"), "es", model="m",
+                                            max_concurrent=1))
+        assert "Limiting translation concurrency" not in caplog.text
 
 
 class TestBatchedTranslation:

@@ -1524,12 +1524,21 @@ async def translate_segments(
     # server-side while each one's clock runs — with a big thinking model that
     # turns into timeouts on the later segments. LM_STUDIO_MAX_CONCURRENT
     # (already in .env.example) caps it; honour it here.
-    if USE_LM_STUDIO and LM_STUDIO_MAX_CONCURRENT > 0:
-        if LM_STUDIO_MAX_CONCURRENT < max_concurrent:
-            logger.info(
-                f"Limiting translation concurrency to "
-                f"{LM_STUDIO_MAX_CONCURRENT} (LM_STUDIO_MAX_CONCURRENT)"
-            )
+    #
+    # A CEILING, never a floor. This used to assign the setting unconditionally,
+    # which meant a caller asking for 1 got whatever the config said — 2, on a
+    # machine with the .env shipped in this repo. Raising it is not a harmless
+    # speed-up: `prev_context` can only show the model the *translated* previous
+    # lines once that batch has finished, so anything above 1 silently drops the
+    # continuity context back to bare source text (see TRANSLATE_CONTEXT_LINES in
+    # .env.example). `tools/gochidubb_benchmark.py` passes max_concurrent=1
+    # precisely to get that prompt, and was quietly measuring a different one.
+    if (USE_LM_STUDIO and LM_STUDIO_MAX_CONCURRENT > 0
+            and LM_STUDIO_MAX_CONCURRENT < max_concurrent):
+        logger.info(
+            f"Limiting translation concurrency to "
+            f"{LM_STUDIO_MAX_CONCURRENT} (LM_STUDIO_MAX_CONCURRENT)"
+        )
         max_concurrent = LM_STUDIO_MAX_CONCURRENT
 
     max_concurrent = max(1, min(max_concurrent, 20))
