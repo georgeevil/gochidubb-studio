@@ -1,0 +1,836 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
+<title>Admin console · GoChiDUBB</title>
+<!-- No CDN, no build step, no framework — same rule as creator.html. This
+     page is the one someone opens when they want to know whether the server
+     is healthy, so it must paint with nothing but the server that serves it. -->
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+<a class="skip-link" href="#console">Skip to content</a>
+
+<div class="shell">
+  <nav class="nav" id="nav" aria-label="Admin sections"></nav>
+  <main class="console" id="console" tabindex="-1"></main>
+</div>
+<div id="live" role="status" aria-live="polite" class="sr-only"></div>
+
+<script>
+"use strict";
+
+// ═══════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════
+
+const $ = (s, root) => (root || document).querySelector(s);
+const $$ = (s, root) => Array.from((root || document).querySelectorAll(s));
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => (
+  {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+/** Dollars, always two decimals — this is money, even when it is an estimate. */
+const money = n => "$" + (Number(n) || 0).toFixed(2);
+/** Per-minute rates are published to three decimals ($0.065); money() would
+ *  round that to $0.07, a price that does not exist. */
+const rate = n => "$" + (Number(n) || 0).toFixed(3);
+/** 61204 -> "61,204". Big counts are unreadable without the separators. */
+const num = (n, dp) => (Number(n) || 0).toLocaleString("en-US", {
+  minimumFractionDigits: dp || 0, maximumFractionDigits: dp || 0 });
+const pct = n => (n === null || n === undefined) ? "—" : (Number(n).toFixed(1) + "%");
+
+/** Compact "2m ago" / "3d ago". Absent timestamps read as "never", not "now". */
+function ago(ts) {
+  if (!ts) return "never";
+  const s = Math.max(0, Date.now() / 1000 - Number(ts));
+  if (s < 60) return "just now";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  if (s < 86400 * 30) return Math.floor(s / 86400) + "d ago";
+  return new Date(Number(ts) * 1000).toLocaleDateString(undefined,
+    { month: "short", day: "numeric", year: "numeric" });
+}
+function dateStr(ts) {
+  if (!ts) return "—";
+  return new Date(Number(ts) * 1000).toLocaleDateString(undefined,
+    { month: "short", day: "numeric", year: "numeric" });
+}
+function secs(n) {
+  n = Number(n) || 0;
+  if (n < 90) return n.toFixed(0) + "s";
+  if (n < 3600) return (n / 60).toFixed(1) + "m";
+  return (n / 3600).toFixed(1) + "h";
+}
+/** Stage timings are rates — seconds of stage per second of source — so they
+ *  are comparable across a day of feature films and a day of 30s clips. */
+const rt = n => (Number(n) || 0).toFixed(n < 0.1 ? 3 : 2) + "×";
+
+/** A delta rendered with the right sign AND the right colour.
+ *
+ *  `betterWhenLower` exists for the realtime-factor tile: a number that fell
+ *  is an improvement there, and painting it amber like a dropping success
+ *  rate would tell the reader the opposite of what happened. */
+function delta(v, betterWhenLower) {
+  if (v === null || v === undefined) return `<div class="tile-note">no prior period</div>`;
+  const up = Number(v) >= 0;
+  const good = betterWhenLower ? !up : up;
+  const arrow = up ? "▲" : "▼";
+  return `<div class="tile-note ${good ? "up" : "down"}">${arrow} ${Math.abs(Number(v)).toFixed(1)}% vs previous</div>`;
+}
+
+function sev(s) { return s === "bad" ? "bad" : s === "warn" ? "warn" : "ok"; }
+
+function chip(text, kind, extra) {
+  return `<span class="chip chip--${kind || "line"} ${extra || ""}">${esc(text)}</span>`;
+}
+
+function announce(msg) { $("#live").textContent = msg; }
+
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  const text = await res.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : null; } catch (_) { /* non-JSON */ }
+  if (!res.ok) {
+    throw new Error((body && body.error) || `${res.status} ${res.statusText}`);
+  }
+  return body;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════════════
+
+const VIEWS = ["overview", "accounts", "revenue", "fleet", "review"];
+
+const state = {
+  view: "overview",
+  windowDays: 30,
+  mode: "local",
+  data: {},          // view -> last payload
+  selectedKey: null, // accounts detail
+  keyDetail: null,
+  fleetTimer: null,
+  busy: false,
+};
+
+// ═══════════════════════════════════════════════════════════════════
+// Navigation rail
+// ═══════════════════════════════════════════════════════════════════
+
+// "Feature flags" and "Staff access" are in the design's rail and have no
+// screen behind them here. They are rendered disabled rather than dropped:
+// the rail is the design's map of the console, and quietly deleting two of
+// its seven entries would hide what is missing instead of showing it.
+//
+// (And "feature flags" in the design means product rollout toggles, which is
+// unrelated to pipeline/flags.py — that module flags uncertain *translations*
+// for the creator review screen. Different word, different thing.)
+const NAV = [
+  { id: "overview", label: "Overview" },
+  { id: "accounts", label: "Accounts", count: () => (state.data.accounts || {}).counts?.total },
+  { id: "revenue", label: "Revenue" },
+  { id: "fleet", label: "Fleet & jobs" },
+  { id: "review", label: "Review queue",
+    count: () => (state.data.fleet || {}).review_queue?.length, warn: true },
+  { id: "flags", label: "Feature flags", disabled: "no rollout system in this build" },
+  { id: "staff", label: "Staff access", disabled: "this server has no authentication" },
+];
+
+function renderNav() {
+  const items = NAV.map(n => {
+    const n_ = n.count ? n.count() : null;
+    const badge = n_ ? `<span class="nav-count ${n.warn ? "is-warn" : ""}">${num(n_)}</span>` : "";
+    if (n.disabled) {
+      return `<button class="nav-item" disabled title="${esc(n.disabled)}">${esc(n.label)}</button>`;
+    }
+    return `<button class="nav-item" data-view="${n.id}"
+      ${state.view === n.id ? 'aria-current="page"' : ""}>${esc(n.label)}${badge}</button>`;
+  }).join("");
+
+  $("#nav").innerHTML = `
+    <div class="nav-brand">
+      <div class="nav-mark">gd</div>
+      <div>
+        <div class="nav-title">admin</div>
+        <div class="nav-sub">staff · ${esc(state.mode)}</div>
+      </div>
+    </div>
+    ${items}
+    <div class="nav-foot">
+      no sign-in<br>
+      <span class="muted">this server has no authentication</span><br>
+      <a href="/">← workspace</a>
+    </div>`;
+
+  $$("#nav .nav-item[data-view]").forEach(b => {
+    b.addEventListener("click", () => { location.hash = "#" + b.dataset.view; });
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Shared fragments
+// ═══════════════════════════════════════════════════════════════════
+
+function windowPicker() {
+  const opts = [[30, "30d"], [90, "90d"], [365, "12m"]];
+  return `<div class="seg" role="group" aria-label="Time window">` + opts.map(([d, l]) =>
+    `<button data-days="${d}" aria-pressed="${state.windowDays === d}">${l}</button>`
+  ).join("") + `</div>`;
+}
+
+function bindWindowPicker(reload) {
+  $$("[data-days]").forEach(b => b.addEventListener("click", () => {
+    state.windowDays = Number(b.dataset.days);
+    reload();
+  }));
+}
+
+/** The one sentence every dollar figure on this console is qualified by. */
+function disclaimer(text) {
+  return `<div class="note"><b>Minutes are real. The money is an estimate.</b>
+    ${esc(text || "")}</div>`;
+}
+
+function modeBanner() {
+  if (state.mode !== "hosted") return "";
+  return `<div class="banner"><b>This console is not authenticated.</b>
+    Deployment mode is <span class="mono">hosted</span>, but GoChiDUBB has no
+    staff sign-in: anyone who can reach this port can read the revenue
+    estimate, every API key record and the audit trail. Keep it on loopback or
+    behind your own proxy auth until that exists.</div>`;
+}
+
+function loading(what) {
+  return `<div class="skeleton">Loading ${esc(what)}…</div>`;
+}
+
+function failure(err, retry) {
+  return `<div class="banner"><b>Could not load this screen.</b>
+    ${esc(err.message || String(err))}
+    <button class="btn btn--sm" id="retry" style="margin-left:10px">Retry</button></div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Screen 1 — Business overview
+// ═══════════════════════════════════════════════════════════════════
+
+function tileValue(t) {
+  if (t.value === null || t.value === undefined) {
+    return `<div class="tile-value is-none">—</div>`;
+  }
+  const v = t.format === "money" ? money(t.value)
+    : t.format === "percent" ? pct(t.value)
+    : t.format === "factor" ? Number(t.value).toFixed(2) + "×"
+    : t.format === "int" ? num(t.value)
+    : num(t.value, 1);
+  return `<div class="tile-value">${esc(v)}</div>`;
+}
+
+function renderOverview(d) {
+  const series = d.series || [];
+  const max = Math.max(1, ...series.map(s => s.cost));
+  const bars = series.map((s, i) => {
+    const cls = i === series.length - 1 ? "is-last"
+      : i === series.length - 2 ? "is-prev" : "";
+    const h = Math.max(2, Math.round(s.cost / max * 100));
+    return `<div class="chart-bar ${cls}" style="height:${h}%"
+      title="${esc(s.bucket)} · ${money(s.cost)} · ${num(s.minutes, 1)} min · ${s.jobs} job(s)"></div>`;
+  }).join("");
+  const last = series[series.length - 1];
+
+  const attn = (d.attention || []).length
+    ? d.attention.map(a => `
+      <div class="attn-row">
+        <span class="attn-mark ${sev(a.severity)}">●</span>
+        <span><strong>${esc(a.title)}</strong><br>${esc(a.detail)}</span>
+        <a class="attn-go" href="#${esc(a.link === "jobs" ? "fleet" : a.link)}">open</a>
+      </div>`).join("")
+    : `<div class="empty">Nothing needs attention.</div>`;
+
+  const rows = (d.top_sources || []).map(s => `
+    <tr>
+      <td class="name">${esc(s.label)}
+        <span class="dim mono" style="font-size:10.5px">· ${s.jobs} job${s.jobs === 1 ? "" : "s"}${
+          s.langs.length ? " · " + esc(s.langs.join(" ")) : ""}</span></td>
+      <td class="num">${num(s.minutes, 1)}</td>
+      <td class="num" style="color:var(--ink)">${money(s.cost)}</td>
+      <td class="num">${rate(s.effective_rate)}</td>
+      <td class="num">${esc(s.mode)}</td>
+      <td class="num" style="color:var(${s.health === "bad" ? "--bad"
+        : s.health === "warn" ? "--warn" : "--accent"})">●</td>
+    </tr>`).join("") || `<tr><td colspan="6" class="empty">No jobs in this window.</td></tr>`;
+
+  return `
+    ${modeBanner()}
+    <div class="head">
+      <h1>Business overview</h1>
+      <span class="head-note">last ${d.window_days} days · UTC</span>
+      <div class="head-right">${windowPicker()}</div>
+    </div>
+
+    <div class="tiles">
+      ${(d.tiles || []).map(t => `
+        <div class="tile">
+          <div class="caps">${esc(t.label)}${t.estimate ? " (est.)" : ""}</div>
+          ${tileValue(t)}
+          ${t.delta_pct === null || t.delta_pct === undefined
+            ? `<div class="tile-note">${esc(t.note)}</div>`
+            : delta(t.delta_pct, t.key === "throughput")}
+          ${t.delta_pct === null || t.delta_pct === undefined ? ""
+            : `<div class="tile-note">${esc(t.note)}</div>`}
+        </div>`).join("")}
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-head">
+          <h2>Revenue by ${d.bucket === "month" ? "month" : "day"}</h2>
+          <span class="head-note">estimated · bars = $</span>
+        </div>
+        <div class="chart">${bars}</div>
+        <div class="chart-axis">
+          <span>${esc(series.length ? series[0].bucket : "")}</span>
+          <span>${last ? esc(last.bucket) + " · " + money(last.cost) : ""}</span>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><h2>Needs attention</h2></div>
+        <div class="attn">${attn}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Top sources by spend</h2>
+        <span class="head-note">grouped by batch · one submitted source per row</span>
+      </div>
+      <div class="table-scroll"><table>
+        <thead><tr>
+          <th>Source</th><th class="num">Minutes</th><th class="num">Spend (est.)</th>
+          <th class="num">Eff. rate</th><th class="num">Mode</th><th class="num">Health</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+    </div>
+
+    ${disclaimer(d.disclaimer)}
+    <div class="note">Spend per source is the window's estimated total shared
+      out in proportion to metered minutes. Pricing each source on its own
+      would give every one of them the first, most expensive tier and the
+      column would add up to more than the workspace used.</div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Screen 2 — Accounts (API keys)
+// ═══════════════════════════════════════════════════════════════════
+
+const KEY_STATE_CHIP = {
+  active: "ok", idle: "line", expiring: "warn", expired: "bad", revoked: "bad",
+};
+
+function renderAccounts(d) {
+  const w = d.workspace || {};
+  const rows = (d.keys || []).map(k => `
+    <tr data-key="${esc(k.id)}" class="${state.selectedKey === k.id ? "is-selected" : ""}"
+        style="cursor:pointer">
+      <td class="name">${esc(k.name)}
+        <span class="dim mono" style="font-size:10.5px">· ${esc(k.detail)}</span></td>
+      <td>${esc(k.environment)}</td>
+      <td class="num">${k.scopes.length}</td>
+      <td class="num">${esc(k.last_used ? ago(k.last_used) : "never")}</td>
+      <td class="num">${chip(k.state, KEY_STATE_CHIP[k.state] || "line")}</td>
+    </tr>`).join("") || `<tr><td colspan="5" class="empty">No API keys yet.</td></tr>`;
+
+  return `
+    ${modeBanner()}
+    <div class="head">
+      <h1>Accounts</h1>
+      <span class="head-note">1 workspace · ${d.counts.total} API key${d.counts.total === 1 ? "" : "s"}</span>
+      <div class="head-right">
+        ${chip(d.enforced ? "scopes enforced" : "scopes not enforced (local mode)",
+               d.enforced ? "ok" : "line")}
+      </div>
+    </div>
+
+    <div class="split">
+      <div style="display:flex;flex-direction:column;gap:14px;min-width:0">
+        <div class="card">
+          <div class="card-head">
+            <h2>This workspace</h2>
+            <span class="head-note">last ${d.window_days} days</span>
+          </div>
+          <div class="mini" style="grid-template-columns:repeat(auto-fit,minmax(120px,1fr))">
+            <div class="tile"><div class="caps">Minutes</div>
+              <div class="tile-value">${num(w.minutes, 1)}</div></div>
+            <div class="tile"><div class="caps">Spend (est.)</div>
+              <div class="tile-value">${money(w.cost)}</div></div>
+            <div class="tile"><div class="caps">Jobs</div>
+              <div class="tile-value">${num(w.jobs)}</div></div>
+            <div class="tile"><div class="caps">Last activity</div>
+              <div class="tile-value" style="font-size:16px">${esc(ago(w.last_active))}</div></div>
+          </div>
+        </div>
+
+        <div class="card card--flush">
+          <div class="table-scroll"><table>
+            <thead><tr>
+              <th>Key</th><th>Env</th><th class="num">Scopes</th>
+              <th class="num">Last used</th><th class="num">Status</th>
+            </tr></thead>
+            <tbody id="keyrows">${rows}</tbody>
+          </table></div>
+        </div>
+
+        <div class="note">${esc(d.note)}</div>
+      </div>
+
+      <aside class="detail" id="keydetail">
+        ${state.selectedKey ? loading("key") : `<div class="card"><div class="empty">
+          Select a key to see its scopes, age and audit trail.</div></div>`}
+      </aside>
+    </div>
+
+    ${disclaimer(d.disclaimer)}`;
+}
+
+function renderKeyDetail(d) {
+  const k = d.key || {};
+  const scopes = (k.scopes || []).map(s =>
+    `<div class="kv"><span>${esc(s)}</span><b>${esc((d.scopes || {})[s] || "")}</b></div>`
+  ).join("") || `<div class="kv"><span>no scopes</span></div>`;
+
+  const trail = (d.audit || []).length
+    ? d.audit.map(e => `<div class="kv"><span>${esc(dateStr(e.ts))} · ${esc(e.action)}</span>
+        <b>${esc(e.detail || e.actor || "")}</b></div>`).join("")
+    : `<div class="dim mono" style="font-size:10.5px">No audit entries mention this key yet.</div>`;
+
+  const revoked = !!k.revoked;
+  return `
+    <div class="detail-head">
+      <h2>${esc(k.name || k.id)}</h2>
+      ${chip(d.state, KEY_STATE_CHIP[d.state] || "line", "chip--pill")}
+    </div>
+
+    <div class="mini">
+      <div class="tile"><div class="caps">Created</div>
+        <div class="tile-value" style="font-size:15px">${esc(dateStr(k.created))}</div></div>
+      <div class="tile"><div class="caps">Last used</div>
+        <div class="tile-value" style="font-size:15px">${esc(k.last_used ? ago(k.last_used) : "never")}</div></div>
+    </div>
+
+    <div class="card">
+      <div class="caps" style="margin-bottom:9px">Credential</div>
+      <div class="kv"><span>id</span><b class="mono">${esc(k.id)}</b></div>
+      <div class="kv"><span>masked</span><b class="mono">${esc(k.masked || "—")}</b></div>
+      <div class="kv"><span>environment</span><b>${esc(k.environment || "live")}</b></div>
+      <div class="kv"><span>expires</span><b>${k.expires ? esc(dateStr(k.expires)) : "never"}</b></div>
+      <div class="kv"><span>revoked</span><b>${revoked ? esc(dateStr(k.revoked)) : "no"}</b></div>
+      <div class="kv"><span>enforcement</span><b>${d.enforced ? "on (hosted)" : "off (local mode)"}</b></div>
+    </div>
+
+    <div class="card">
+      <div class="caps" style="margin-bottom:9px">Scopes</div>
+      ${scopes}
+    </div>
+
+    <div class="card">
+      <div class="caps" style="margin-bottom:9px">Audit trail</div>
+      ${trail}
+    </div>
+
+    <div class="actions">
+      <button class="btn btn--danger" id="revoke" ${revoked ? "disabled" : ""}>
+        ${revoked ? "Already revoked" : "Revoke key"}</button>
+      <a class="btn" href="/api/audit" target="_blank" rel="noopener">Full audit log</a>
+    </div>
+    <div class="dim mono" style="font-size:10px;text-align:center">
+      revoking is recorded in audit.jsonl and cannot be undone</div>`;
+}
+
+async function loadKeyDetail(id) {
+  const box = $("#keydetail");
+  if (!box) return;
+  box.innerHTML = loading("key");
+  try {
+    state.keyDetail = await api(`/api/admin/account/${encodeURIComponent(id)}`);
+    box.innerHTML = renderKeyDetail(state.keyDetail);
+    const btn = $("#revoke", box);
+    if (btn) btn.addEventListener("click", async () => {
+      btn.disabled = true;
+      try {
+        await api(`/api/apikeys/${encodeURIComponent(id)}/revoke`, { method: "POST" });
+        announce("Key revoked.");
+        await load("accounts", { force: true });
+      } catch (e) {
+        btn.disabled = false;
+        announce("Could not revoke: " + e.message);
+      }
+    });
+  } catch (e) {
+    box.innerHTML = `<div class="card"><div class="banner">${esc(e.message)}</div></div>`;
+  }
+}
+
+function bindAccounts() {
+  $$("#keyrows tr[data-key]").forEach(tr => tr.addEventListener("click", () => {
+    state.selectedKey = tr.dataset.key;
+    $$("#keyrows tr").forEach(r => r.classList.toggle("is-selected", r === tr));
+    loadKeyDetail(state.selectedKey);
+  }));
+  if (state.selectedKey) loadKeyDetail(state.selectedKey);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Screen 3 — Revenue ops
+// ═══════════════════════════════════════════════════════════════════
+
+function renderRevenue(d) {
+  const rc = d.rate_card || {};
+  const bands = (rc.bands || []).map(b => `
+    <div class="band ${b.reached ? "is-current" : ""}">
+      <span>${esc(b.label)}</span>
+      <span class="num band-rate">${rate(b.rate)}</span>
+      <span class="num">${num(b.minutes, 1)}</span>
+      <span class="num">${money(b.cost)}</span>
+    </div>`).join("");
+
+  const buckets = (d.unbilled.buckets || []).map(b => `
+    <div class="bucket is-${sev(b.severity)}">
+      <div class="bucket-n">${num(b.count)}</div>
+      <div class="bucket-note">${esc(b.label)}<br>${num(b.minutes, 1)} min · ${money(b.cost)}</div>
+    </div>`).join("");
+
+  const periods = (d.periods || []).map(p => `
+    <div class="kv">
+      <span>${esc(p.period)} · ${p.jobs} job${p.jobs === 1 ? "" : "s"}</span>
+      <b>${num(p.minutes, 1)} min</b>
+      <b style="min-width:70px">${money(p.cost)}</b>
+    </div>`).join("") || `<div class="empty">No usage recorded.</div>`;
+
+  const s = d.summary || {};
+  return `
+    ${modeBanner()}
+    <div class="head">
+      <h1>Revenue ops</h1>
+      <span class="head-note">rate card, metered usage, unbilled work</span>
+      <div class="head-right">
+        ${windowPicker()}
+        <a class="btn" href="/api/admin/revenue.csv?window_days=${state.windowDays}"
+           download>Export CSV ↓</a>
+      </div>
+    </div>
+
+    <div class="tiles">
+      <div class="tile"><div class="caps">Metered minutes</div>
+        <div class="tile-value">${num(s.minutes, 1)}</div>
+        <div class="tile-note">${s.jobs_counted} job(s) counted · ${s.jobs_unbilled} unbilled</div></div>
+      <div class="tile"><div class="caps">Estimated total</div>
+        <div class="tile-value">${money(s.cost)}</div>
+        <div class="tile-note">incl. storage ${money(s.storage_cost)}</div></div>
+      <div class="tile"><div class="caps">Marginal rate</div>
+        <div class="tile-value">${rate(s.rate)}</div>
+        <div class="tile-note">${s.next_tier
+          ? num(s.next_tier.minutes, 0) + " min to " + rate(s.next_tier.next_rate)
+          : "lowest published tier"}</div></div>
+      <div class="tile"><div class="caps">Storage</div>
+        <div class="tile-value">${num(s.storage_gb, 1)} GB</div>
+        <div class="tile-note">${num(rc.storage_included_gb)} GB included, then
+          ${money(rc.storage_per_gb)}/GB</div></div>
+    </div>
+
+    <div class="grid-half">
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div class="card">
+          <div class="card-head">
+            <h2>Rate card · published</h2>
+            <span class="head-note">tiers are cumulative</span>
+          </div>
+          <div class="band is-head caps">
+            <span>Tier</span><span class="num">Rate</span>
+            <span class="num">Minutes</span><span class="num">Cost</span>
+          </div>
+          ${bands}
+          <div class="dim mono" style="font-size:10px;margin-top:10px;line-height:1.7">
+            showcase stitch +${rate(rc.showcase_surcharge)}/min ·
+            rates are the design's published hosted schedule and are not
+            user-editable, so a local install cannot invent a price
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Unbilled work</h2>
+            <span class="head-note">minutes that will not turn into money</span></div>
+          <div class="buckets">${buckets}</div>
+          <div class="dim mono" style="font-size:10.5px;margin-top:12px;line-height:1.8">
+            ${esc(d.unbilled.policy)}</div>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div class="card">
+          <div class="card-head"><h2>By month</h2>
+            <span class="head-note">what each month's usage would have billed</span></div>
+          ${periods}
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Credits &amp; adjustments</h2>
+            ${chip("unavailable", "line", "push")}</div>
+          <div class="note">${esc(d.adjustments.reason)}</div>
+        </div>
+      </div>
+    </div>
+
+    ${disclaimer(d.disclaimer)}`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Screen 4 — Fleet & jobs
+// ═══════════════════════════════════════════════════════════════════
+
+function fleetTile(t) {
+  const v = t.value === null || t.value === undefined ? "—"
+    : t.key === "util" || t.key === "failures" ? pct(t.value) : num(t.value);
+  const colour = t.key === "failures" && Number(t.value) > 10 ? "var(--warn)"
+    : t.key === "util" && Number(t.value) > 0 ? "var(--accent)" : "";
+  return `<div class="tile">
+    <div class="caps">${esc(t.label)}</div>
+    <div class="tile-value ${v === "—" ? "is-none" : ""}" ${colour ? `style="color:${colour}"` : ""}>${esc(v)}</div>
+    <div class="tile-note">${esc(t.note)}</div>
+  </div>`;
+}
+
+function stageRows(stages) {
+  if (!stages.length) {
+    return `<tr><td colspan="5" class="empty">
+      No stage timings in the last 24 hours.</td></tr>`;
+  }
+  return stages.map(s => {
+    const ratio = s.ratio === null
+      ? `<span class="dim" title="needs more runs on both sides to compare">—</span>`
+      : `<span style="color:var(${s.severity === "bad" ? "--bad"
+          : s.severity === "warn" ? "--warn" : "--ink-2"})">${s.ratio.toFixed(1)}×${
+          s.severity === "ok" ? "" : " ⚠"}</span>`;
+    return `<tr>
+      <td class="name" style="font-size:12px">${esc(s.stage)}</td>
+      <td class="num">${s.runs}</td>
+      <td class="num">${rt(s.p50)}</td>
+      <td class="num">${rt(s.p95)}</td>
+      <td class="num">${ratio}</td>
+    </tr>`;
+  }).join("");
+}
+
+function queueItem(q) {
+  const actions = (q.actions || []).map(a =>
+    `<span class="chip">${esc(a)}</span>`).join("");
+  return `<div class="queue-item ${q.severity === "bad" ? "is-bad" : ""}">
+    <div class="queue-head">${esc(q.title)}
+      <span class="queue-when">${esc(ago(q.at))}</span></div>
+    <div class="queue-body">${esc(q.detail)}</div>
+    ${q.job_ids && q.job_ids.length
+      ? `<div class="queue-body">jobs: ${q.job_ids.map(j =>
+          `<a href="/#job-${esc(j)}">${esc(j)}</a>`).join(" · ")}</div>` : ""}
+    ${actions ? `<div class="queue-actions">${actions}</div>` : ""}
+  </div>`;
+}
+
+function renderFleet(d) {
+  const node = d.node || {};
+  const gpu = node.gpu || {};
+  const gpuBits = Object.keys(gpu).length
+    ? Object.entries(gpu).map(([k, v]) => `${esc(k)} ${esc(String(v))}`).join(" · ")
+    : "no GPU telemetry available";
+
+  return `
+    ${modeBanner()}
+    <div class="head">
+      <h1>Fleet &amp; jobs</h1>
+      <span class="chip chip--${sev(d.status)} chip--pill"><span class="dot"></span>${esc(d.status_text)}</span>
+      <div class="head-right">
+        <button class="btn ${d.intake_paused ? "btn--primary" : ""}" id="intake">
+          ${d.intake_paused ? "Resume intake ▶" : "Pause new jobs ⏸"}</button>
+      </div>
+    </div>
+
+    ${d.intake_paused ? `<div class="banner banner--warn">
+      <b>Intake is paused.</b> The queue worker is not taking anything new;
+      ${d.tiles[0].value} job(s) are waiting. A job already running was left
+      alone — use cancel for that. The pause is in-process and does not
+      survive a restart.</div>` : ""}
+
+    <div class="tiles">${(d.tiles || []).map(fleetTile).join("")}</div>
+
+    <div class="grid-half">
+      <div class="card">
+        <div class="card-head">
+          <h2>Pipeline stages</h2>
+          <span class="head-note">seconds per source-second · 24h vs the 7 days before</span>
+        </div>
+        <div class="table-scroll"><table>
+          <thead><tr><th>Stage</th><th class="num">Runs</th>
+            <th class="num">p50 ×RT</th><th class="num">p95 ×RT</th>
+            <th class="num">vs base</th></tr></thead>
+          <tbody>${stageRows(d.stages || [])}</tbody>
+        </table></div>
+        <div class="dim mono" style="font-size:10.5px;margin-top:12px;line-height:1.8">
+          ${(d.alerts || []).length
+            ? esc(d.alerts[0].stage) + " is the worst-degraded stage right now — "
+              + "check the most recent jobs that ran it."
+            : "No stage is running slower than its baseline."}
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <h2>Node</h2>
+          <span class="head-note">${esc(node.backend || "cpu")}</span>
+        </div>
+        <div class="kv"><span>host</span><b>${esc(node.name)}</b></div>
+        <div class="kv"><span>running / queued</span><b>${node.running} / ${node.queued}</b></div>
+        <div class="kv"><span>gpu</span><b class="mono">${esc(gpuBits)}</b></div>
+        <div class="note" style="margin-top:12px">${esc(node.note)}</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Review queue</h2>
+        ${(d.review_queue || []).length
+          ? chip(d.review_queue.length + " open", "warn") : chip("clear", "ok")}
+        <span class="head-note push">detected from real signals — see the note below</span>
+      </div>
+      <div class="stack">
+        ${(d.review_queue || []).map(queueItem).join("")
+          || `<div class="empty">Nothing flagged.</div>`}
+      </div>
+    </div>`;
+}
+
+function bindFleet() {
+  const btn = $("#intake");
+  if (!btn) return;
+  btn.addEventListener("click", async () => {
+    const want = !(state.data.fleet || {}).intake_paused;
+    btn.disabled = true;
+    try {
+      const body = new FormData();
+      body.append("paused", want ? "true" : "false");
+      await api("/api/admin/intake", { method: "POST", body });
+      announce(want ? "Job intake paused." : "Job intake resumed.");
+      await load("fleet", { force: true });
+    } catch (e) {
+      btn.disabled = false;
+      announce("Could not change intake: " + e.message);
+    }
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Screen 5 — Review queue (the design's abuse queue, full width)
+// ═══════════════════════════════════════════════════════════════════
+
+function renderReview(d) {
+  const items = (d.review_queue || []);
+  return `
+    ${modeBanner()}
+    <div class="head">
+      <h1>Review queue</h1>
+      <span class="head-note">${items.length} open</span>
+    </div>
+
+    <div class="stack">
+      ${items.map(queueItem).join("") || `<div class="card"><div class="empty">
+        Nothing flagged. The detectors below found no signal.</div></div>`}
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>What this queue watches</h2></div>
+      <div class="kv"><span>usage anomaly</span>
+        <b>today's metered minutes vs the trailing 13-day median</b></div>
+      <div class="kv"><span>voice clones</span>
+        <b>jobs cloned from an uploaded reference in the last 30 days</b></div>
+      <div class="kv"><span>credential hygiene</span>
+        <b>expired-but-live, expiring, and very old keys with no expiry</b></div>
+      <div class="note" style="margin-top:12px">
+        The design's queue also carries DMCA and copyright claims. Those are
+        not detected here and are not listed as clear: a claim queue needs
+        somewhere for a claim to arrive, and this server has no such intake.
+        Voice-clone items are a list to look at, not an accusation — nothing
+        in this build stores a consent attestation alongside an uploaded
+        voice sample, so there is nothing to check them against.
+      </div>
+    </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Router + loader
+// ═══════════════════════════════════════════════════════════════════
+
+const ENDPOINT = {
+  overview: () => `/api/admin/overview?window_days=${state.windowDays}`,
+  accounts: () => `/api/admin/accounts?window_days=${state.windowDays}`,
+  revenue: () => `/api/admin/revenue?window_days=${state.windowDays}`,
+  fleet: () => `/api/admin/fleet`,
+  review: () => `/api/admin/fleet`,   // same payload, different framing
+};
+
+const RENDER = {
+  overview: renderOverview, accounts: renderAccounts,
+  revenue: renderRevenue, fleet: renderFleet, review: renderReview,
+};
+
+async function load(view, opts) {
+  opts = opts || {};
+  const box = $("#console");
+  if (!opts.silent && !state.data[view]) box.innerHTML = loading(view);
+  try {
+    const data = await api(ENDPOINT[view]());
+    // The review screen reads the fleet payload; cache it under both names
+    // so switching between them does not refetch.
+    state.data[view] = data;
+    if (view === "review") state.data.fleet = data;
+    if (view === "fleet") state.data.review = data;
+    if (data.mode) state.mode = data.mode;
+    if (state.view !== view) return;   // navigated away mid-flight
+    box.innerHTML = RENDER[view](data);
+    bindWindowPicker(() => load(view, { force: true }));
+    if (view === "accounts") bindAccounts();
+    if (view === "fleet") bindFleet();
+    renderNav();
+  } catch (e) {
+    if (state.view !== view) return;
+    box.innerHTML = failure(e);
+    const r = $("#retry");
+    if (r) r.addEventListener("click", () => load(view, { force: true }));
+  }
+}
+
+function route() {
+  const want = (location.hash || "#overview").slice(1);
+  state.view = VIEWS.includes(want) ? want : "overview";
+  renderNav();
+  load(state.view);
+
+  // Fleet is the only screen whose numbers move on their own, so it is the
+  // only one that polls. Everything else refetches when you ask it to —
+  // /api/admin/revenue walks every output directory to size storage, and
+  // putting that on a timer would spin the disk for numbers that change
+  // once a job finishes.
+  clearInterval(state.fleetTimer);
+  state.fleetTimer = null;
+  if (state.view === "fleet" || state.view === "review") {
+    state.fleetTimer = setInterval(() => {
+      if (!document.hidden) load(state.view, { silent: true });
+    }, 10000);
+  }
+}
+
+window.addEventListener("hashchange", route);
+route();
+</script>
+</body>
+</html>
