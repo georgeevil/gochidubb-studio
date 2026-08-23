@@ -164,6 +164,29 @@ def minutes_to_next_tier(total_minutes: float) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _finite_duration(value: Any) -> float:
+    """Seconds of source, or 0.0 for anything that is not a real measurement.
+
+    `job["duration"]` is written by the extract stage from a media probe, and
+    a probe that could not read a stream has more than one way to say so:
+    ``"N/A"``, ``None``, a negative, or a float NaN/infinity. The last two are
+    the dangerous ones — they survive every arithmetic operation here and only
+    blow up much later, at ``round()`` or at ``json.dumps(allow_nan=False)``,
+    turning one unreadable file into a 500 on the whole usage screen.
+
+    So they die at the door instead. `server._finite_seconds` does the same
+    thing to the browser-supplied duration on the estimate route, for the same
+    reason; this is the other end of the same pipe.
+    """
+    try:
+        out = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if out != out or out in (float("inf"), float("-inf")) or out <= 0:
+        return 0.0
+    return out
+
+
 def job_minutes(job: Dict[str, Any]) -> float:
     """Billable minutes for one job: source length × target languages.
 
@@ -172,7 +195,7 @@ def job_minutes(job: Dict[str, Any]) -> float:
     """
     if (job.get("status") or "") in UNBILLED_STATUSES:
         return 0.0
-    duration = job.get("duration") or 0.0
+    duration = _finite_duration(job.get("duration"))
     if duration <= 0:
         return 0.0
     langs = job.get("target_langs")
