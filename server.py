@@ -57,6 +57,8 @@ del _sys, _types, _gochidubb_stub_module, _n
 # ═══════════════════════════════════════════════════════════════════
 
 import asyncio
+import csv
+import io
 import json
 import math
 import re
@@ -70,6 +72,7 @@ import time
 import uuid
 import webbrowser
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -209,7 +212,7 @@ from app.db import init_db, save_job_sync, load_all_jobs, delete_job_db
 from app import (logbuf, artifact_store, reuse_runtime, reuse as app_reuse,
                  activity, apikeys as app_apikeys, webhooks as app_webhooks,
                  billing as app_billing, audit as app_audit,
-                 estimate as app_estimate)
+                 estimate as app_estimate, admin as app_admin)
 
 
 # Force UTF-8 stdout for foreign-language transcripts on Windows cp1252 consoles
@@ -354,6 +357,35 @@ def _free_gpu_memory():
 _job_queue: "asyncio.Queue[tuple]" = None  # set in lifespan
 _queue_worker_task = None
 _scheduler_task = None
+
+# Admission gate for the queue worker — the admin console's "Pause new jobs".
+# Set = running, clear = paused, which is the direction asyncio.Event reads
+# naturally in `await _intake_gate.wait()`.
+#
+# The gate is checked BEFORE the dequeue, never after. Holding a job the
+# worker has already taken would leave it out of `qsize()` while it is plainly
+# still waiting, so the console's queue depth would under-report for as long
+# as the pause lasted.
+#
+# That alone is not enough, though, and the gap is the interesting part: an
+# idle worker is parked inside `_job_queue.get()`, which returns the instant
+# something is enqueued — so a job submitted during a pause would start
+# anyway, while the console went on claiming intake was paused. A safety
+# control that lies is worse than not having one.
+#
+# So the worker races the dequeue against `_intake_changed`, which the pause
+# route pulses on every toggle. When the toggle wins, the pending `get()` is
+# cancelled and the worker loops back to park on the gate. Cancelling an
+# `asyncio.Queue.get()` cannot lose a job: the item lives in the queue's own
+# deque and a getter only pops it after being woken, so a cancelled getter
+# leaves it exactly where it was.
+_intake_gate: "asyncio.Event" = None      # set in lifespan; set == open
+_intake_changed: "asyncio.Event" = None   # pulsed when intake is toggled
+_intake_paused_since: float = 0.0
+
+
+def _intake_is_paused() -> bool:
+    return _intake_gate is not None and not _intake_gate.is_set()
 
 # Separate queue for platform uploads (Phase 3C). Uploads are network-bound,
 # not GPU-bound, so they must not wait behind (or block) the dub pipeline.
@@ -689,7 +721,33 @@ async def _job_queue_worker():
     log.info("[queue] Worker started")
     while True:
         try:
-            job_id, pipeline_args = await _job_queue.get()
+            if _intake_gate is not None and not _intake_gate.is_set():
+                log.info("[queue] Intake paused — not starting anything new")
+                await _intake_gate.wait()
+                log.info("[queue] Intake resumed")
+            if _intake_changed is None:
+                job_id, pipeline_args = await _job_queue.get()
+            else:
+                # See the `_intake_gate` comment: race the dequeue against a
+                # pause so an idle worker cannot admit a job the operator has
+                # just closed the door on.
+                getter = asyncio.ensure_future(_job_queue.get())
+                toggled = asyncio.ensure_future(_intake_changed.wait())
+                try:
+                    done, _pending = await asyncio.wait(
+                        {getter, toggled}, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    toggled.cancel()
+                if getter in done:
+                    # A job and a pause can land in the same tick. The job is
+                    # already out of the queue by then, so it runs — the
+                    # pause takes effect from the next one.
+                    _intake_changed.clear()
+                    job_id, pipeline_args = getter.result()
+                else:
+                    getter.cancel()
+                    _intake_changed.clear()
+                    continue
         except asyncio.CancelledError:
             log.info("[queue] Worker cancelled, exiting")
             return
@@ -1320,6 +1378,12 @@ async def lifespan(app: FastAPI):
     global _job_queue, _queue_worker_task, _scheduler_task
     global _upload_queue, _upload_worker_task
     _job_queue = asyncio.Queue()
+    # Intake starts open. A pause is a live operational decision, never a
+    # state that survives a restart and silently strands the queue.
+    global _intake_gate, _intake_changed
+    _intake_gate = asyncio.Event()
+    _intake_gate.set()
+    _intake_changed = asyncio.Event()
     _queue_worker_task = asyncio.create_task(_job_queue_worker())
     # Scheduler: polls every 30s looking for jobs with status='scheduled'
     # whose scheduled_at time has arrived. Survives restarts — status and
@@ -3688,6 +3752,242 @@ async def get_estimate(source: str = "", duration_sec: float = 0.0,
 async def get_audit(limit: int = 200):
     return {"entries": app_audit.recent(limit=max(1, min(int(limit or 200), 1000))),
             "total": app_audit.count()}
+
+
+# ─────────────────────────────────────────────────────────────
+# API: Vendor admin console
+# ─────────────────────────────────────────────────────────────
+# Backs static/admin.html — the design's `3a` screens. All aggregation lives
+# in app/admin.py, which is pure; these routes only gather the inputs it
+# cannot reach on its own (disk sizes, GPU telemetry, per-stage metrics
+# files) and hand them over.
+#
+# Same honesty boundary as /api/billing/usage, and for the same reason: the
+# minutes are real, every dollar figure is an estimate at the design's
+# published rates, and this server bills nobody. app/admin.py's docstring
+# lists what the console shows, what it estimates, and what it refuses to
+# invent.
+#
+# No authentication, because nothing on this server has any — see the
+# loopback-bind rationale at the bottom of this file. In a hosted deployment
+# this surface is the one that must go behind staff SSO first: it reads the
+# revenue estimate, every API key record and the audit trail.
+
+# Per-stage durations are read from each job's metrics.json, one small file
+# per job. The fleet screen polls, so the walk is cached: without this a 5s
+# poll over a few hundred finished jobs is a few hundred file reads a second
+# for numbers that move once a job finishes.
+_ADMIN_STAGE_TTL = 30.0
+_admin_stage_cache: dict = {}
+
+
+def _admin_stage_samples(now: float) -> tuple:
+    """(recent, baseline) maps of stage id -> [seconds per source-second, …].
+
+    "Recent" is the last 24 hours and "baseline" is the 7 days before that,
+    which is the comparison the design's pool table draws ("stage p95s vs 7d
+    baseline"). Jobs are visited newest-first and capped, so an install with
+    thousands of finished jobs still answers in bounded time.
+
+    **Samples are normalised by source length, not raw stage seconds.** Every
+    stage's wall clock scales with how long the video was, so comparing raw
+    p95s across two windows mostly compares what got dubbed rather than how
+    fast it ran: measured on a real install, a day of full videos against a
+    week of short test clips reported *every* stage as 3-34x degraded, which
+    is a wall of false alarms and worse than no signal. Dividing by the source
+    duration asks the question the panel is actually for — is this stage
+    slower per unit of work than it was — and it is the same normalisation
+    `app/estimate.py` applies to whole jobs.
+
+    A job with no measured duration contributes nothing rather than a
+    division by zero or a guess.
+    """
+    hit = _admin_stage_cache.get("samples")
+    if hit and (now - hit[0]) < _ADMIN_STAGE_TTL:
+        return hit[1]
+
+    recent: dict = {}
+    baseline: dict = {}
+    cutoff_recent = now - 86400.0
+    cutoff_base = now - 8 * 86400.0
+
+    candidates = sorted(
+        (j for j in jobs.values() if (j.get("created") or 0) >= cutoff_base),
+        key=lambda j: -(j.get("created") or 0),
+    )[:400]
+
+    for job in candidates:
+        source_sec = _finite_seconds(job.get("duration"))
+        if source_sec <= 0:
+            continue
+        work = OUTPUT_DIR / (job.get("id") or "")
+        if not work.is_dir():
+            continue
+        try:
+            stages = (load_metrics(work).get("stages") or {})
+        except Exception:
+            continue
+        bucket = recent if (job.get("created") or 0) >= cutoff_recent else baseline
+        for stage_id, rec in stages.items():
+            # Only successful runs. A stage that raised after four seconds is
+            # not evidence that the stage got faster.
+            if (rec.get("status") or "") not in ("", "ok", "success", "complete"):
+                continue
+            secs = rec.get("duration_sec")
+            if isinstance(secs, (int, float)) and secs > 0:
+                bucket.setdefault(stage_id, []).append(float(secs) / source_sec)
+
+    _admin_stage_cache["samples"] = (now, (recent, baseline))
+    return recent, baseline
+
+
+async def _admin_storage_gb() -> float:
+    """Total output size in GB, or 0.0 if the walk fails.
+
+    Storage is never the reason an admin page fails to render, so this
+    swallows errors the way /api/billing/usage does.
+    """
+    try:
+        return float((await storage_stats()).get("total_gb") or 0.0)
+    except Exception as e:
+        log.warning(f"[admin] storage walk failed (non-fatal): {e}")
+        return 0.0
+
+
+@app.get("/api/admin/overview")
+async def admin_overview(window_days: int = 30):
+    """Screen `3a Business overview` — tiles, revenue series, attention list."""
+    now = time.time()
+    recent, baseline = _admin_stage_samples(now)
+    health = app_admin.stage_health(recent, baseline)
+    payload = app_admin.overview(
+        list(jobs.values()), app_apikeys.list_keys(),
+        days=max(1, int(window_days or 30)), now=now,
+        storage_gb=await _admin_storage_gb(),
+        stage_alerts=app_admin.stage_alerts(health),
+    )
+    payload["mode"] = cfg.mode
+    return payload
+
+
+@app.get("/api/admin/accounts")
+async def admin_accounts(window_days: int = 30):
+    """Screen `3a Customer accounts`, mapped onto API keys — see app/admin.py."""
+    return app_admin.accounts(
+        list(jobs.values()), app_apikeys.list_keys(),
+        mode=cfg.mode, days=max(1, int(window_days or 30)),
+        enforced=cfg.mode == "hosted",
+    )
+
+
+@app.get("/api/admin/account/{key_id}")
+async def admin_account(key_id: str):
+    """One key, with the audit entries that mention it.
+
+    The design's detail pane promises "every action here lands in the
+    audit log". It does — app/audit.py records key creation and revocation —
+    so the pane reads that trail back rather than claiming it exists.
+    """
+    rec = next((k for k in app_apikeys.list_keys() if k.get("id") == key_id), None)
+    if rec is None:
+        return JSONResponse({"error": "No such key"}, 404)
+    entries = [e for e in app_audit.recent(limit=1000)
+               if e.get("target") == key_id or key_id in str(e.get("detail") or "")]
+    return {
+        "key": rec,
+        "state": app_admin.key_state(rec),
+        "scopes": app_apikeys.SCOPES,
+        "audit": entries[:50],
+        "enforced": cfg.mode == "hosted",
+        "note": app_admin.accounts([], [])["note"],
+    }
+
+
+@app.get("/api/admin/revenue")
+async def admin_revenue(window_days: int = 30):
+    """Screen `3a Revenue ops` — rate card, unbilled work, per-month roll-up."""
+    payload = app_admin.revenue(
+        list(jobs.values()), days=max(1, int(window_days or 30)),
+        storage_gb=await _admin_storage_gb(),
+    )
+    payload["mode"] = cfg.mode
+    return payload
+
+
+@app.get("/api/admin/revenue.csv")
+async def admin_revenue_csv(window_days: int = 30):
+    """The design's `Export CSV ↓`, one row per job.
+
+    Built in memory: the row count is the job count, which is bounded by
+    what one machine has dubbed, and streaming would buy nothing.
+    """
+    days = max(1, int(window_days or 30))
+    now = time.time()
+    rows = app_admin.revenue_csv_rows(
+        list(jobs.values()), since=now - days * 86400, until=now)
+    buf = io.StringIO()
+    csv.writer(buf, lineterminator="\n").writerows(rows)
+    stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%d")
+    return Response(
+        buf.getvalue(), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="gochidubb-usage-{days}d-{stamp}.csv"'},
+    )
+
+
+@app.get("/api/admin/fleet")
+async def admin_fleet():
+    """Screen `3a Fleet and abuse queue` — capacity, stage p95s, review queue."""
+    now = time.time()
+    recent, baseline = _admin_stage_samples(now)
+    gpu = gpu_snapshot() or {}
+    try:
+        gpu_name = (get_system_status().get("gpu") or {}).get("name") or ""
+    except Exception:
+        gpu_name = ""
+    return app_admin.fleet(
+        list(jobs.values()), app_apikeys.list_keys(), now=now,
+        queue_depth=_job_queue.qsize() if _job_queue is not None else 0,
+        gpu={k: round(v, 1) for k, v in gpu.items()} if gpu else {},
+        gpu_backend=gpu_backend(), gpu_name=gpu_name,
+        health=app_admin.stage_health(recent, baseline),
+        intake_paused=_intake_is_paused(),
+    )
+
+
+@app.post("/api/admin/intake")
+async def admin_set_intake(paused: bool = Form(...)):
+    """The design's `Pause new jobs ⏸` — and it really does pause them.
+
+    Pausing stops the worker taking anything new off the queue. A job already
+    running is left alone: killing work mid-pipeline to honour a pause would
+    throw away GPU time that has already been spent, and cancel is the
+    endpoint for that.
+
+    The pause is in-process and deliberately does not persist — see
+    `_intake_gate` — so a restart always comes back admitting work.
+    """
+    global _intake_paused_since
+    if _intake_gate is None:
+        return JSONResponse({"error": "Queue is not running"}, 503)
+    want = bool(paused)
+    if want:
+        if _intake_gate.is_set():
+            _intake_paused_since = time.time()
+        _intake_gate.clear()
+    else:
+        _intake_gate.set()
+        _intake_paused_since = 0.0
+    # Wake a worker that is parked in `_job_queue.get()` so the new state
+    # takes effect now rather than after the next job slips through.
+    if _intake_changed is not None:
+        _intake_changed.set()
+    app_audit.record("admin.intake", target="queue",
+                     detail="paused" if want else "resumed")
+    activity.record_system(
+        f"Job intake {'paused' if want else 'resumed'} from the admin console")
+    return {"ok": True, "paused": want, "since": _intake_paused_since,
+            "queue_depth": _job_queue.qsize() if _job_queue is not None else 0}
 
 
 @app.post("/api/models/pull")
@@ -9667,6 +9967,19 @@ async def creator_index():
     preference says, so each mode always has a direct address that works.
     """
     return FileResponse(str(STATIC_DIR / "creator.html"))
+
+
+@app.get("/admin")
+async def admin_index():
+    """The vendor admin console — the design's `3a` screens.
+
+    Unconditional, like /pro and /creator. It is a separate surface from the
+    customer workspace (in the design, a separate host behind staff SSO), so
+    it gets its own address rather than a tab inside either mode: a page that
+    reads the revenue estimate, every API key and the audit trail should not
+    be one mis-click away from the screen a creator uses.
+    """
+    return FileResponse(str(STATIC_DIR / "admin.html"))
 
 
 @app.get("/beta")

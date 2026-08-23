@@ -44,7 +44,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from app import billing
+from app import billing, estimate
 
 # ── Status vocabulary ────────────────────────────────────────────────
 # Mirrors server.py. Kept as its own copy on purpose: this module must not
@@ -423,8 +423,8 @@ def attention(jobs: Iterable[Dict[str, Any]],
             "severity": alert.get("severity", "warn"),
             "title": f"{alert.get('stage', 'a stage')} p95 is "
                      f"{alert.get('ratio', 0):.1f}x its 7-day baseline",
-            "detail": f"p95 {alert.get('p95', 0):.0f}s vs "
-                      f"{alert.get('baseline_p95', 0):.0f}s baseline "
+            "detail": f"p95 {alert.get('p95', 0):.2f}x realtime vs "
+                      f"{alert.get('baseline_p95', 0):.2f}x baseline "
                       f"over {alert.get('runs', 0)} recent runs",
             "link": "fleet", "target": alert.get("stage", ""),
         })
@@ -472,10 +472,23 @@ def overview(jobs: Iterable[Dict[str, Any]],
     previous = _counts(jobs, prev_since, since)
     bucket = "month" if int(days or 30) > MONTHLY_BUCKET_DAYS else "day"
 
+    # The design's fourth tile is gross margin, which needs a GPU bill this
+    # deployment does not receive. The nearest real efficiency number is the
+    # one the wizard already quotes ETAs from: measured wall-clock per second
+    # of source. None when too few jobs have finished to take a median —
+    # `app/estimate.py` is explicit that a median of two is a coin flip.
+    factor_now = estimate.realtime_factor(
+        j for j in jobs if _in_window(j, since, now_ts))
+    factor_prev = estimate.realtime_factor(
+        j for j in jobs if _in_window(j, prev_since, since))
+
     tiles = [
         {
             "key": "revenue",
-            "label": "Revenue (est.)",
+            # No "(est.)" here — the tile carries `estimate` and the UI
+            # appends the marker itself, so putting it in the label too
+            # renders "Revenue (est.) (est.)".
+            "label": "Revenue",
             "value": current["cost"],
             "format": "money",
             "delta_pct": _delta(current["cost"], previous["cost"]),
@@ -503,10 +516,16 @@ def overview(jobs: Iterable[Dict[str, Any]],
         {
             "key": "throughput",
             "label": "Realtime factor",
-            "value": None,
+            "value": round(factor_now, 2) if factor_now is not None else None,
             "format": "factor",
-            "delta_pct": None,
-            "note": "median wall-clock per second of source",
+            # Lower is faster, so the sign of the delta is inverted before
+            # it reaches the tile: a factor that fell is an improvement, and
+            # rendering that as a red "▼" would read as a regression.
+            "delta_pct": (None if (factor_now is None or factor_prev is None)
+                          else _delta(factor_prev, factor_now)),
+            "note": ("median wall-clock per second of source"
+                     if factor_now is not None
+                     else f"needs {estimate.MIN_SAMPLES} finished jobs to measure"),
             "estimate": False,
         },
         {
@@ -871,9 +890,14 @@ def stage_health(recent: Dict[str, Sequence[float]],
                  baseline: Dict[str, Sequence[float]]) -> List[Dict[str, Any]]:
     """Per-stage p95 against a 7-day baseline — the design's pool table.
 
-    `recent` and `baseline` map a stage id to that stage's durations in
-    seconds. A stage with too few samples on either side reports its p95
-    with ``ratio: None`` rather than a comparison built on two runs.
+    `recent` and `baseline` map a stage id to that stage's **rates**: seconds
+    of stage time per second of source. The caller normalises (see
+    ``server._admin_stage_samples``) because a raw duration mostly measures
+    how long the video was, so a raw comparison flags every stage on any day
+    whose videos ran longer than last week's.
+
+    A stage with too few samples on either side reports its p95 with
+    ``ratio: None`` rather than a comparison built on two runs.
     """
     out: List[Dict[str, Any]] = []
     for stage in sorted(set(recent) | set(baseline)):
@@ -893,9 +917,12 @@ def stage_health(recent: Dict[str, Sequence[float]],
         out.append({
             "stage": stage,
             "runs": len(now_samples),
-            "p50": round(percentile(now_samples, 50), 1),
-            "p95": round(p95, 1),
-            "baseline_p95": round(base_p95, 1),
+            # Three decimals: these are rates, and a fast stage like merge
+            # runs at hundredths of realtime — one decimal would print 0.0
+            # for most of the table.
+            "p50": round(percentile(now_samples, 50), 3),
+            "p95": round(p95, 3),
+            "baseline_p95": round(base_p95, 3),
             "baseline_runs": len(base_samples),
             "ratio": ratio,
             "severity": severity,
@@ -1017,12 +1044,21 @@ def fleet(jobs: Iterable[Dict[str, Any]],
     util = gpu.get("util_pct")
     alerts = stage_alerts(health)
 
+    # Each branch names the cause it actually fired on. An earlier version
+    # said "see stages below" whenever anything was wrong, which sent the
+    # reader to a table of eight healthy rows when the real problem was the
+    # failure rate.
     if intake_paused:
         status, status_text = "warn", "intake paused — nothing new will start"
     elif any(a["severity"] == "bad" for a in alerts):
-        status, status_text = "bad", "a pipeline stage is badly degraded"
-    elif alerts or (fail_pct is not None and fail_pct > 10):
-        status, status_text = "warn", "degraded — see stages below"
+        status = "bad"
+        status_text = f"{alerts[0]['stage']} is badly degraded"
+    elif alerts:
+        status = "warn"
+        status_text = f"{alerts[0]['stage']} is slower than its baseline"
+    elif fail_pct is not None and fail_pct > 10:
+        status = "warn"
+        status_text = f"{fail_pct:.0f}% of jobs failed in the last 24h"
     else:
         status, status_text = "ok", "all systems nominal"
 
