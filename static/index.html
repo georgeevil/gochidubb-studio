@@ -4975,6 +4975,173 @@ function VoiceTtsTab({ system }) {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// DESKTOP NOTIFICATIONS
+// ═══════════════════════════════════════════════════════════════════
+// A dub runs for hours; nobody watches the tab. Creator mode had a
+// "Notify me when it's ready" button, but it only ever announced
+// completions — a job that errored told you nothing, which is the case where
+// being told actually matters, because the machine has stopped and is
+// waiting for you. Pro mode had no notifications at all.
+//
+// Everything here is per-browser, in localStorage. Notification permission is
+// per-origin and cannot be granted on someone's behalf, so a server-side
+// preference would only be able to describe an intent the browser might
+// refuse. Webhooks (Develop → Webhooks) are the durable, cross-device path;
+// this is the local one.
+
+const NOTIFY_EVENTS = [
+  { id: 'complete', label: 'Finished',
+    hint: 'A dub rendered and is ready to watch.' },
+  { id: 'error', label: 'Failed',
+    hint: 'A job stopped. Usually needs you before anything else can run.' },
+  { id: 'review', label: 'Waiting for review',
+    hint: 'A job paused at a wizard gate and will sit there until you act.' },
+];
+
+// Which of the three buckets a status belongs to, or null for the many
+// statuses that are just progress and would make a notification into noise.
+const notifyBucket = (status) => {
+  if (status === 'complete') return 'complete';
+  if (status === 'error') return 'error';
+  if (REVIEW_STATUSES.has(status)) return 'review';
+  return null;
+};
+
+const notifySupported = () => typeof window !== 'undefined' && 'Notification' in window;
+
+function useNotifyPrefs() {
+  const [enabled, setEnabled] = useState(() => _lsGet('notify_enabled', false) === true);
+  const [events, setEventsState] = useState(() => {
+    const out = {};
+    // Failures and review gates default ON once notifications are enabled at
+    // all: they are the two that block the pipeline. Completions are the
+    // pleasant one, and also default on — it is what Creator mode already did.
+    for (const e of NOTIFY_EVENTS) out[e.id] = _lsGet('notify_' + e.id, true) !== false;
+    return out;
+  });
+  useEffect(() => { _lsSet('notify_enabled', enabled); }, [enabled]);
+  const setEvent = (id, on) => {
+    setEventsState(prev => ({ ...prev, [id]: on }));
+    _lsSet('notify_' + id, on);
+  };
+  return { enabled, setEnabled, events, setEvent };
+}
+
+function useJobNotifications(jobs) {
+  const seen = useRef(null);
+
+  useEffect(() => {
+    const byId = new Map(jobs.map(j => [j.id, j.status]));
+
+    // First pass records the world as it is and announces nothing. Without
+    // this, opening the page would fire a notification for every job that has
+    // ever completed or failed.
+    if (seen.current === null) { seen.current = byId; return; }
+
+    const prev = seen.current;
+    seen.current = byId;
+
+    if (_lsGet('notify_enabled', false) !== true) return;
+    if (!notifySupported() || Notification.permission !== 'granted') return;
+
+    for (const job of jobs) {
+      const was = prev.get(job.id);
+      // A job absent from the previous poll is new to this browser, not
+      // newly finished — the jobs list is paginated and a stale job can
+      // appear at any time.
+      if (was === undefined || was === job.status) continue;
+      const bucket = notifyBucket(job.status);
+      if (!bucket || _lsGet('notify_' + bucket, true) === false) continue;
+
+      const name = job.title || job.source_label || job.id;
+      const lang = (job.target_lang || '').toUpperCase();
+      const title = bucket === 'complete' ? 'Dub ready'
+                  : bucket === 'error' ? 'Dub failed'
+                  : 'Waiting for you';
+      const body = bucket === 'error'
+        ? `${name}${lang ? ' → ' + lang : ''}\n${(job.error || 'Stopped with no message').slice(0, 140)}`
+        : `${name}${lang ? ' → ' + lang : ''}${bucket === 'review' ? '\n' + (job.step_detail || 'Paused for review') : ''}`;
+      try {
+        // tag = job id, so a job that flips status twice replaces its own
+        // notification instead of stacking a second one.
+        const n = new Notification(title, { body, tag: 'gcd-' + job.id });
+        n.onclick = () => { try { window.focus(); } catch (_) {} n.close(); };
+      } catch (_) { /* some browsers throw outside a user gesture */ }
+    }
+  }, [jobs]);
+}
+
+function NotificationsTab() {
+  const { enabled, setEnabled, events, setEvent } = useNotifyPrefs();
+  const [perm, setPerm] = useState(() => notifySupported() ? Notification.permission : 'unsupported');
+
+  const enable = async () => {
+    if (!notifySupported()) return;
+    let p = Notification.permission;
+    // requestPermission must be called from a user gesture, which is why this
+    // lives on a button and not in the effect that fires the notifications.
+    if (p === 'default') p = await Notification.requestPermission();
+    setPerm(p);
+    setEnabled(p === 'granted');
+  };
+
+  const test = () => {
+    try {
+      new Notification('GoChiDUBB', { body: 'Notifications are working.' });
+    } catch (_) {}
+  };
+
+  const blocked = perm === 'denied';
+  const on = enabled && perm === 'granted';
+
+  return (
+    <div style={{ maxWidth: 620, display: 'flex', flexDirection: 'column', gap: 18 }}>
+      <div style={{ fontSize: 12.5, color: 'var(--ink-2)', lineHeight: 1.7 }}>
+        Desktop notifications for jobs that finish, fail, or stop and wait for
+        you. They come from this browser, so they only arrive while a
+        GoChiDUBB tab is open somewhere — for alerts that reach you anywhere,
+        use <span style={{ color: 'var(--ink-1)' }}>Develop → Webhooks</span>.
+      </div>
+
+      {perm === 'unsupported' && (
+        <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>
+          This browser has no Notification API, so there is nothing to turn on.
+        </div>
+      )}
+
+      {blocked && (
+        <div style={{ fontSize: 12, color: 'var(--warn)', lineHeight: 1.6 }}>
+          This site is blocked from sending notifications. The browser will not
+          ask again from a button — reset it in the site settings beside the
+          address bar, then reload.
+        </div>
+      )}
+
+      {perm !== 'unsupported' && !blocked && (
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button className={'btn ' + (on ? 'btn-ghost' : 'btn-primary')}
+                  onClick={on ? () => setEnabled(false) : enable}>
+            {on ? 'Turn notifications off' : 'Turn notifications on'}
+          </button>
+          {on && <button className="btn btn-ghost" onClick={test}>Send a test</button>}
+          {on && <span className="chip" style={{ color: 'var(--accent)',
+                                                 borderColor: 'var(--line-2)' }}>on</span>}
+        </div>
+      )}
+
+      <div style={{ opacity: on ? 1 : 0.45, pointerEvents: on ? 'auto' : 'none' }}>
+        <div className="caps" style={{ marginBottom: 6 }}>Tell me about</div>
+        {NOTIFY_EVENTS.map(e => (
+          <Toggle key={e.id} value={events[e.id]} onChange={v => setEvent(e.id, v)}
+                  label={e.label} hint={e.hint}/>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
 function SystemView({ system, onRefreshSystem }) {
   const [tab, setTab] = useState(_lsGet('system_tab', 'overview'));
   const pick = (t) => { setTab(t); _lsSet('system_tab', t); };
@@ -5002,7 +5169,7 @@ function SystemView({ system, onRefreshSystem }) {
       </div>
 
       <div style={{ display: 'flex', gap: 6, marginBottom: 22 }}>
-        {[['overview', 'Overview'], ['voice', 'Voice & TTS'], ['output', 'Output'], ['setup', 'Setup'], ['logs', 'Logs']].map(([id, label]) => (
+        {[['overview', 'Overview'], ['voice', 'Voice & TTS'], ['output', 'Output'], ['notify', 'Notifications'], ['setup', 'Setup'], ['logs', 'Logs']].map(([id, label]) => (
           <button key={id} className={'tab' + (tab === id ? ' active' : '')} onClick={() => pick(id)}>
             {label}{id === 'setup' && issues.length > 0 ? ` · ${issues.length}` : ''}
           </button>
@@ -5011,6 +5178,7 @@ function SystemView({ system, onRefreshSystem }) {
 
       {tab === 'voice' && <VoiceTtsTab system={system}/>}
       {tab === 'output' && <OutputTab system={system}/>}
+      {tab === 'notify' && <NotificationsTab/>}
       {tab === 'setup' && <SetupTab system={system} onRefreshSystem={onRefreshSystem}/>}
       {tab === 'logs' && <LogsTab/>}
       {tab === 'overview' && (
@@ -6550,6 +6718,10 @@ function App() {
     const t = setInterval(fetchJobs, interval);
     return () => { stopped = true; clearInterval(t); };
   }, [jobs.some(j => ACTIVE_STATUSES.has(j.status))]);
+
+  // Watches the same poll the UI already runs, so notifications cost no
+  // extra requests. Mounted at the top so they fire whichever screen is open.
+  useJobNotifications(jobs);
 
   const runningJob = jobs.find(j => ACTIVE_STATUSES.has(j.status));
   const awaitingReviewCount = jobs.filter(j => REVIEW_STATUSES.has(j.status)).length;

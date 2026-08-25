@@ -69,7 +69,16 @@ const POPULAR = ["es", "pt", "fr", "de", "ja", "hi", "id", "ar"];
 // Status vocabulary from server.py, collapsed into the four states a creator
 // can act on. Anything not listed is mid-pipeline, i.e. "running".
 const S_DONE = new Set(["complete"]);
-const S_ATTN = new Set(["awaiting_translation_review"]);
+// Every gate the wizard can park a job at. A status missing from here falls
+// through to "run" below and is drawn as though the machine were still
+// working on it — so a job waiting on a person looks like a job in progress,
+// and nobody goes and unblocks it.
+const S_ATTN = new Set([
+  "awaiting_translation_review",
+  "awaiting_transcript_review",
+  "awaiting_voice_review",
+]);
+const needsReviewStatus = s => S_ATTN.has(s);
 const S_FAIL = new Set(["error", "cancelled", "interrupted"]);
 // Stopped, not queued: a paused job will never resume on its own, so it must
 // not be drawn as if the machine is going to get to it. Its own state, with
@@ -258,12 +267,32 @@ function schedulePoll() {
 function announceCompletions(before) {
   for (const j of state.jobs) {
     const was = before.get(j.id);
-    if (was && was !== "complete" && j.status === "complete") {
-      const msg = `${langName(j.target_lang)} is ready for "${groupTitle({ jobs: [j] })}".`;
-      $("#live").textContent = msg;
-      if (state.notify && "Notification" in window && Notification.permission === "granted") {
-        try { new Notification("Your dub is ready", { body: msg }); } catch (_) {}
-      }
+    if (!was || was === j.status) continue;
+
+    const what = `${langName(j.target_lang)} for "${groupTitle({ jobs: [j] })}"`;
+    let title = "", msg = "";
+    if (j.status === "complete") {
+      title = "Your dub is ready";
+      msg = `${langName(j.target_lang)} is ready for "${groupTitle({ jobs: [j] })}".`;
+    } else if (j.status === "error") {
+      // This used to announce nothing at all. A finished dub is good news you
+      // will find on your own next time you look; a failed one has stopped
+      // and is waiting for you, which is precisely when not being told costs
+      // you the afternoon.
+      title = "A dub stopped";
+      msg = `${what} didn't finish. ${(j.error || "").slice(0, 120)}`.trim();
+    } else if (needsReviewStatus(j.status)) {
+      title = "Waiting for you";
+      msg = `${what} is paused for review.`;
+    } else {
+      continue;
+    }
+
+    $("#live").textContent = msg;
+    if (state.notify && "Notification" in window && Notification.permission === "granted") {
+      // tag = job id, so a job that changes twice replaces its own
+      // notification rather than stacking a second one.
+      try { new Notification(title, { body: msg, tag: `gcd-${j.id}` }); } catch (_) {}
     }
   }
 }

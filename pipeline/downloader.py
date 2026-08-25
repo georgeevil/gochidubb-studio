@@ -74,6 +74,57 @@ def _cookie_args() -> list:
 _PLAYER_CLIENT_FALLBACK = ["--extractor-args", "youtube:player_client=web_embedded"]
 
 
+def _remote_components_args() -> list:
+    """`--remote-components` flags, only if the user has opted in.
+
+    YouTube sometimes gates a video behind a JavaScript challenge that yt-dlp
+    can only solve by downloading a solver component at request time and
+    running it under deno or node. That is remote code executed on the user's
+    machine as a side effect of pasting a link, so it is off unless
+    `ytdlp_remote_components` says otherwise, and even then it is only reached
+    for after a challenge failure — never on the first attempt.
+    """
+    value = (getattr(cfg, "ytdlp_remote_components", "") or "").strip()
+    return ["--remote-components", value] if value else []
+
+
+def _needs_challenge_solver(*outputs: str) -> bool:
+    """True when the failure looks like an unsolved JS challenge.
+
+    Deliberately narrow. yt-dlp prints its "components were skipped" line as a
+    WARNING on runs that go on to succeed, so the warning alone must not be
+    taken as the cause — the output has to show a challenge that actually
+    could not be solved.
+    """
+    blob = " ".join(o or "" for o in outputs).lower()
+    # None of these appear in the advisory "components were skipped" warning,
+    # which is why matching on them is enough to tell a real challenge failure
+    # from a run that merely mentioned one.
+    return any(k in blob for k in (
+        "failed to solve", "unable to solve", "could not solve",
+        "no challenge solver", "nsig extraction failed",
+        "unable to extract nsig",
+    ))
+
+
+def _ytdlp_error(stderr: str, stdout: str = "") -> str:
+    """The line that actually explains a failed run.
+
+    Not `stderr[:300]`. yt-dlp prints warnings first and its fatal ERROR line
+    last, so slicing the head of stderr reliably reports a warning as though
+    it were the cause. That is not hypothetical: a failed job was persisted
+    with "Remote components challenge solver script ... were skipped" as its
+    error — a warning, on a run whose real failure was cut off past character
+    300 — and it sent the diagnosis in entirely the wrong direction.
+    """
+    for line in reversed((stderr or "").splitlines()):
+        line = line.strip()
+        if line.startswith("ERROR:"):
+            return line[:300]
+    tail = (stderr or "").strip() or (stdout or "").strip()
+    return tail[-300:] if tail else "yt-dlp failed without writing an error"
+
+
 def _is_403(*outputs: str) -> bool:
     """True when yt-dlp output looks like an HTTP 403 from the extractor."""
     blob = " ".join(o or "" for o in outputs).lower()
@@ -410,16 +461,38 @@ def download_video(source: str, output_dir: str, info: dict | None = None) -> st
         result = _run(preferred_fmt, _PLAYER_CLIENT_FALLBACK)
 
     if result.returncode != 0:
-        log.warning(f"First attempt failed: {result.stderr[:200]}")
+        log.warning(f"First attempt failed: {_ytdlp_error(result.stderr)}")
         result = _run(simple_fmt)
         # The simpler format can hit the same 403; give it the same escape.
         if result.returncode != 0 and _is_403(result.stderr, result.stdout):
             log.warning("[download] 403 on the fallback format too — "
                         "retrying it with player_client=web_embedded")
             result = _run(simple_fmt, _PLAYER_CLIENT_FALLBACK)
+
+        # Last resort, and only with consent: a JS challenge yt-dlp could not
+        # solve on its own. Solving it means downloading a component from
+        # GitHub or npm and executing it, so this runs only when the user has
+        # set ytdlp_remote_components — and only here, after everything that
+        # needs no remote code has already failed.
+        if result.returncode != 0 and _needs_challenge_solver(
+                result.stderr, result.stdout):
+            rc_args = _remote_components_args()
+            if rc_args:
+                log.warning(f"[download] JS challenge unsolved — retrying with "
+                            f"{' '.join(rc_args)} (opt-in)")
+                result = _run(preferred_fmt, rc_args)
+                if result.returncode != 0:
+                    result = _run(simple_fmt, rc_args)
+            else:
+                log.warning(
+                    "[download] JS challenge unsolved and remote components "
+                    "are off. Settings -> ytdlp_remote_components = "
+                    "'ejs:github' lets yt-dlp fetch a solver, which means "
+                    "running code downloaded at request time.")
+
         if result.returncode != 0:
             raise DownloadFailed(
-                f"YouTube download failed: {result.stderr[:300]}",
+                f"YouTube download failed: {_ytdlp_error(result.stderr, result.stdout)}",
                 hint=classify_download_failure(
                     result.stderr, result.stdout, source))
 

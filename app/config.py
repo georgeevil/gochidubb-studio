@@ -68,6 +68,10 @@ FIELD_SPECS: dict = {
     "bg_ducking":          (bool,),
     "eta_realtime_factor": (float, 0.5, 60.0),
     "mode":                (str, ("local", "hosted")),
+    # "" is off, and is the default: the other two make yt-dlp fetch and run
+    # a solver component from the network. An enum rather than free text so a
+    # typo cannot turn into an arbitrary --remote-components argument.
+    "ytdlp_remote_components": (str, ("", "ejs:github", "ejs:npm")),
 }
 
 _TRUTHY = ("1", "true", "yes", "on")
@@ -225,6 +229,13 @@ class UserConfig:
     # ── Downloader (yt-dlp) ───────────────────────────────────────────
     ytdlp_cookies_from_browser: str = ""   # e.g. "firefox", "chrome", "safari"
     ytdlp_cookiefile: str = ""             # path to Netscape cookies.txt
+    # YouTube sometimes gates a video behind a JavaScript challenge that
+    # yt-dlp can only solve by downloading a solver component at runtime
+    # ("ejs:github" or "ejs:npm") and executing it in deno or node. That is
+    # remote code fetched at download time, so it stays OFF by default and is
+    # only ever used as a last-resort retry after a challenge failure — see
+    # pipeline/downloader.py. Empty = never fetch it.
+    ytdlp_remote_components: str = ""      # "" | "ejs:github" | "ejs:npm"
     max_source_duration_sec: int = 0       # 0 = no pre-download duration gate
 
     # ── Estimates ─────────────────────────────────────────────────────
@@ -367,6 +378,7 @@ def _load_config() -> UserConfig:
         "GOCHIDUBB_FFMPEG_STALL_TIMEOUT": "ffmpeg_stall_timeout",
         "YT_DLP_COOKIES_FROM_BROWSER": "ytdlp_cookies_from_browser",
         "YT_DLP_COOKIEFILE": "ytdlp_cookiefile",
+        "YT_DLP_REMOTE_COMPONENTS": "ytdlp_remote_components",
         "MAX_SOURCE_DURATION_SEC": "max_source_duration_sec",
         "PUBLISH_DESCRIPTION_TEMPLATE": "publish_description_template",
     }

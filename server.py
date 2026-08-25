@@ -5484,7 +5484,16 @@ async def start_quick_test(
                         dl_dir.rmdir()
                 except OSError:
                     pass
-                return None, {"error": f"Could not download URL: {e}"}, 400
+                # Carry the structured rescue hint through. DownloadFailed
+                # attaches "which yt-dlp command to run by hand" for exactly
+                # this case, and dropping it here is why a failed
+                # multi-language submit showed a bare message and an empty
+                # rescue panel while the single-dub path showed both.
+                payload = {"error": f"Could not download URL: {e}"}
+                hint = getattr(e, "hint", None)
+                if isinstance(hint, dict) and hint:
+                    payload["download_hint"] = hint
+                return None, payload, 400
         if not trim_seconds:
             return src, None, 0
         dst = src.parent / f"{src.stem}_qt{trim_seconds}s.mp4"
@@ -6325,7 +6334,11 @@ async def start_showcase(
             src_path = Path(await asyncio.to_thread(
                 download_video, url, str(dl_dir)))
         except Exception as e:
-            return JSONResponse({"error": f"Could not download URL: {e}"}, 400)
+            payload = {"error": f"Could not download URL: {e}"}
+            hint = getattr(e, "hint", None)
+            if isinstance(hint, dict) and hint:
+                payload["download_hint"] = hint
+            return JSONResponse(payload, 400)
 
     # Trim
     trimmed_path = src_path.parent / f"{src_path.stem}_sc{trim_seconds}s.mp4"
