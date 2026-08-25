@@ -5,6 +5,7 @@ from unittest.mock import patch
 import pytest
 
 from app.config import cfg
+from pipeline import rescue
 from pipeline.downloader import (
     DownloadFailed,
     _cookie_args,
@@ -267,8 +268,14 @@ class _Result:
 
 
 class TestDownload403Fallback:
-    """download_video() retries through web_embedded — but only for a 403,
-    and without giving up the preferred format to do it."""
+    """How download_video() recovers, now that pipeline/rescue.py decides.
+
+    The old ladder went one way: a 403 escalated straight to the web_embedded
+    player client. That is what broke a real download — the 403 was transient,
+    web_embedded could not solve YouTube's JS challenge, and its format list
+    collapsed to images. The escalation is still there; it is no longer the
+    first thing tried.
+    """
 
     SIMPLE = "best[ext=mp4]/best"
 
@@ -287,7 +294,10 @@ class TestDownload403Fallback:
             (tmp_path / "source_video.mp4").write_bytes(b"x")
             return responder(len(calls), cmd)
 
-        with patch("pipeline.downloader.subprocess.run", side_effect=fake_run):
+        # The waits are real seconds and the point of them is not under test
+        # here; the policy tests assert that they are asked for.
+        with patch("pipeline.downloader.subprocess.run", side_effect=fake_run), \
+             patch("pipeline.downloader.time.sleep"):
             download_video("https://youtu.be/abc", str(tmp_path))
         return calls
 
@@ -296,14 +306,26 @@ class TestDownload403Fallback:
         assert len(calls) == 1
         assert "web_embedded" not in " ".join(calls[0])
 
-    def test_403_retries_with_web_embedded(self, tmp_path):
+    def test_a_403_is_retried_as_is_before_the_client_is_changed(self, tmp_path):
+        """The regression that motivated the rescue module. Most 403s here
+        clear on their own, and swapping to a degraded client to dodge one
+        trades a failure that would have fixed itself for one that will not."""
+        calls = self._run(tmp_path, lambda n, cmd: (
+            _Result(0) if n >= 2 else _Result(1, "HTTP Error 403: Forbidden")))
+        assert len(calls) == 2
+        assert "web_embedded" not in " ".join(calls[1]), (
+            "escalated to a different player client on the first 403 instead "
+            "of simply trying again")
+        assert self._fmt(calls[1]) == self._fmt(calls[0])
+
+    def test_a_persistent_403_does_still_reach_web_embedded(self, tmp_path):
         calls = self._run(tmp_path, lambda n, cmd: (
             _Result(0) if "web_embedded" in " ".join(cmd)
             else _Result(1, "HTTP Error 403: Forbidden")))
-        assert len(calls) == 2
-        assert "youtube:player_client=web_embedded" in calls[1]
+        assert "youtube:player_client=web_embedded" in calls[-1]
+        assert len(calls) == 3   # preferred, wait+preferred, web_embedded
 
-    def test_403_retry_keeps_the_preferred_format(self, tmp_path):
+    def test_403_retries_keep_the_preferred_format(self, tmp_path):
         # A 403 is an access problem, not a format problem — degrading to
         # best[ext=mp4] would hand back a worse rendition of a 1080p video.
         # Asserted as "same selector as attempt 1, and not the degraded one"
@@ -312,8 +334,9 @@ class TestDownload403Fallback:
         calls = self._run(tmp_path, lambda n, cmd: (
             _Result(0) if "web_embedded" in " ".join(cmd)
             else _Result(1, "HTTP Error 403: Forbidden")))
-        assert self._fmt(calls[1]) == self._fmt(calls[0])
-        assert self._fmt(calls[1]) != self.SIMPLE
+        for c in calls:
+            assert self._fmt(c) == self._fmt(calls[0])
+            assert self._fmt(c) != self.SIMPLE
 
     def test_non_403_failure_degrades_format_without_web_embedded(self, tmp_path):
         calls = self._run(tmp_path, lambda n, cmd: (
@@ -321,6 +344,51 @@ class TestDownload403Fallback:
         assert len(calls) == 2
         assert "web_embedded" not in " ".join(calls[1])
         assert self._fmt(calls[1]) == self.SIMPLE   # degraded, as intended
+
+    def test_a_dead_video_is_not_retried_at_all(self, tmp_path):
+        """Six attempts at a deleted video is a minute of nothing, and it
+        teaches people that the retry count means nothing."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return _Result(1, "ERROR: [youtube] abc: Video unavailable")
+
+        with patch("pipeline.downloader.subprocess.run", side_effect=fake_run), \
+             patch("pipeline.downloader.time.sleep"), \
+             pytest.raises(DownloadFailed):
+            download_video("https://youtu.be/abc", str(tmp_path))
+        assert len(calls) == 1
+
+    def test_the_ladder_is_bounded(self, tmp_path):
+        """Nothing works, everything is tried, and then it stops."""
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return _Result(1, "ERROR: something nobody has a rule for")
+
+        with patch("pipeline.downloader.subprocess.run", side_effect=fake_run), \
+             patch("pipeline.downloader.time.sleep"), \
+             pytest.raises(DownloadFailed):
+            download_video("https://youtu.be/abc", str(tmp_path))
+        assert 1 < len(calls) <= rescue.MAX_ATTEMPTS
+
+    def test_what_was_attempted_is_recorded_on_the_failure(self, tmp_path):
+        """A rescue that did not work has to be readable afterwards, or the
+        only record is a log line nobody kept."""
+        def fake_run(cmd, **kwargs):
+            return _Result(1, "ERROR: [youtube] Requested format is not available")
+
+        with patch("pipeline.downloader.subprocess.run", side_effect=fake_run), \
+             patch("pipeline.downloader.time.sleep"):
+            with pytest.raises(DownloadFailed) as ei:
+                download_video("https://youtu.be/abc", str(tmp_path))
+
+        rec = (ei.value.hint or {}).get("rescue") or {}
+        assert rec.get("shape") == rescue.FORMAT_GONE
+        assert [a["strategy"] for a in rec.get("attempts", [])]
+        assert "format" in rec.get("summary", "").lower()
 
 
 class TestProbe403Fallback:

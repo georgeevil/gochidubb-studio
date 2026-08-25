@@ -3281,6 +3281,80 @@ function _openLogFocus(focus) {
   window.dispatchEvent(new CustomEvent('gcd:open-logs'));
 }
 
+// ── Do-it-yourself download instructions ──
+// The rescue panel used to offer bare yt-dlp one-liners, which are no help to
+// anybody who does not already have yt-dlp — and the people hitting this are
+// by definition not having a good day with downloads. Served from
+// /api/download_guides with the failing URL already quoted in, so every
+// command is paste-ready.
+function guessPlatform() {
+  const s = (navigator.userAgentData?.platform || navigator.platform ||
+             navigator.userAgent || '').toLowerCase();
+  if (s.includes('android')) return 'Android';
+  if (/iphone|ipad|ipod/.test(s)) return 'iPhone / iPad';
+  if (s.includes('win')) return 'Windows';
+  if (s.includes('mac')) return 'macOS';
+  if (s.includes('linux')) return 'Linux';
+  return 'macOS';
+}
+
+function DownloadGuides({ jobId }) {
+  const [data, setData] = useState(null);
+  const [pick, setPick] = useState(guessPlatform);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    fetch(`/api/download_guides?job_id=${encodeURIComponent(jobId)}`)
+      .then(r => r.json())
+      .then(d => d.error ? setErr(d.error) : setData(d))
+      .catch(e => setErr(String(e.message || e)));
+  }, [jobId]);
+
+  if (err) return <div style={{ fontSize: 11.5, color: 'var(--ink-3)' }}>{err}</div>;
+  if (!data) return <div style={{ fontSize: 11.5, color: 'var(--ink-3)' }}>Loading instructions…</div>;
+
+  const guides = data.guides || [];
+  const cur = guides.find(g => g.platform === pick) || guides[0];
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+        {guides.map(g => (
+          <button key={g.platform} className={'tab' + (g.platform === pick ? ' active' : '')}
+                  onClick={() => setPick(g.platform)}
+                  style={{ fontSize: 11, padding: '3px 9px' }}>
+            {g.platform}
+          </button>
+        ))}
+      </div>
+      {(cur?.steps || []).map((st, i) => (
+        <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div className="caps">{st.label}</div>
+            <div style={{ flex: 1 }}/>
+            {st.command && <CopyButton text={st.command}/>}
+          </div>
+          {st.command && (
+            <pre className="mono wrap-any" style={{ margin: 0, fontSize: 10.5, lineHeight: 1.5,
+                        whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                        background: 'var(--bg-1)', border: '1px solid var(--line)',
+                        borderRadius: 5, padding: '6px 8px' }}>{st.command}</pre>
+          )}
+          {st.url && (
+            <a href={st.url} target="_blank" rel="noopener noreferrer"
+               className="mono wrap-any" style={{ fontSize: 10.5, color: 'var(--accent)' }}>
+              {st.url}
+            </a>
+          )}
+        </div>
+      ))}
+      {cur?.note && (
+        <div style={{ fontSize: 11, color: 'var(--ink-3)', lineHeight: 1.6 }}>{cur.note}</div>
+      )}
+    </div>
+  );
+}
+
 // ── Download rescue panel ──
 // Rendered inside JobErrorPanel when the download stage failed and the
 // server attached a `download_hint`: shows why yt-dlp failed, the exact
@@ -3291,6 +3365,7 @@ function DownloadRescuePanel({ job }) {
   const [uploading, setUploading] = useState(false);
   const [err, setErr] = useState('');
   const [drag, setDrag] = useState(false);
+  const [showHow, setShowHow] = useState(false);
   const inputRef = useRef(null);
   if (!hint) return null;
 
@@ -3340,6 +3415,14 @@ function DownloadRescuePanel({ job }) {
                       borderRadius: 5, padding: '6px 8px' }}>{cmd.command}</pre>
         </div>
       ))}
+      <div style={{ paddingTop: 4 }}>
+        <button className="btn btn-ghost" onClick={() => setShowHow(v => !v)}
+                style={{ fontSize: 11, padding: '3px 8px' }}>
+          {showHow ? 'Hide' : 'Download it yourself'}
+        </button>
+      </div>
+      {showHow && <DownloadGuides jobId={job.id}/>}
+
       <div
         className={'dropzone' + (drag ? ' dragging' : '')}
         onClick={() => !uploading && inputRef.current?.click()}
@@ -4156,6 +4239,20 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
   const [selected, setSelected] = useState(() => new Set());
   const [anchor, setAnchor] = useState(null);   // index of the last plain click
   const [confirming, setConfirming] = useState(false);
+  // The confirmation lives in the shared selection toolbar at the top of the
+  // list — one delete path rather than two that can disagree. But a row's
+  // Delete button can be clicked from anywhere in a 95-job list, and the
+  // answer appeared off-screen above with nothing to say so: the click looked
+  // like it had done nothing. The bar is sticky now, and this brings it into
+  // view for the case where it is not yet stuck.
+  const confirmRef = useRef(null);
+  useEffect(() => {
+    if (confirming && confirmRef.current) {
+      try {
+        confirmRef.current.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      } catch (_) { confirmRef.current.scrollIntoView(); }
+    }
+  }, [confirming]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
 
@@ -4253,8 +4350,20 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
       {/* Selection toolbar. Always present so "Select all" is discoverable
           without first hunting for a checkbox. */}
       {visible.length > 0 && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10,
-                      flexWrap: 'wrap', fontSize: 12 }}>
+        <div ref={confirmRef} style={{
+          display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10,
+          flexWrap: 'wrap', fontSize: 12,
+          // Sticky so a confirmation raised from a row 40 items down is on
+          // screen rather than somewhere above it. Opaque, and bled out over
+          // the scroll container's padding, so rows pass underneath it
+          // instead of through it.
+          position: 'sticky', top: 0, zIndex: 5,
+          background: 'var(--bg)',
+          padding: confirming ? '8px 10px' : '6px 10px',
+          margin: '0 -10px 10px',
+          borderRadius: 'var(--r-md)',
+          border: '1px solid ' + (confirming ? 'oklch(0.7 0.2 25 / 0.35)' : 'transparent'),
+        }}>
           <label style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer',
                           color: 'var(--ink-2)' }}>
             <input type="checkbox" checked={allSelected} onChange={selectAll}
@@ -4274,7 +4383,14 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
               ) : (
                 <>
                   <span style={{ color: 'var(--err)' }}>
-                    Delete {selected.size} job{selected.size === 1 ? '' : 's'} and their files? This cannot be undone.
+                    {selected.size === 1
+                      ? `Delete “${(() => {
+                          const one = visible.find(v => selected.has(v.id));
+                          const name = (one && (one.title || one.source_label || one.id)) || 'this job';
+                          return name.length > 60 ? name.slice(0, 60) + '…' : name;
+                        })()}” and its files?`
+                      : `Delete ${selected.size} jobs and their files?`}
+                    {' '}This cannot be undone.
                   </span>
                   <button className="btn" onClick={doDelete} disabled={busy}
                           style={{ background: 'oklch(0.7 0.2 25 / 0.15)', color: 'var(--err)',
@@ -4337,6 +4453,17 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
                 {openId === j.id ? 'Hide stages' : 'Stages'}
               </button>
               {j.status === 'complete' && <button className="btn" onClick={() => onJumpResult(j.id)}>View</button>}
+              {/* A job at a review gate has stopped and will not move until
+                  somebody acts on it, so the row has to offer the action. The
+                  handler was already being passed in and was never called:
+                  the only route to the review screen was the header chip,
+                  which hides itself on this very screen. */}
+              {REVIEW_STATUSES.has(j.status) && (
+                <button className="btn btn-primary" style={{ padding: '4px 10px', fontSize: 11.5 }}
+                        onClick={() => onJumpReview(j.id)}>
+                  {j.status === 'awaiting_voice_review' ? 'Cast voices' : 'Review'}
+                </button>
+              )}
               {/* Selects just this row and opens the shared confirm, so there
                   is one delete path rather than two that can disagree. */}
               <button className="btn btn-ghost" title="Delete this job and its files"
@@ -4975,6 +5102,173 @@ function VoiceTtsTab({ system }) {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// DESKTOP NOTIFICATIONS
+// ═══════════════════════════════════════════════════════════════════
+// A dub runs for hours; nobody watches the tab. Creator mode had a
+// "Notify me when it's ready" button, but it only ever announced
+// completions — a job that errored told you nothing, which is the case where
+// being told actually matters, because the machine has stopped and is
+// waiting for you. Pro mode had no notifications at all.
+//
+// Everything here is per-browser, in localStorage. Notification permission is
+// per-origin and cannot be granted on someone's behalf, so a server-side
+// preference would only be able to describe an intent the browser might
+// refuse. Webhooks (Develop → Webhooks) are the durable, cross-device path;
+// this is the local one.
+
+const NOTIFY_EVENTS = [
+  { id: 'complete', label: 'Finished',
+    hint: 'A dub rendered and is ready to watch.' },
+  { id: 'error', label: 'Failed',
+    hint: 'A job stopped. Usually needs you before anything else can run.' },
+  { id: 'review', label: 'Waiting for review',
+    hint: 'A job paused at a wizard gate and will sit there until you act.' },
+];
+
+// Which of the three buckets a status belongs to, or null for the many
+// statuses that are just progress and would make a notification into noise.
+const notifyBucket = (status) => {
+  if (status === 'complete') return 'complete';
+  if (status === 'error') return 'error';
+  if (REVIEW_STATUSES.has(status)) return 'review';
+  return null;
+};
+
+const notifySupported = () => typeof window !== 'undefined' && 'Notification' in window;
+
+function useNotifyPrefs() {
+  const [enabled, setEnabled] = useState(() => _lsGet('notify_enabled', false) === true);
+  const [events, setEventsState] = useState(() => {
+    const out = {};
+    // Failures and review gates default ON once notifications are enabled at
+    // all: they are the two that block the pipeline. Completions are the
+    // pleasant one, and also default on — it is what Creator mode already did.
+    for (const e of NOTIFY_EVENTS) out[e.id] = _lsGet('notify_' + e.id, true) !== false;
+    return out;
+  });
+  useEffect(() => { _lsSet('notify_enabled', enabled); }, [enabled]);
+  const setEvent = (id, on) => {
+    setEventsState(prev => ({ ...prev, [id]: on }));
+    _lsSet('notify_' + id, on);
+  };
+  return { enabled, setEnabled, events, setEvent };
+}
+
+function useJobNotifications(jobs) {
+  const seen = useRef(null);
+
+  useEffect(() => {
+    const byId = new Map(jobs.map(j => [j.id, j.status]));
+
+    // First pass records the world as it is and announces nothing. Without
+    // this, opening the page would fire a notification for every job that has
+    // ever completed or failed.
+    if (seen.current === null) { seen.current = byId; return; }
+
+    const prev = seen.current;
+    seen.current = byId;
+
+    if (_lsGet('notify_enabled', false) !== true) return;
+    if (!notifySupported() || Notification.permission !== 'granted') return;
+
+    for (const job of jobs) {
+      const was = prev.get(job.id);
+      // A job absent from the previous poll is new to this browser, not
+      // newly finished — the jobs list is paginated and a stale job can
+      // appear at any time.
+      if (was === undefined || was === job.status) continue;
+      const bucket = notifyBucket(job.status);
+      if (!bucket || _lsGet('notify_' + bucket, true) === false) continue;
+
+      const name = job.title || job.source_label || job.id;
+      const lang = (job.target_lang || '').toUpperCase();
+      const title = bucket === 'complete' ? 'Dub ready'
+                  : bucket === 'error' ? 'Dub failed'
+                  : 'Waiting for you';
+      const body = bucket === 'error'
+        ? `${name}${lang ? ' → ' + lang : ''}\n${(job.error || 'Stopped with no message').slice(0, 140)}`
+        : `${name}${lang ? ' → ' + lang : ''}${bucket === 'review' ? '\n' + (job.step_detail || 'Paused for review') : ''}`;
+      try {
+        // tag = job id, so a job that flips status twice replaces its own
+        // notification instead of stacking a second one.
+        const n = new Notification(title, { body, tag: 'gcd-' + job.id });
+        n.onclick = () => { try { window.focus(); } catch (_) {} n.close(); };
+      } catch (_) { /* some browsers throw outside a user gesture */ }
+    }
+  }, [jobs]);
+}
+
+function NotificationsTab() {
+  const { enabled, setEnabled, events, setEvent } = useNotifyPrefs();
+  const [perm, setPerm] = useState(() => notifySupported() ? Notification.permission : 'unsupported');
+
+  const enable = async () => {
+    if (!notifySupported()) return;
+    let p = Notification.permission;
+    // requestPermission must be called from a user gesture, which is why this
+    // lives on a button and not in the effect that fires the notifications.
+    if (p === 'default') p = await Notification.requestPermission();
+    setPerm(p);
+    setEnabled(p === 'granted');
+  };
+
+  const test = () => {
+    try {
+      new Notification('GoChiDUBB', { body: 'Notifications are working.' });
+    } catch (_) {}
+  };
+
+  const blocked = perm === 'denied';
+  const on = enabled && perm === 'granted';
+
+  return (
+    <div style={{ maxWidth: 620, display: 'flex', flexDirection: 'column', gap: 18 }}>
+      <div style={{ fontSize: 12.5, color: 'var(--ink-2)', lineHeight: 1.7 }}>
+        Desktop notifications for jobs that finish, fail, or stop and wait for
+        you. They come from this browser, so they only arrive while a
+        GoChiDUBB tab is open somewhere — for alerts that reach you anywhere,
+        use <span style={{ color: 'var(--ink-1)' }}>Develop → Webhooks</span>.
+      </div>
+
+      {perm === 'unsupported' && (
+        <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>
+          This browser has no Notification API, so there is nothing to turn on.
+        </div>
+      )}
+
+      {blocked && (
+        <div style={{ fontSize: 12, color: 'var(--warn)', lineHeight: 1.6 }}>
+          This site is blocked from sending notifications. The browser will not
+          ask again from a button — reset it in the site settings beside the
+          address bar, then reload.
+        </div>
+      )}
+
+      {perm !== 'unsupported' && !blocked && (
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+          <button className={'btn ' + (on ? 'btn-ghost' : 'btn-primary')}
+                  onClick={on ? () => setEnabled(false) : enable}>
+            {on ? 'Turn notifications off' : 'Turn notifications on'}
+          </button>
+          {on && <button className="btn btn-ghost" onClick={test}>Send a test</button>}
+          {on && <span className="chip" style={{ color: 'var(--accent)',
+                                                 borderColor: 'var(--line-2)' }}>on</span>}
+        </div>
+      )}
+
+      <div style={{ opacity: on ? 1 : 0.45, pointerEvents: on ? 'auto' : 'none' }}>
+        <div className="caps" style={{ marginBottom: 6 }}>Tell me about</div>
+        {NOTIFY_EVENTS.map(e => (
+          <Toggle key={e.id} value={events[e.id]} onChange={v => setEvent(e.id, v)}
+                  label={e.label} hint={e.hint}/>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+
 function SystemView({ system, onRefreshSystem }) {
   const [tab, setTab] = useState(_lsGet('system_tab', 'overview'));
   const pick = (t) => { setTab(t); _lsSet('system_tab', t); };
@@ -5002,7 +5296,7 @@ function SystemView({ system, onRefreshSystem }) {
       </div>
 
       <div style={{ display: 'flex', gap: 6, marginBottom: 22 }}>
-        {[['overview', 'Overview'], ['voice', 'Voice & TTS'], ['output', 'Output'], ['setup', 'Setup'], ['logs', 'Logs']].map(([id, label]) => (
+        {[['overview', 'Overview'], ['voice', 'Voice & TTS'], ['output', 'Output'], ['notify', 'Notifications'], ['setup', 'Setup'], ['logs', 'Logs']].map(([id, label]) => (
           <button key={id} className={'tab' + (tab === id ? ' active' : '')} onClick={() => pick(id)}>
             {label}{id === 'setup' && issues.length > 0 ? ` · ${issues.length}` : ''}
           </button>
@@ -5011,6 +5305,7 @@ function SystemView({ system, onRefreshSystem }) {
 
       {tab === 'voice' && <VoiceTtsTab system={system}/>}
       {tab === 'output' && <OutputTab system={system}/>}
+      {tab === 'notify' && <NotificationsTab/>}
       {tab === 'setup' && <SetupTab system={system} onRefreshSystem={onRefreshSystem}/>}
       {tab === 'logs' && <LogsTab/>}
       {tab === 'overview' && (
@@ -6550,6 +6845,10 @@ function App() {
     const t = setInterval(fetchJobs, interval);
     return () => { stopped = true; clearInterval(t); };
   }, [jobs.some(j => ACTIVE_STATUSES.has(j.status))]);
+
+  // Watches the same poll the UI already runs, so notifications cost no
+  // extra requests. Mounted at the top so they fire whichever screen is open.
+  useJobNotifications(jobs);
 
   const runningJob = jobs.find(j => ACTIVE_STATUSES.has(j.status));
   const awaitingReviewCount = jobs.filter(j => REVIEW_STATUSES.has(j.status)).length;

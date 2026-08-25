@@ -6,8 +6,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 from app.config import cfg
+from pipeline import rescue
 
 log = logging.getLogger("gochidubb.downloader")
 
@@ -74,6 +76,92 @@ def _cookie_args() -> list:
 _PLAYER_CLIENT_FALLBACK = ["--extractor-args", "youtube:player_client=web_embedded"]
 
 
+def _remote_components_value() -> str:
+    return (getattr(cfg, "ytdlp_remote_components", "") or "").strip()
+
+
+def _advisor_enabled() -> bool:
+    """Whether the local LLM may be asked what to try next.
+
+    Off by default and consulted only for failures the rules do not recognise
+    — see pipeline/rescue.advise. The rules cover everything this install has
+    actually hit; the model is for the tail.
+    """
+    return bool(getattr(cfg, "download_rescue_llm", False))
+
+
+def _ask_advisor(stderr: str, tried: list):
+    """Bridge the async advisor into this synchronous function.
+
+    download_video already runs in a worker thread (server._blocking), so
+    there is no loop on this thread to reuse and asyncio.run is safe here.
+    Any failure means "no suggestion", never a crash: a download must not
+    fail because a language model was busy.
+    """
+    import asyncio
+    try:
+        model = (getattr(cfg, "translation_model", "") or "").strip()
+        if not model:
+            return None
+        return asyncio.run(rescue.advise(
+            stderr, tried, model,
+            remote_components=_remote_components_value()))
+    except Exception as e:
+        log.info(f"[rescue] advisor skipped: {type(e).__name__}: {e}")
+        return None
+
+
+def _remote_components_args() -> list:
+    """`--remote-components` flags, only if the user has opted in.
+
+    YouTube sometimes gates a video behind a JavaScript challenge that yt-dlp
+    can only solve by downloading a solver component at request time and
+    running it under deno or node. That is remote code executed on the user's
+    machine as a side effect of pasting a link, so it is off unless
+    `ytdlp_remote_components` says otherwise, and even then it is only reached
+    for after a challenge failure — never on the first attempt.
+    """
+    value = (getattr(cfg, "ytdlp_remote_components", "") or "").strip()
+    return ["--remote-components", value] if value else []
+
+
+def _needs_challenge_solver(*outputs: str) -> bool:
+    """True when the failure looks like an unsolved JS challenge.
+
+    Deliberately narrow. yt-dlp prints its "components were skipped" line as a
+    WARNING on runs that go on to succeed, so the warning alone must not be
+    taken as the cause — the output has to show a challenge that actually
+    could not be solved.
+    """
+    blob = " ".join(o or "" for o in outputs).lower()
+    # None of these appear in the advisory "components were skipped" warning,
+    # which is why matching on them is enough to tell a real challenge failure
+    # from a run that merely mentioned one.
+    return any(k in blob for k in (
+        "failed to solve", "unable to solve", "could not solve",
+        "no challenge solver", "nsig extraction failed",
+        "unable to extract nsig",
+    ))
+
+
+def _ytdlp_error(stderr: str, stdout: str = "") -> str:
+    """The line that actually explains a failed run.
+
+    Not `stderr[:300]`. yt-dlp prints warnings first and its fatal ERROR line
+    last, so slicing the head of stderr reliably reports a warning as though
+    it were the cause. That is not hypothetical: a failed job was persisted
+    with "Remote components challenge solver script ... were skipped" as its
+    error — a warning, on a run whose real failure was cut off past character
+    300 — and it sent the diagnosis in entirely the wrong direction.
+    """
+    for line in reversed((stderr or "").splitlines()):
+        line = line.strip()
+        if line.startswith("ERROR:"):
+            return line[:300]
+    tail = (stderr or "").strip() or (stdout or "").strip()
+    return tail[-300:] if tail else "yt-dlp failed without writing an error"
+
+
 def _is_403(*outputs: str) -> bool:
     """True when yt-dlp output looks like an HTTP 403 from the extractor."""
     blob = " ".join(o or "" for o in outputs).lower()
@@ -81,6 +169,114 @@ def _is_403(*outputs: str) -> bool:
         "403" in blob
         and ("forbidden" in blob or "http error 403" in blob or "status code 403" in blob)
     ) or "http error 403" in blob
+
+
+# ── Do-it-yourself recipes ──────────────────────────────────────────────
+# When the server cannot fetch a video, the user still can — and then upload
+# it, which resumes the job from the extract stage with nothing recomputed.
+# What was missing was the instructions: the rescue panel offered bare yt-dlp
+# one-liners, which are no help at all to somebody who does not have yt-dlp.
+#
+# The format selector below is not a generic "best quality" — it asks for
+# H.264 video and AAC audio specifically, because that is what the assembler
+# can stream-copy. Anything else (VP9, AV1, Opus) still works but costs a full
+# re-encode at the end of the job.
+#
+# Only first-party sources are named. Every one of these is the project's own
+# site or a store listing for it; none is a mirror or an APK host.
+
+def _diy_format() -> str:
+    """The yt-dlp -f selector to hand a user, matching what the pipeline wants."""
+    try:
+        from app.config import cfg as _cfg
+        cap = int(getattr(_cfg, "output_max_height", 1080) or 0)
+    except Exception:
+        cap = 1080
+    h = f"[height<={cap}]" if cap else ""
+    return (f"bv*{h}[vcodec^=avc1]+ba[acodec^=mp4a]/"
+            f"bv*{h}[ext=mp4]+ba[ext=m4a]/b{h}[ext=mp4]/b{h}/b")
+
+
+def download_guides(url: str = "") -> list:
+    """Per-platform instructions for fetching a video by hand.
+
+    Returns a list of {platform, steps: [{label, command?, url?}], note}.
+    `url` is quoted into the commands when given so they can be pasted as-is.
+    """
+    q = shlex.quote(url) if url else "<VIDEO URL>"
+    fmt = _diy_format()
+    dl = f'yt-dlp -f "{fmt}" --merge-output-format mp4 {q}'
+
+    return [
+        {
+            "platform": "macOS",
+            "steps": [
+                {"label": "Install once (Homebrew)",
+                 "command": "brew install yt-dlp ffmpeg"},
+                {"label": "Download", "command": dl},
+            ],
+            "note": "ffmpeg is what merges the video and audio streams back "
+                    "together; without it you get one or the other.",
+        },
+        {
+            "platform": "Windows",
+            "steps": [
+                {"label": "Install once (PowerShell)",
+                 "command": "winget install yt-dlp.yt-dlp Gyan.FFmpeg"},
+                {"label": "Download", "command": dl},
+            ],
+            "note": "Open a new terminal after installing so the PATH change "
+                    "takes effect.",
+        },
+        {
+            "platform": "Linux",
+            "steps": [
+                {"label": "Install once",
+                 "command": "pipx install yt-dlp   # plus ffmpeg from your package manager"},
+                {"label": "Download", "command": dl},
+            ],
+            "note": "Distro packages of yt-dlp are often months old, and "
+                    "YouTube breaks old versions constantly. pipx tracks "
+                    "upstream.",
+        },
+        {
+            "platform": "Android",
+            "steps": [
+                {"label": "Seal — a yt-dlp app, no terminal needed",
+                 "url": "https://github.com/JunkFood02/Seal"},
+                {"label": "Or Termux, then yt-dlp inside it",
+                 "url": "https://f-droid.org/packages/com.termux/"},
+                {"label": "In Termux, install once",
+                 "command": "pkg install python ffmpeg && pip install yt-dlp"},
+                {"label": "Then download", "command": dl},
+            ],
+            "note": "Save to your phone, then send the file to this machine "
+                    "and drop it below. Install Termux from F-Droid rather "
+                    "than the Play Store — the Play Store build is frozen and "
+                    "its packages no longer install.",
+        },
+        {
+            "platform": "iPhone / iPad",
+            "steps": [
+                {"label": "There is no reliable yt-dlp on iOS",
+                 "url": "https://github.com/yt-dlp/yt-dlp/wiki/FAQ"},
+            ],
+            "note": "Use a computer for this one, or AirDrop the file over "
+                    "from someone who has.",
+        },
+        {
+            "platform": "Any — official install docs",
+            "steps": [
+                {"label": "yt-dlp installation guide",
+                 "url": "https://github.com/yt-dlp/yt-dlp#installation"},
+                {"label": "ffmpeg downloads",
+                 "url": "https://ffmpeg.org/download.html"},
+            ],
+            "note": "Whatever you download, drop the file into the box below "
+                    "and the job carries on from where it stopped — the "
+                    "transcript and translation are not redone.",
+        },
+    ]
 
 
 class DownloadFailed(RuntimeError):
@@ -393,6 +589,11 @@ def download_video(source: str, output_dir: str, info: dict | None = None) -> st
         "--socket-timeout", "30",
     ]
 
+    # "any" exists because a re-encode is cheap and no dub is not: when a
+    # selector has already missed twice, take whatever the site will give.
+    any_fmt = ["-f", "best", "--merge-output-format", "mp4"]
+    FORMATS = {"preferred": preferred_fmt, "simple": simple_fmt, "any": any_fmt}
+
     def _run(fmt, extra=()):
         cmd = base_cmd + common + fmt + list(extra) + cookie_args + [source]
         return subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
@@ -400,28 +601,51 @@ def download_video(source: str, output_dir: str, info: dict | None = None) -> st
     log.info(f"Downloading: {source}")
     result = _run(preferred_fmt)
 
-    # A 403 is an access problem, not a format problem, so retry the *preferred*
-    # format through the web_embedded player client before degrading quality.
-    # Dropping to `best[ext=mp4]` first would either fail the same way or hand
-    # back a worse rendition for a video we could have had at 1080p.
-    if result.returncode != 0 and _is_403(result.stderr, result.stdout):
-        log.warning(f"[download] 403 for {source} — retrying with "
-                    f"player_client=web_embedded")
-        result = _run(preferred_fmt, _PLAYER_CLIENT_FALLBACK)
+    # Everything after the first attempt is decided by pipeline/rescue.py
+    # rather than by a fixed ladder here. The ladder this replaced could only
+    # escalate: a transient 403 sent it to the web_embedded player client,
+    # that client could not solve YouTube's JS challenge, its format list
+    # collapsed to images, and the run died — on a video the default client
+    # downloaded at 1080p seconds later. A policy can wait, or go back.
+    tried = ["preferred"]
+    rescue_log: list = []
+    while result.returncode != 0:
+        shape = rescue.classify(result.stderr, result.stdout)
+        attempt = rescue.plan(shape, tried,
+                              remote_components=_remote_components_value())
+        if attempt is None and _advisor_enabled() and shape == rescue.UNKNOWN:
+            attempt = _ask_advisor(result.stderr, tried)
+        if attempt is None:
+            break
+
+        st = attempt.strategy
+        extra = list(st.args)
+        if st.key == "remote_components":
+            extra += _remote_components_args()
+        log.warning(
+            f"[download] {shape} — {attempt.reason}; trying '{st.key}' "
+            f"({st.why})" + (f" after {st.sleep:.0f}s" if st.sleep else ""))
+        if st.sleep:
+            time.sleep(st.sleep)
+        tried.append(st.key)
+        rescue_log.append({"shape": shape, "strategy": st.key,
+                           "reason": attempt.reason})
+        result = _run(FORMATS[st.fmt], extra)
 
     if result.returncode != 0:
-        log.warning(f"First attempt failed: {result.stderr[:200]}")
-        result = _run(simple_fmt)
-        # The simpler format can hit the same 403; give it the same escape.
-        if result.returncode != 0 and _is_403(result.stderr, result.stdout):
-            log.warning("[download] 403 on the fallback format too — "
-                        "retrying it with player_client=web_embedded")
-            result = _run(simple_fmt, _PLAYER_CLIENT_FALLBACK)
-        if result.returncode != 0:
-            raise DownloadFailed(
-                f"YouTube download failed: {result.stderr[:300]}",
-                hint=classify_download_failure(
-                    result.stderr, result.stdout, source))
+        shape = rescue.classify(result.stderr, result.stdout)
+        hint = classify_download_failure(result.stderr, result.stdout, source)
+        if isinstance(hint, dict):
+            # What was attempted, so a failed rescue can be read back rather
+            # than re-derived from the log.
+            hint["rescue"] = {"shape": shape, "attempts": rescue_log,
+                              "summary": rescue.describe(shape)}
+        raise DownloadFailed(
+            f"YouTube download failed: {_ytdlp_error(result.stderr, result.stdout)}",
+            hint=hint)
+    if rescue_log:
+        log.info(f"[download] recovered after {len(rescue_log)} rescue "
+                 f"attempt(s): {' → '.join(a['strategy'] for a in rescue_log)}")
 
     # yt-dlp sometimes adds extensions; find the actual file
     if not os.path.exists(output_path):

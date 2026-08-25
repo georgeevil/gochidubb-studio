@@ -177,7 +177,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from pipeline.downloader import download_video, probe_metadata, curate_metadata
+from pipeline.downloader import (download_video, probe_metadata,
+                                 curate_metadata, download_guides)
 from pipeline.audio import (
     extract_audio, extract_audio_hq, separate_background, get_duration,
     SeparationAborted,
@@ -2874,7 +2875,18 @@ async def _stage_tts(job, work, ctx, update, perf):
     t0 = time.time()
     if todo:
         if isinstance(tts_used, VoxCPMSynthesizer):
-            todo = tts_used.synthesize_segments(
+            # Off the event loop — see _blocking's docstring, which describes
+            # this exact failure and was written for the stages around it.
+            # This call was the one that never got moved, and it is the
+            # longest: while it ran, the server answered no HTTP at all.
+            # Measured mid-dub: /api/system did not respond in 90 seconds, so
+            # the UI, the CLI and the MCP server were all dead for the hours
+            # synthesis takes. The progress callback writes through
+            # save_job_sync, which opens its own connection per call, and it
+            # never passes `status`, so nothing on that path schedules a task
+            # or fires a webhook from the worker thread.
+            todo = await _blocking(
+                tts_used.synthesize_segments,
                 todo, tts_dir,
                 speaker_refs=speaker_refs,
                 speaker_transcripts=speaker_transcripts,
@@ -2985,11 +2997,19 @@ async def _stage_assemble(job, work, ctx, update, perf):
 async def _stage_merge(job, work, ctx, update, perf):
     update(step_detail="Rendering final video...")
     output_mp4 = str(work / "dubbed_video.mp4")
+    # bg_volume/bg_ducking are per-job when set and fall back to the global
+    # Output settings when not. This stage is a mux — seconds — so "the music
+    # is too quiet" is fixable by re-running just this one, instead of being
+    # a global preference that only takes effect on the next dub.
     await _blocking(
         merge_audio_video,
         ctx["video_path"], ctx["dubbed_wav"], output_mp4,
         ctx.get("bg_audio_path", "") if ctx.get("keep_bg") else "",
+        bg_volume=ctx.get("bg_volume"),
+        bg_ducking=ctx.get("bg_ducking"),
     )
+    perf["bg_volume"] = ctx.get("bg_volume")
+    perf["bg_ducking"] = ctx.get("bg_ducking")
     ctx["output_mp4"] = output_mp4
     try:
         perf["mp4_mb"] = round(os.path.getsize(output_mp4) / 1024 / 1024, 1)
@@ -5473,7 +5493,16 @@ async def start_quick_test(
                         dl_dir.rmdir()
                 except OSError:
                     pass
-                return None, {"error": f"Could not download URL: {e}"}, 400
+                # Carry the structured rescue hint through. DownloadFailed
+                # attaches "which yt-dlp command to run by hand" for exactly
+                # this case, and dropping it here is why a failed
+                # multi-language submit showed a bare message and an empty
+                # rescue panel while the single-dub path showed both.
+                payload = {"error": f"Could not download URL: {e}"}
+                hint = getattr(e, "hint", None)
+                if isinstance(hint, dict) and hint:
+                    payload["download_hint"] = hint
+                return None, payload, 400
         if not trim_seconds:
             return src, None, 0
         dst = src.parent / f"{src.stem}_qt{trim_seconds}s.mp4"
@@ -6314,7 +6343,11 @@ async def start_showcase(
             src_path = Path(await asyncio.to_thread(
                 download_video, url, str(dl_dir)))
         except Exception as e:
-            return JSONResponse({"error": f"Could not download URL: {e}"}, 400)
+            payload = {"error": f"Could not download URL: {e}"}
+            hint = getattr(e, "hint", None)
+            if isinstance(hint, dict) and hint:
+                payload["download_hint"] = hint
+            return JSONResponse(payload, 400)
 
     # Trim
     trimmed_path = src_path.parent / f"{src_path.stem}_sc{trim_seconds}s.mp4"
@@ -7319,7 +7352,10 @@ async def _run_tts_and_merge_stage(
             # since that's the common dubbing use-case)
             src_lang = state.get("effective_src") or state.get("source_lang", "en")
             tgt_lang = state.get("target_lang", "ru")
-            synth_input = tts_used.synthesize_segments(
+            # Off the event loop, as in _stage_tts — retry_tts, redub and
+            # per-segment regen all come through here.
+            synth_input = await _blocking(
+                tts_used.synthesize_segments,
                 synth_input, tts_dir,
                 speaker_refs=speaker_refs,
                 speaker_transcripts=speaker_transcripts,
@@ -7565,14 +7601,14 @@ _RETRY_OVERRIDE_KEYS = {
     "speaker_mode", "context_hint", "voice_style", "voice_preset",
     "tts_speed", "auto_denoise", "wizard_mode", "reference_audio",
     "skip_diarization", "translate_failed_only", "tts_keep_existing",
-    "voxcpm_cfg", "voxcpm_steps",
+    "voxcpm_cfg", "voxcpm_steps", "bg_volume", "bg_ducking",
 }
 
 # Retry overrides that are numbers handed straight to VoxCPM rather than
 # strings the pipeline interprets. Everything in _RETRY_OVERRIDE_KEYS is
 # otherwise taken as-is from the request body, which is fine for a model
 # name and is not for these.
-_RETRY_NUMERIC_KEYS = ("voxcpm_cfg", "voxcpm_steps")
+_RETRY_NUMERIC_KEYS = ("voxcpm_cfg", "voxcpm_steps", "bg_volume")
 
 # Declarative retry controls, rendered generically by the UI so a new
 # knob only has to be added here (plus honoured in the stage handler).
@@ -7629,7 +7665,15 @@ STAGE_RETRY_OPTIONS = {
          "hint": "More steps, better quality, slower. Blank = global setting"},
     ],
     "assemble": [],
-    "merge": [],
+    "merge": [
+        {"key": "bg_volume", "type": "number", "label": "Background level",
+         "min": 0.0, "max": 1.0, "step": 0.05,
+         "hint": "How loud the music and effects sit when nobody is speaking. "
+                 "Re-running this stage is a re-mux — seconds, not a re-dub."},
+        {"key": "bg_ducking", "type": "bool", "label": "Duck under speech",
+         "hint": "Pull the bed down while the dub talks. Off = a flat mix at "
+                 "the level above, which is louder but fights the voice."},
+    ],
     "download": [],
 }
 
@@ -8218,6 +8262,23 @@ async def retry_stage(
     }
 
 
+@app.get("/api/download_guides")
+async def get_download_guides(job_id: str = "", url: str = ""):
+    """Per-platform instructions for fetching a video by hand.
+
+    Served rather than embedded in every job's `download_hint`, which is
+    persisted to SQLite — the recipes are the same for every failure and
+    would be dead weight on each row. Pass `job_id` (or `url`) to get the
+    commands with that video's URL already quoted into them.
+    """
+    if not url and job_id and job_id in jobs:
+        j = jobs[job_id]
+        url = str(j.get("url") or j.get("source") or "")
+        if not url.startswith(("http://", "https://")):
+            url = ""
+    return {"url": url, "guides": download_guides(url)}
+
+
 @app.post("/api/job/{job_id}/attach_source")
 async def attach_source(job_id: str, video: UploadFile = File(...)):
     """Rescue a job whose download failed: accept a manually-downloaded
@@ -8672,6 +8733,59 @@ async def preview_voice_casting(job_id: str, request: _ScoutRequest):
 # ═══════════════════════════════════════════════════════════════════════
 #  Transcript export
 # ═══════════════════════════════════════════════════════════════════════
+
+@app.get("/api/dub/{job_id}/files")
+async def list_job_files(job_id: str):
+    """What this job produced that a person might want to keep.
+
+    The outputs/ directory is already served statically, so this is not a
+    download route — it answers "does this exist", which a UI otherwise has
+    to guess at. The background track in particular only exists when the run
+    separated one, and offering a download for a file that is not there is
+    worse than not offering it.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    work = OUTPUT_DIR / job_id
+    job = jobs[job_id]
+    wanted = [
+        ("video", "dubbed_video.mp4", "Dubbed video", "video/mp4"),
+        ("subtitles", "subtitles.srt", "Subtitles", "text/plain"),
+        ("dub_audio", "dubbed_audio.wav", "Dubbed audio only", "audio/wav"),
+        ("background", "background.wav", "Background music & effects", "audio/wav"),
+        ("vocals", "vocals.wav", "Isolated original speech", "audio/wav"),
+        ("source", "source_video.mp4", "Original video", "video/mp4"),
+    ]
+    out = []
+    for key, name, label, mime in wanted:
+        f = work / name
+        if not f.exists():
+            continue
+        try:
+            size = f.stat().st_size
+        except OSError:
+            continue
+        if size <= 0:
+            continue
+        out.append({
+            "key": key, "label": label, "filename": name, "mime": mime,
+            "size_mb": round(size / 1048576, 1),
+            # A subtitle file is kilobytes, and "0.0 MB" next to a download
+            # button reads as "there is nothing here".
+            "size_label": (f"{size / 1048576:.1f} MB" if size >= 1048576
+                           else f"{max(1, size // 1024)} KB"),
+            "url": f"/outputs/{job_id}/{name}",
+        })
+    return {
+        "job_id": job_id,
+        "target_lang": job.get("target_lang", ""),
+        "status": job.get("status", ""),
+        "files": out,
+        # So the UI can say why there is no background to download rather
+        # than silently omitting the row.
+        "kept_background": bool(job.get("keep_bg", True)),
+    }
+
 
 @app.get("/api/dub/{job_id}/transcripts.txt")
 async def download_transcripts_txt(job_id: str):
