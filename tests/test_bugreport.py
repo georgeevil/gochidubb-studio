@@ -1,4 +1,4 @@
-"""Tests for app/bugreport.py — signatures, report assembly, Linear sink.
+"""Tests for app/bugreport.py — signatures, assembly, and both sinks.
 
 The error signature is a *contract with the outside world*: it is embedded
 in Linear issue bodies as ``gcd-sig:<hash>`` and searched for on the next
@@ -17,8 +17,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app import logbuf  # noqa: E402
 from app.bugreport import (  # noqa: E402
-    SIG_PREFIX, LinearSink, build_bug_report, error_signature,
-    normalize_message, select_log_window,
+    SIG_PREFIX, SUPPORT_EMAIL, EmailSink, LinearSink, build_bug_report,
+    deliver_report, error_signature, get_email_sink, normalize_message,
+    render_report_text, report_title, select_log_window,
 )
 
 
@@ -168,6 +169,28 @@ class TestBuildBugReport:
         assert "private words" not in blob
         assert "_pending_args" not in blob
         assert "hf_abcdefghijkl" not in blob
+
+    def test_legacy_top_level_error_reaches_the_report(self):
+        """An interrupted job writes only job["error"]; it must still describe itself.
+
+        The signature was always computed from the resolved message, so a
+        report that showed "unknown error" was inconsistent with its own
+        dedupe key — and useless to whoever received it.
+        """
+        job = {"id": "j9", "status": "error", "failed_stage": "tts",
+               "error": "Interrupted by server restart"}
+        rep = build_bug_report(job, system={}, logs=[])
+        assert rep["last_error"]["message"] == "Interrupted by server restart"
+        assert rep["last_error"]["stage"] == "tts"
+        assert rep["signature"] == error_signature("tts", job["error"])
+        assert "unknown error" not in report_title(rep)
+
+    def test_structured_error_wins_over_the_legacy_field(self):
+        job = {"id": "j9", "status": "error", "error": "stale summary",
+               "last_error": {"stage": "translate", "message": "real cause"}}
+        rep = build_bug_report(job, system={}, logs=[])
+        assert rep["last_error"]["message"] == "real cause"
+        assert rep["last_error"]["stage"] == "translate"
 
     def test_no_error_means_empty_signature(self):
         rep = build_bug_report({"id": "j", "status": "complete"},
@@ -321,6 +344,236 @@ class TestLinearSink:
 
 
 # ═════════════════════════════════════════════════════════════════════
+# Email sink — the fallback for when the tracker will not take the write
+# ═════════════════════════════════════════════════════════════════════
+class _FakeSMTP:
+    """Records the conversation instead of holding one."""
+
+    def __init__(self, fail_on_send=None):
+        self.calls = []
+        self.sent = []
+        self._fail_on_send = fail_on_send
+
+    def starttls(self):
+        self.calls.append("starttls")
+
+    def login(self, user, password):
+        self.calls.append(("login", user, password))
+
+    def send_message(self, msg):
+        if self._fail_on_send is not None:
+            raise self._fail_on_send
+        self.calls.append("send_message")
+        self.sent.append(msg)
+
+    def quit(self):
+        self.calls.append("quit")
+
+
+def _email_sink(smtp, **kw):
+    kw.setdefault("username", "bot@gochidubb.com")
+    kw.setdefault("password", "hunter2")
+    kw.setdefault("sender", "bot@gochidubb.com")
+    return EmailSink("mail.example.com", smtp_factory=lambda: smtp, **kw)
+
+
+class TestEmailSinkMessage:
+    def test_subject_carries_signature_so_recurrences_thread(self):
+        rep = _report()
+        msg = _email_sink(_FakeSMTP()).build_message(rep)
+        assert msg["Subject"].startswith("[gochidubb] ")
+        assert f"{SIG_PREFIX}{rep['signature']}" in msg["Subject"]
+        # And again as a header, for a filter that should not parse subjects.
+        assert msg["X-GoChiDUBB-Signature"] == rep["signature"]
+
+    def test_addressed_to_support_by_default(self):
+        msg = _email_sink(_FakeSMTP()).build_message(_report())
+        assert msg["To"] == SUPPORT_EMAIL
+        assert msg["From"] == "bot@gochidubb.com"
+
+    def test_body_is_plain_text_with_the_same_facts(self):
+        rep = _report()
+        msg = _email_sink(_FakeSMTP()).build_message(rep, note="I clicked dub")
+        body = msg.get_body(preferencelist=("plain",)).get_content()
+        assert "I clicked dub" in body
+        assert rep["signature"] in body
+        assert "job-1" in body
+        # Markdown table pipes would be noise in a mail client.
+        assert "| --- |" not in body
+
+    def test_full_report_attached_as_json(self):
+        rep = _report()
+        msg = _email_sink(_FakeSMTP()).build_message(rep)
+        parts = list(msg.iter_attachments())
+        assert len(parts) == 1
+        assert parts[0].get_filename().endswith(".json")
+        payload = json.loads(parts[0].get_content())
+        assert payload["signature"] == rep["signature"]
+        assert payload["job"]["id"] == "job-1"
+
+    def test_text_renderer_survives_an_empty_report(self):
+        """A report is assembled from a failure; it must not need one itself."""
+        text = render_report_text({})
+        assert "unknown error" in text
+        assert SIG_PREFIX not in text          # no signature, no dedupe claim
+
+    def test_context_reaches_the_reader(self):
+        """Why the tracker refused it is the point of the fallback mail."""
+        msg = _email_sink(_FakeSMTP()).build_message(
+            _report(), context="Filed here because the tracker said HTTP 400")
+        body = msg.get_body(preferencelist=("plain",)).get_content()
+        assert "HTTP 400" in body
+
+
+class TestEmailSinkDelivery:
+    def test_sends_and_reports_the_recipient(self):
+        smtp = _FakeSMTP()
+        result = asyncio.run(_email_sink(smtp).deliver(_report()))
+        assert result["ok"] is True
+        assert result["action"] == "emailed"
+        assert result["recipient"] == SUPPORT_EMAIL
+        assert smtp.calls == ["starttls", ("login", "bot@gochidubb.com", "hunter2"),
+                              "send_message", "quit"]
+        assert len(smtp.sent) == 1
+
+    def test_ssl_mode_skips_starttls(self):
+        smtp = _FakeSMTP()
+        asyncio.run(_email_sink(smtp, security="ssl").deliver(_report()))
+        assert "starttls" not in smtp.calls
+
+    def test_anonymous_relay_never_logs_in(self):
+        smtp = _FakeSMTP()
+        asyncio.run(_email_sink(smtp, username="", password="",
+                                sender="gochidubb@localhost",
+                                security="none").deliver(_report()))
+        assert smtp.calls == ["send_message", "quit"]
+
+    def test_failure_never_raises_and_still_closes(self):
+        smtp = _FakeSMTP(fail_on_send=OSError("connection reset"))
+        result = asyncio.run(_email_sink(smtp).deliver(_report()))
+        assert result["ok"] is False
+        assert result["action"] == "failed"
+        assert "connection reset" in result["error"]
+        assert smtp.calls[-1] == "quit"      # the finally block ran
+
+    def test_password_never_survives_into_the_result(self):
+        """An SMTP server that echoes the password must not leak it onwards."""
+        smtp = _FakeSMTP(
+            fail_on_send=RuntimeError("535 auth rejected for hunter2"))
+        result = asyncio.run(_email_sink(smtp).deliver(_report()))
+        assert "hunter2" not in result["error"]
+        assert "***" in result["error"]
+
+    def test_send_does_not_run_on_the_event_loop(self):
+        """A hung SMTP host must not freeze every other request."""
+        import threading
+        seen = {}
+
+        class _ThreadSpy(_FakeSMTP):
+            def send_message(self, msg):
+                seen["thread"] = threading.current_thread().name
+                super().send_message(msg)
+
+        async def go():
+            seen["loop"] = threading.current_thread().name
+            await _email_sink(_ThreadSpy()).deliver(_report())
+
+        asyncio.run(go())
+        assert seen["thread"] != seen["loop"]
+
+
+class TestEmailSinkConfig:
+    def _secrets(self, monkeypatch, **values):
+        import app.secrets as secrets_mod
+        monkeypatch.setattr(secrets_mod, "get_secret",
+                            lambda k: values.get(k, ""))
+
+    def test_no_host_means_no_sink(self, monkeypatch):
+        self._secrets(monkeypatch)
+        assert get_email_sink() is None
+
+    def test_host_alone_is_enough(self, monkeypatch):
+        self._secrets(monkeypatch, smtp_host="localhost")
+        sink = get_email_sink()
+        assert sink is not None
+        assert sink._port == 587 and sink._security == "starttls"
+
+    def test_port_465_implies_implicit_tls(self, monkeypatch):
+        self._secrets(monkeypatch, smtp_host="mail.example.com", smtp_port="465")
+        assert get_email_sink()._security == "ssl"
+
+    def test_explicit_security_wins(self, monkeypatch):
+        self._secrets(monkeypatch, smtp_host="mail.example.com",
+                      smtp_port="465", smtp_security="none")
+        assert get_email_sink()._security == "none"
+
+    def test_recipient_is_support_unless_overridden(self, monkeypatch):
+        self._secrets(monkeypatch, smtp_host="h")
+        assert get_email_sink()._recipient == SUPPORT_EMAIL
+        self._secrets(monkeypatch, smtp_host="h", bugreport_email="me@example.com")
+        assert get_email_sink()._recipient == "me@example.com"
+
+
+# ═════════════════════════════════════════════════════════════════════
+# The sink chain
+# ═════════════════════════════════════════════════════════════════════
+class _ChainSink:
+    def __init__(self, name, ok, error=""):
+        self.name = name
+        self._ok = ok
+        self._error = error
+        self.calls = []
+
+    async def deliver(self, report, note="", *, context=""):
+        self.calls.append(context)
+        return {"ok": self._ok, "sink": self.name,
+                "action": "created" if self._ok else "failed",
+                "url": "", "issue": "", "error": self._error,
+                "signature": report.get("signature", "")}
+
+
+class TestDeliverReport:
+    def test_tracker_success_never_reaches_the_mailbox(self):
+        linear, mail = _ChainSink("linear", True), _ChainSink("email", True)
+        r = asyncio.run(deliver_report(_report(), sinks=[linear, mail]))
+        assert r["ok"] is True and r["sink"] == "linear"
+        assert r["fell_back"] is False
+        assert mail.calls == []          # not tried at all
+
+    def test_tracker_refusal_falls_through_with_its_reason(self):
+        linear = _ChainSink("linear", False, "RuntimeError: Linear API returned HTTP 400")
+        mail = _ChainSink("email", True)
+        r = asyncio.run(deliver_report(_report(), sinks=[linear, mail]))
+        assert r["ok"] is True and r["sink"] == "email"
+        assert r["fell_back"] is True
+        assert "HTTP 400" in mail.calls[0]
+        assert [(a["sink"], a["ok"]) for a in r["attempts"]] == [
+            ("linear", False), ("email", True)]
+
+    def test_a_200_with_a_graphql_error_falls_back_too(self):
+        """Linear reports some refusals as 200 + errors[], so status is no test."""
+        linear = _ChainSink("linear", False, "Linear GraphQL error: over quota")
+        mail = _ChainSink("email", True)
+        r = asyncio.run(deliver_report(_report(), sinks=[linear, mail]))
+        assert r["ok"] is True and r["sink"] == "email"
+
+    def test_everything_failing_keeps_every_reason(self):
+        a = _ChainSink("linear", False, "HTTP 400")
+        b = _ChainSink("email", False, "SMTPConnectError")
+        r = asyncio.run(deliver_report(_report(), sinks=[a, b]))
+        assert r["ok"] is False
+        assert r["fell_back"] is False
+        assert [x["error"] for x in r["attempts"]] == ["HTTP 400", "SMTPConnectError"]
+
+    def test_no_sinks_is_not_a_failure_to_deliver(self):
+        """'Nowhere to send it' and 'sending failed' need different answers."""
+        r = asyncio.run(deliver_report(_report(), sinks=[]))
+        assert r["ok"] is False
+        assert r["action"] == "unconfigured"
+        assert r["attempts"] == []
+
+
+# ═════════════════════════════════════════════════════════════════════
 # Routes (handlers awaited directly — no HTTP client, no server start)
 # ═════════════════════════════════════════════════════════════════════
 # server.py transitively imports the heavy optional ML stack. Stub the
@@ -353,12 +606,23 @@ class _StubSink:
         self.result = result
         self.calls = []
 
-    async def deliver(self, report, note=""):
-        self.calls.append((report, note))
+    async def deliver(self, report, note="", *, context=""):
+        self.calls.append((report, note, context))
         return dict(self.result, signature=report.get("signature", ""))
 
 
 class TestBugReportRoutes:
+    @pytest.fixture(autouse=True)
+    def _no_sinks(self, monkeypatch):
+        """Both sinks off unless a test says otherwise.
+
+        Without this the route would consult the developer's real
+        secrets.json — a machine with smtp_host set would take the fallback
+        and quietly pass a test that meant to exercise the tracker.
+        """
+        monkeypatch.setattr(bugreport_mod, "get_sink", lambda: None)
+        monkeypatch.setattr(bugreport_mod, "get_email_sink", lambda: None)
+
     def test_get_unknown_job_404(self, monkeypatch):
         monkeypatch.setattr(server, "jobs", {})
         resp = asyncio.run(server.get_bug_report("nope"))
@@ -378,18 +642,21 @@ class TestBugReportRoutes:
 
     def test_post_unconfigured_400(self, monkeypatch):
         monkeypatch.setattr(server, "jobs", {"j1": _fake_job()})
-        monkeypatch.setattr(bugreport_mod, "get_sink", lambda: None)
         resp = asyncio.run(server.send_bug_report("j1", _Req()))
         assert resp.status_code == 400
+        # Names both ways out, not just the tracker.
         assert b"linear_api_key" in resp.body
+        assert b"smtp_host" in resp.body
 
     def test_get_returns_report_and_config_flag(self, monkeypatch):
         monkeypatch.setattr(server, "jobs", {"j1": _fake_job()})
-        monkeypatch.setattr(bugreport_mod, "get_sink", lambda: None)
         d = asyncio.run(server.get_bug_report("j1"))
         assert d["report"]["job"]["id"] == "job-1"
         assert d["signature"] == d["report"]["signature"]
         assert d["linear_configured"] is False
+        assert d["email_configured"] is False
+        # The UI addresses its mailto link from this, so it is never blank.
+        assert d["support_email"]
 
     def test_post_success_delivers_and_echoes_result(self, monkeypatch):
         job = _fake_job()
@@ -402,8 +669,11 @@ class TestBugReportRoutes:
             "j1", _Req({"note": "was dubbing token=abcd1234secret"})))
         assert d == {"ok": True, "action": "created",
                      "url": "https://linear.app/i/GCD-9", "issue": "GCD-9",
-                     "signature": sink.calls[0][0]["signature"]}
-        report, note = sink.calls[0]
+                     "signature": sink.calls[0][0]["signature"],
+                     "recipient": "", "fell_back": False,
+                     "attempts": [{"sink": "stub", "ok": True,
+                                   "action": "created", "error": ""}]}
+        report, note, _ctx = sink.calls[0]
         assert report["job"]["id"] == "job-1"
         # The note is redacted before it reaches the sink.
         assert "abcd1234secret" not in note
@@ -426,3 +696,35 @@ class TestBugReportRoutes:
         d = asyncio.run(server.send_bug_report("j1", _Req()))   # body raises
         assert d["ok"] is True
         assert sink.calls[0][1] == ""
+
+    def test_post_falls_back_to_email_and_says_so(self, monkeypatch):
+        """The route must not report an emailed fallback as a filed issue."""
+        monkeypatch.setattr(server, "jobs", {"j1": _fake_job()})
+        linear = _StubSink({"ok": False, "sink": "linear", "action": "failed",
+                            "url": "", "issue": "",
+                            "error": "RuntimeError: Linear API returned HTTP 400"})
+        mail = _StubSink({"ok": True, "sink": "email", "action": "emailed",
+                          "url": "", "issue": "", "error": "",
+                          "recipient": SUPPORT_EMAIL})
+        monkeypatch.setattr(bugreport_mod, "get_sink", lambda: linear)
+        monkeypatch.setattr(bugreport_mod, "get_email_sink", lambda: mail)
+        d = asyncio.run(server.send_bug_report("j1", _Req({})))
+        assert d["ok"] is True
+        assert d["action"] == "emailed"
+        assert d["fell_back"] is True
+        assert d["recipient"] == SUPPORT_EMAIL
+        assert [a["sink"] for a in d["attempts"]] == ["linear", "email"]
+        # The mail carries why the tracker refused it.
+        assert "HTTP 400" in mail.calls[0][2]
+
+    def test_post_502_lists_every_attempt(self, monkeypatch):
+        monkeypatch.setattr(server, "jobs", {"j1": _fake_job()})
+        dead = _StubSink({"ok": False, "sink": "linear", "action": "failed",
+                          "url": "", "issue": "", "error": "HTTP 400"})
+        also_dead = _StubSink({"ok": False, "sink": "email", "action": "failed",
+                               "url": "", "issue": "", "error": "SMTPConnectError"})
+        monkeypatch.setattr(bugreport_mod, "get_sink", lambda: dead)
+        monkeypatch.setattr(bugreport_mod, "get_email_sink", lambda: also_dead)
+        resp = asyncio.run(server.send_bug_report("j1", _Req({})))
+        assert resp.status_code == 502
+        assert b"HTTP 400" in resp.body and b"SMTPConnectError" in resp.body

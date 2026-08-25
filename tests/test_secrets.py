@@ -27,9 +27,10 @@ def test_roundtrip(store, no_env):
     assert store.get("vk_access_token") == ""
     store.set("vk_access_token", "tok123")
     assert store.get("vk_access_token") == "tok123"
-    assert store.status() == {"vk_access_token": True, "vk_group_id": False,
-                              "linear_api_key": False, "linear_team_id": False,
-                              "linear_project_id": False}
+    status = store.status()
+    assert set(status) == set(KNOWN_SECRETS)
+    assert status["vk_access_token"] is True
+    assert not any(v for k, v in status.items() if k != "vk_access_token")
 
 
 def test_persists_across_instances(tmp_path, no_env):
@@ -115,10 +116,9 @@ def test_module_functions_delegate(tmp_path, no_env, monkeypatch):
     monkeypatch.setattr(secrets_mod, "_store", SecretsStore(tmp_path / "secrets.json"))
     secrets_mod.set_secret("vk_access_token", "tok")
     assert secrets_mod.get_secret("vk_access_token") == "tok"
-    assert secrets_mod.secret_status() == {
-        "vk_access_token": True, "vk_group_id": False,
-        "linear_api_key": False, "linear_team_id": False,
-        "linear_project_id": False,
-    }
+    status = secrets_mod.secret_status()
+    assert set(status) == set(KNOWN_SECRETS)
+    assert status["vk_access_token"] is True
+    assert not any(v for k, v in status.items() if k != "vk_access_token")
     with pytest.raises(KeyError):
         secrets_mod.set_secret("nope", "x")

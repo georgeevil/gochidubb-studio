@@ -36,6 +36,18 @@ KNOWN_SECRETS = {
     "linear_api_key": "LINEAR_API_KEY",
     "linear_team_id": "LINEAR_TEAM_ID",
     "linear_project_id": "LINEAR_PROJECT_ID",
+    # SMTP, for the bug-report fallback when the issue tracker refuses the
+    # write. smtp_password is the only true credential here; the rest live
+    # alongside it because a half-configured mailer is worse than none, and
+    # keeping the set together means one presence check covers it.
+    "smtp_host": "SMTP_HOST",
+    "smtp_port": "SMTP_PORT",
+    "smtp_security": "SMTP_SECURITY",
+    "smtp_username": "SMTP_USERNAME",
+    "smtp_password": "SMTP_PASSWORD",
+    "smtp_from": "SMTP_FROM",
+    # Overrides app.bugreport.SUPPORT_EMAIL for anyone self-hosting.
+    "bugreport_email": "BUGREPORT_EMAIL",
 }
 
 
