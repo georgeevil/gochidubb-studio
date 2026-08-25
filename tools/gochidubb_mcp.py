@@ -551,7 +551,7 @@ async def gochidubb_add_glossary_term(
     domain: str = "",
 ) -> dict:
     """Teach the glossary one term for one target language: a rendering
-    (`translation`), a pronunciation respelling (`say`, e.g. "GOH-chee" —
+    (`translation`), a pronunciation respelling (`say`, e.g. "goh-chee" —
     spoken by TTS but never shown in subtitles), or both. Applies to every
     later translation for that language, across jobs."""
     c = await _get_client()

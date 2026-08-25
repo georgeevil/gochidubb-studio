@@ -866,3 +866,28 @@ required.)
 4. **CLD-263** epic cites `ReviewView` as only-continue — correct, but note it
    already commits the voice cast before continuing (index.html:3948-3960);
    the workbench must keep that commit-before-continue ordering.
+
+---
+
+## Changelog (as built)
+
+### §6.2 pitch/pace investigation — NO-GO (2026-08-25)
+
+Measured on one real segment (job 995430d8 seg_0000, zh, whisper-base CER —
+coarse but comparative): pitch +2st delta +0.042, pitch −2st +0.084,
+pace 0.9× +0.084, pace 1.1× +0.084 vs the untouched wav. Three of four
+variants breach the < 0.05 go rule, and the asetrate mechanism audibly
+shifts formants against the clone. The design's pitch/pace sliders do not
+ship; wavs kept in the job tmp dir for a human to overrule. Revisit only if
+a rate-capable TTS engine lands (CLD-222's timbre scoring would make the
+measurement honest).
+
+### §8 respelling spike — hedge confirmed (2026-08-25)
+
+Measured (VoxCPM2 on mps, fixed seed, whisper-base roundtrip): lowercase
+sound-alike respellings are honored — "kube-control" spoke as "cube control"
+(CER 0.105 → 0.024), "sequel" for SQL worked — but ALL-CAPS hyphenated
+respellings are read out as letters ("GOH-chee" → "G-O-H-G"), a partially
+capitalized foreign respelling was half-honored, and the IPA probe came out
+as letter salad. Ship shape: the `say` field stays; the editor copy steers
+users to lowercase sound-alikes and states IPA is unsupported.

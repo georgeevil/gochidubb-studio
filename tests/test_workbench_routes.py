@@ -305,3 +305,25 @@ def test_voice_preview_refuses_mid_synthesis(client):
     server.jobs["j"] = _job("j", status="synthesizing")
     r = client.post("/api/dub/j/voice_preview", json={"text": "hola"})
     assert r.status_code == 409
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  GET /api/job/{id} enrichment (CLD-273)
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_get_job_cost_is_a_number_not_the_band_breakdown(client):
+    """marginal_cost returns a dict; the wire field is the one number every
+    client prints — the CLI's `${cost:.2f}` crashed on the dict once."""
+    server.jobs["j"] = _job("j", status="complete", duration=120.0,
+                            target_langs=["ru"])
+    d = client.get("/api/job/j").json()
+    assert isinstance(d["cost_so_far_usd"], float)
+    assert d["cost_so_far_usd"] > 0
+    assert isinstance(d["eta_seconds"], int)
+
+
+def test_get_job_eta_zero_when_parked_at_a_gate(client):
+    server.jobs["j"] = _job("j", status="awaiting_translation_review",
+                            duration=120.0, progress=62)
+    d = client.get("/api/job/j").json()
+    assert d["eta_seconds"] == 0

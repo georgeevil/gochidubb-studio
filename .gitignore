@@ -80,3 +80,5 @@ Thumbs.db
 .vscode/
 .idea/
 *.swp
+gochidubb.db-shm
+gochidubb.db-wal

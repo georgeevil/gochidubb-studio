@@ -10958,7 +10958,10 @@ async def get_job(job_id: str):
         since = time.time() - 30 * 86400
         others = [j for j in jobs.values() if j.get("id") != job_id]
         used = app_billing.summarize(others, since=since)["minutes"]
-        out["cost_so_far_usd"] = app_billing.marginal_cost(used, minutes)
+        # marginal_cost returns the full band breakdown; the wire field is
+        # the one number every client prints.
+        out["cost_so_far_usd"] = float(
+            app_billing.marginal_cost(used, minutes).get("cost") or 0.0)
     else:
         out["cost_so_far_usd"] = 0.0
 

@@ -242,8 +242,9 @@ async def cmd_status(c: GoChiDUBBClient, a) -> None:
         _print_json(j)
     else:
         _print_job(j)
-        if j.get("cost_so_far_usd"):
-            print(f"     cost: ${j['cost_so_far_usd']:.2f} so far (estimate)")
+        cost = j.get("cost_so_far_usd")
+        if isinstance(cost, (int, float)) and cost:
+            print(f"     cost: ${cost:.2f} so far (estimate)")
         if j.get("eta_seconds"):
             print(f"      eta: ~{int(j['eta_seconds']) // 60}m"
                   f"{int(j['eta_seconds']) % 60:02d}s")
@@ -799,7 +800,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("term")
     s.add_argument("--lang", required=True, help="Target language code")
     s.add_argument("--translation", help="How to render the term")
-    s.add_argument("--say", help='How to pronounce it, e.g. "GOH-chee"')
+    s.add_argument("--say", help='How to pronounce it, e.g. "goh-chee"')
     s.add_argument("--domain", help="Glossary domain (default: creator-review)")
     s.set_defaults(handler=cmd_glossary_term)
 
