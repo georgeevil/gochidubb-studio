@@ -4156,6 +4156,20 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
   const [selected, setSelected] = useState(() => new Set());
   const [anchor, setAnchor] = useState(null);   // index of the last plain click
   const [confirming, setConfirming] = useState(false);
+  // The confirmation lives in the shared selection toolbar at the top of the
+  // list — one delete path rather than two that can disagree. But a row's
+  // Delete button can be clicked from anywhere in a 95-job list, and the
+  // answer appeared off-screen above with nothing to say so: the click looked
+  // like it had done nothing. The bar is sticky now, and this brings it into
+  // view for the case where it is not yet stuck.
+  const confirmRef = useRef(null);
+  useEffect(() => {
+    if (confirming && confirmRef.current) {
+      try {
+        confirmRef.current.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      } catch (_) { confirmRef.current.scrollIntoView(); }
+    }
+  }, [confirming]);
   const [busy, setBusy] = useState(false);
   const [note, setNote] = useState('');
 
@@ -4253,8 +4267,20 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
       {/* Selection toolbar. Always present so "Select all" is discoverable
           without first hunting for a checkbox. */}
       {visible.length > 0 && (
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10,
-                      flexWrap: 'wrap', fontSize: 12 }}>
+        <div ref={confirmRef} style={{
+          display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10,
+          flexWrap: 'wrap', fontSize: 12,
+          // Sticky so a confirmation raised from a row 40 items down is on
+          // screen rather than somewhere above it. Opaque, and bled out over
+          // the scroll container's padding, so rows pass underneath it
+          // instead of through it.
+          position: 'sticky', top: 0, zIndex: 5,
+          background: 'var(--bg)',
+          padding: confirming ? '8px 10px' : '6px 10px',
+          margin: '0 -10px 10px',
+          borderRadius: 'var(--r-md)',
+          border: '1px solid ' + (confirming ? 'oklch(0.7 0.2 25 / 0.35)' : 'transparent'),
+        }}>
           <label style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer',
                           color: 'var(--ink-2)' }}>
             <input type="checkbox" checked={allSelected} onChange={selectAll}
@@ -4274,7 +4300,14 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
               ) : (
                 <>
                   <span style={{ color: 'var(--err)' }}>
-                    Delete {selected.size} job{selected.size === 1 ? '' : 's'} and their files? This cannot be undone.
+                    {selected.size === 1
+                      ? `Delete “${(() => {
+                          const one = visible.find(v => selected.has(v.id));
+                          const name = (one && (one.title || one.source_label || one.id)) || 'this job';
+                          return name.length > 60 ? name.slice(0, 60) + '…' : name;
+                        })()}” and its files?`
+                      : `Delete ${selected.size} jobs and their files?`}
+                    {' '}This cannot be undone.
                   </span>
                   <button className="btn" onClick={doDelete} disabled={busy}
                           style={{ background: 'oklch(0.7 0.2 25 / 0.15)', color: 'var(--err)',
