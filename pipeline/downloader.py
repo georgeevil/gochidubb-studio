@@ -6,8 +6,10 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
 
 from app.config import cfg
+from pipeline import rescue
 
 log = logging.getLogger("gochidubb.downloader")
 
@@ -72,6 +74,41 @@ def _cookie_args() -> list:
 # does, and it costs nothing to retry with because we only reach for it after a
 # 403 has already been seen.
 _PLAYER_CLIENT_FALLBACK = ["--extractor-args", "youtube:player_client=web_embedded"]
+
+
+def _remote_components_value() -> str:
+    return (getattr(cfg, "ytdlp_remote_components", "") or "").strip()
+
+
+def _advisor_enabled() -> bool:
+    """Whether the local LLM may be asked what to try next.
+
+    Off by default and consulted only for failures the rules do not recognise
+    — see pipeline/rescue.advise. The rules cover everything this install has
+    actually hit; the model is for the tail.
+    """
+    return bool(getattr(cfg, "download_rescue_llm", False))
+
+
+def _ask_advisor(stderr: str, tried: list):
+    """Bridge the async advisor into this synchronous function.
+
+    download_video already runs in a worker thread (server._blocking), so
+    there is no loop on this thread to reuse and asyncio.run is safe here.
+    Any failure means "no suggestion", never a crash: a download must not
+    fail because a language model was busy.
+    """
+    import asyncio
+    try:
+        model = (getattr(cfg, "translation_model", "") or "").strip()
+        if not model:
+            return None
+        return asyncio.run(rescue.advise(
+            stderr, tried, model,
+            remote_components=_remote_components_value()))
+    except Exception as e:
+        log.info(f"[rescue] advisor skipped: {type(e).__name__}: {e}")
+        return None
 
 
 def _remote_components_args() -> list:
@@ -444,6 +481,11 @@ def download_video(source: str, output_dir: str, info: dict | None = None) -> st
         "--socket-timeout", "30",
     ]
 
+    # "any" exists because a re-encode is cheap and no dub is not: when a
+    # selector has already missed twice, take whatever the site will give.
+    any_fmt = ["-f", "best", "--merge-output-format", "mp4"]
+    FORMATS = {"preferred": preferred_fmt, "simple": simple_fmt, "any": any_fmt}
+
     def _run(fmt, extra=()):
         cmd = base_cmd + common + fmt + list(extra) + cookie_args + [source]
         return subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
@@ -451,50 +493,51 @@ def download_video(source: str, output_dir: str, info: dict | None = None) -> st
     log.info(f"Downloading: {source}")
     result = _run(preferred_fmt)
 
-    # A 403 is an access problem, not a format problem, so retry the *preferred*
-    # format through the web_embedded player client before degrading quality.
-    # Dropping to `best[ext=mp4]` first would either fail the same way or hand
-    # back a worse rendition for a video we could have had at 1080p.
-    if result.returncode != 0 and _is_403(result.stderr, result.stdout):
-        log.warning(f"[download] 403 for {source} — retrying with "
-                    f"player_client=web_embedded")
-        result = _run(preferred_fmt, _PLAYER_CLIENT_FALLBACK)
+    # Everything after the first attempt is decided by pipeline/rescue.py
+    # rather than by a fixed ladder here. The ladder this replaced could only
+    # escalate: a transient 403 sent it to the web_embedded player client,
+    # that client could not solve YouTube's JS challenge, its format list
+    # collapsed to images, and the run died — on a video the default client
+    # downloaded at 1080p seconds later. A policy can wait, or go back.
+    tried = ["preferred"]
+    rescue_log: list = []
+    while result.returncode != 0:
+        shape = rescue.classify(result.stderr, result.stdout)
+        attempt = rescue.plan(shape, tried,
+                              remote_components=_remote_components_value())
+        if attempt is None and _advisor_enabled() and shape == rescue.UNKNOWN:
+            attempt = _ask_advisor(result.stderr, tried)
+        if attempt is None:
+            break
+
+        st = attempt.strategy
+        extra = list(st.args)
+        if st.key == "remote_components":
+            extra += _remote_components_args()
+        log.warning(
+            f"[download] {shape} — {attempt.reason}; trying '{st.key}' "
+            f"({st.why})" + (f" after {st.sleep:.0f}s" if st.sleep else ""))
+        if st.sleep:
+            time.sleep(st.sleep)
+        tried.append(st.key)
+        rescue_log.append({"shape": shape, "strategy": st.key,
+                           "reason": attempt.reason})
+        result = _run(FORMATS[st.fmt], extra)
 
     if result.returncode != 0:
-        log.warning(f"First attempt failed: {_ytdlp_error(result.stderr)}")
-        result = _run(simple_fmt)
-        # The simpler format can hit the same 403; give it the same escape.
-        if result.returncode != 0 and _is_403(result.stderr, result.stdout):
-            log.warning("[download] 403 on the fallback format too — "
-                        "retrying it with player_client=web_embedded")
-            result = _run(simple_fmt, _PLAYER_CLIENT_FALLBACK)
-
-        # Last resort, and only with consent: a JS challenge yt-dlp could not
-        # solve on its own. Solving it means downloading a component from
-        # GitHub or npm and executing it, so this runs only when the user has
-        # set ytdlp_remote_components — and only here, after everything that
-        # needs no remote code has already failed.
-        if result.returncode != 0 and _needs_challenge_solver(
-                result.stderr, result.stdout):
-            rc_args = _remote_components_args()
-            if rc_args:
-                log.warning(f"[download] JS challenge unsolved — retrying with "
-                            f"{' '.join(rc_args)} (opt-in)")
-                result = _run(preferred_fmt, rc_args)
-                if result.returncode != 0:
-                    result = _run(simple_fmt, rc_args)
-            else:
-                log.warning(
-                    "[download] JS challenge unsolved and remote components "
-                    "are off. Settings -> ytdlp_remote_components = "
-                    "'ejs:github' lets yt-dlp fetch a solver, which means "
-                    "running code downloaded at request time.")
-
-        if result.returncode != 0:
-            raise DownloadFailed(
-                f"YouTube download failed: {_ytdlp_error(result.stderr, result.stdout)}",
-                hint=classify_download_failure(
-                    result.stderr, result.stdout, source))
+        shape = rescue.classify(result.stderr, result.stdout)
+        hint = classify_download_failure(result.stderr, result.stdout, source)
+        if isinstance(hint, dict):
+            # What was attempted, so a failed rescue can be read back rather
+            # than re-derived from the log.
+            hint["rescue"] = {"shape": shape, "attempts": rescue_log,
+                              "summary": rescue.describe(shape)}
+        raise DownloadFailed(
+            f"YouTube download failed: {_ytdlp_error(result.stderr, result.stdout)}",
+            hint=hint)
+    if rescue_log:
+        log.info(f"[download] recovered after {len(rescue_log)} rescue "
+                 f"attempt(s): {' → '.join(a['strategy'] for a in rescue_log)}")
 
     # yt-dlp sometimes adds extensions; find the actual file
     if not os.path.exists(output_path):

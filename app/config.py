@@ -72,6 +72,7 @@ FIELD_SPECS: dict = {
     # a solver component from the network. An enum rather than free text so a
     # typo cannot turn into an arbitrary --remote-components argument.
     "ytdlp_remote_components": (str, ("", "ejs:github", "ejs:npm")),
+    "download_rescue_llm":     (bool,),
 }
 
 _TRUTHY = ("1", "true", "yes", "on")
@@ -236,6 +237,13 @@ class UserConfig:
     # only ever used as a last-resort retry after a challenge failure — see
     # pipeline/downloader.py. Empty = never fetch it.
     ytdlp_remote_components: str = ""      # "" | "ejs:github" | "ejs:npm"
+    # Let the local translation model suggest what to try next when a download
+    # fails in a way pipeline/rescue.py has no rule for. It picks a key out of
+    # a fixed strategy table and can never write a flag or a command, so the
+    # worst case is a wasted attempt. Off by default: the rules cover every
+    # failure seen so far, and a model round trip competes with translation
+    # and TTS for the same GPU.
+    download_rescue_llm: bool = False
     max_source_duration_sec: int = 0       # 0 = no pre-download duration gate
 
     # ── Estimates ─────────────────────────────────────────────────────
@@ -379,6 +387,7 @@ def _load_config() -> UserConfig:
         "YT_DLP_COOKIES_FROM_BROWSER": "ytdlp_cookies_from_browser",
         "YT_DLP_COOKIEFILE": "ytdlp_cookiefile",
         "YT_DLP_REMOTE_COMPONENTS": "ytdlp_remote_components",
+        "GOCHIDUBB_DOWNLOAD_RESCUE_LLM": "download_rescue_llm",
         "MAX_SOURCE_DURATION_SEC": "max_source_duration_sec",
         "PUBLISH_DESCRIPTION_TEMPLATE": "publish_description_template",
     }
