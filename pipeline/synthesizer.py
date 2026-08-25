@@ -16,6 +16,7 @@ import tempfile
 import time
 import traceback
 import types
+import uuid
 from typing import Optional
 
 log = logging.getLogger("gochidubb.synthesizer")
@@ -615,7 +616,14 @@ class VoxCPMSynthesizer(BaseTTSEngine):
         except Exception:
             qa_same_language = False
 
+        # Identifies this job's events in a pipe shared by every job the
+        # daemon has ever run. Echoed back on every event the worker emits,
+        # so a leftover tail from an earlier job is recognisable instead of
+        # being read as this one's output.
+        job_token = uuid.uuid4().hex
+
         job = {
+            "job_token": job_token,
             "model_id": self.model_id,
             "cfg_value": base_cfg,
             "inference_timesteps": base_timesteps,
@@ -655,6 +663,7 @@ class VoxCPMSynthesizer(BaseTTSEngine):
         total = len(segments)
         done = 0
         results = {}
+        stale = 0
         qa_unmeasured_warned = False
 
         # Force UTF-8 and disable noisy output in the child
@@ -740,6 +749,21 @@ class VoxCPMSynthesizer(BaseTTSEngine):
                     evt = json.loads(line)
                 except Exception:
                     continue
+                # Whose events are these? A daemon worker serves job after
+                # job down one pipe, and a parent that stopped reading early
+                # (a job_error, a read exception, a cancelled stage) leaves
+                # its tail behind for the next call to mistake for its own.
+                # That is not hypothetical: a run whose eight segments all
+                # synthesized cleanly, tier 2, QA 0.00-0.07, was reported as
+                # "All 8 TTS segments failed" — the parent had consumed a
+                # stale job_done and stopped before its own segments arrived,
+                # and the next run then read those eight as its own (its
+                # progress counter ran to 16/8, which is what gave it away).
+                tok = evt.get("token")
+                if tok and job_token and tok != job_token:
+                    stale += 1
+                    continue
+
                 kind = evt.get("event")
                 if kind == "loading":
                     log.info(f"TTS worker: loading {evt.get('model')}")
@@ -817,6 +841,7 @@ class VoxCPMSynthesizer(BaseTTSEngine):
                     )
                     # Keep for the server's perf metrics (see last_run_stats)
                     self._last_run_stats = {
+                        "ok": evt.get("ok"),
                         "tier_stats": evt.get("tier_stats"),
                         "qa_regens": evt.get("qa_regens", 0),
                         "qa_measured_count": evt.get("qa_measured_count", 0),
@@ -835,6 +860,28 @@ class VoxCPMSynthesizer(BaseTTSEngine):
                     break
         except Exception as e:
             log.error(f"Error reading TTS worker stdout: {e}")
+
+        reported_ok = (self._last_run_stats or {}).get("ok")
+        if not results and reported_ok:
+            # The worker says it rendered segments and we have none of them.
+            # That is a pipe problem, not a model problem, and the caller's
+            # fallback message ("check model/GPU") sends whoever reads it to
+            # go and look at the GPU.
+            self._last_segment_error = (
+                f"the worker reported {reported_ok} rendered segment(s) but "
+                f"none reached this process — the event stream desynchronized"
+            )
+            log.error(f"[tts] {self._last_segment_error}")
+
+        if stale:
+            # Loud on purpose. Recovering is the right behaviour, but a pipe
+            # that needed recovering means something upstream stopped reading
+            # mid-job, and that is worth finding rather than absorbing.
+            log.warning(
+                f"[tts] Discarded {stale} event(s) left in the worker pipe by "
+                f"an earlier job — this run read only its own. Something "
+                f"stopped reading a previous job before it finished."
+            )
 
         # NOTE: deliberately NOT closing stderr/stdout or waiting on proc —
         # the worker stays alive for the next job. See unload() for cleanup.
