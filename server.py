@@ -10922,9 +10922,42 @@ async def delete_glossary():
 
 @app.get("/api/job/{job_id}")
 async def get_job(job_id: str):
+    """One job, enriched with cost-so-far and a wall-clock ETA (CLD-273).
+
+    The design's MCP page promises `get_status` returns "cost so far, ETA".
+    Both numbers ride the ROUTE rather than new tools, so the CLI, the MCP
+    server and the UI all read the same arithmetic: cost is this job's
+    billed minutes priced as a meter delta (same marginal math as
+    /api/estimate), ETA scales the measured realtime factor by the progress
+    still ahead. Gates state (`review_gates`, `pending_gate`,
+    `gates_cleared`) is already on the job dict itself.
+    """
     if job_id not in jobs:
         return JSONResponse({"error": "Not found"}, 404)
-    return jobs[job_id]
+    job = jobs[job_id]
+    out = dict(job)
+
+    minutes = app_billing.job_minutes(job)
+    if minutes > 0:
+        since = time.time() - 30 * 86400
+        others = [j for j in jobs.values() if j.get("id") != job_id]
+        used = app_billing.summarize(others, since=since)["minutes"]
+        out["cost_so_far_usd"] = app_billing.marginal_cost(used, minutes)
+    else:
+        out["cost_so_far_usd"] = 0.0
+
+    eta = 0
+    if (job.get("status") or "") in _BUSY_STATUSES:
+        duration = _finite_seconds(job.get("duration"))
+        langs = job.get("target_langs")
+        n = len(langs) if isinstance(langs, (list, tuple)) and langs else 1
+        measured = app_estimate.realtime_factor(jobs.values())
+        factor = (measured if measured is not None
+                  else float(cfg.eta_realtime_factor))
+        remaining = max(0.0, 1.0 - float(job.get("progress") or 0) / 100.0)
+        eta = int(app_estimate.eta_seconds(duration, n, factor) * remaining)
+    out["eta_seconds"] = eta
+    return out
 
 
 @app.post("/api/dub/{job_id}/cancel")
