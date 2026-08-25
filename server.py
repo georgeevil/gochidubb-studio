@@ -820,15 +820,19 @@ async def _job_queue_worker():
             #   1. Auto lip-sync (Wav2Lip) if the job opted in.
             #   2. Showcase stitch if this was the last sibling in a showcase batch.
             # Both are best-effort — failures log but don't fail the job.
+            # "Returned cleanly" now includes "paused at a review gate" —
+            # the success hooks only make sense once the job actually
+            # finished (a gated sibling reaches them via the continue path).
+            done = job_id in jobs and jobs[job_id].get("status") == "complete"
             try:
-                if job_id in jobs and jobs[job_id].get("lip_sync"):
+                if done and jobs[job_id].get("lip_sync"):
                     log.info(f"[queue] post-hook: running auto lip-sync on {job_id}")
                     await asyncio.get_event_loop().run_in_executor(
                         None, _run_wav2lip_sync, job_id)
             except Exception as e:
                 log.warning(f"[lipsync] auto hook failed: {e}", exc_info=True)
             try:
-                if job_id in jobs and jobs[job_id].get("batch_kind") == "showcase":
+                if done and jobs[job_id].get("batch_kind") == "showcase":
                     await _maybe_assemble_showcase(jobs[job_id].get("batch_id", ""))
             except Exception as e:
                 log.warning(f"[showcase] post-process hook failed: {e}", exc_info=True)
@@ -9979,6 +9983,18 @@ async def _continue_from_checkpoint(
     )
     try:
         await run_pipeline_stages(job_id, ctx, start_stage=next_stage)
+        # A continued job finishes HERE, not in the queue worker, so the
+        # worker's post-success hooks never see it. The showcase stitch is
+        # the one that matters: a gated sibling that was approved last must
+        # still trigger the reel. (Subtitle/final-QC gates are forced off
+        # for showcase batches, but the translation and voice gates are not.)
+        if (job.get("status") == "complete"
+                and job.get("batch_kind") == "showcase"):
+            try:
+                await _maybe_assemble_showcase(job.get("batch_id", ""))
+            except Exception as e:
+                log.warning(f"[showcase] post-continue hook failed: {e}",
+                            exc_info=True)
     except JobCancelled:
         log.info(f"[continue] Job {job_id} cancelled")
         job.update(status="cancelled"); job.pop("cancel_requested", None)
