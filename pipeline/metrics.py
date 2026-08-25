@@ -43,6 +43,10 @@ except Exception:  # pragma: no cover - psutil is in requirements but optional
 
 _CPU_COUNT = (psutil.cpu_count(logical=True) if psutil else os.cpu_count()) or 1
 
+# Shortest gap between two CPU readings that yields a meaningful rate. Under
+# this, cpu_percent(None) is dividing by a wall-clock delta close to zero.
+_MIN_CPU_WINDOW = 0.05
+
 METRICS_FILENAME = "metrics.json"
 
 
@@ -202,17 +206,32 @@ class ResourceSampler:
         self._gpu_util: list[float] = []
         self._gpu_mem: list[float] = []
         self._gpu_total_mb: Optional[float] = None
+        # Set properly in start(); a sampler that is never started still has
+        # a number here rather than an attribute error.
+        self._last_cpu_at = 0.0
 
     def _sample_once(self) -> None:
         if _PROC is not None:
             try:
-                # cpu_percent(None) is relative to the previous call, which is
-                # exactly one sampling interval ago — that's the window we want.
-                # Divide by core count so 100% means "all cores saturated"
-                # instead of psutil's per-core-sum convention (800% on 8 cores).
-                self._cpu_proc.append(_PROC.cpu_percent(None) / _CPU_COUNT)
+                # RSS is a reading, not a rate — always valid, however soon
+                # after the last one it is taken.
                 self._rss_mb.append(_PROC.memory_info().rss / 1024 / 1024)
-                self._cpu_sys.append(psutil.cpu_percent(None))
+
+                # CPU is a rate: cpu_percent(None) divides the CPU-time delta
+                # by the wall-clock delta since the previous call. start()
+                # primes the counters and _run() samples immediately after, so
+                # that delta can be microseconds and the quotient enormous —
+                # CI measured a 988% "peak" on a normalized scale whose
+                # ceiling is 100. Below a window this short the number is an
+                # artefact of thread-start latency, not a measurement, so it
+                # is skipped rather than recorded and averaged in.
+                now = time.monotonic()
+                if now - self._last_cpu_at >= _MIN_CPU_WINDOW:
+                    self._last_cpu_at = now
+                    # Divide by core count so 100% means "all cores saturated"
+                    # instead of psutil's per-core-sum convention (800% on 8).
+                    self._cpu_proc.append(_PROC.cpu_percent(None) / _CPU_COUNT)
+                    self._cpu_sys.append(psutil.cpu_percent(None))
             except Exception:
                 pass
         g = _gpu.read()
@@ -242,6 +261,7 @@ class ResourceSampler:
                 psutil.cpu_percent(None)
         except Exception:
             pass
+        self._last_cpu_at = time.monotonic()
         self._thread = threading.Thread(
             target=self._run, name="gochidubb-perf-sampler", daemon=True,
         )
@@ -261,7 +281,13 @@ class ResourceSampler:
             out[f"{prefix}_avg"] = round(sum(vals) / len(vals), 1)
             out[f"{prefix}_peak"] = round(max(vals), 1)
 
-        out: Dict[str, Any] = {"samples": len(self._cpu_proc) or len(self._gpu_util)}
+        # Counted from RSS: it is recorded on every pass, while CPU is
+        # skipped when the window since the last reading is too short to
+        # divide by. A stage that sampled once still reports one sample.
+        out: Dict[str, Any] = {
+            "samples": (len(self._rss_mb) or len(self._cpu_proc)
+                        or len(self._gpu_util)),
+        }
         stats(self._cpu_proc, "cpu_proc_pct", out)
         stats(self._cpu_sys, "cpu_sys_pct", out)
         stats(self._rss_mb, "rss_mb", out)

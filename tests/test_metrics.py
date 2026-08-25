@@ -37,6 +37,54 @@ class TestResourceSampler:
         if "cpu_proc_pct_peak" in summary:
             assert summary["cpu_proc_pct_peak"] <= 100.5
 
+    def test_a_reading_taken_too_soon_is_skipped_rather_than_recorded(self):
+        """The CI failure this guards, made deterministic.
+
+        cpu_percent(None) divides the CPU-time delta by the wall-clock delta
+        since the previous call. start() primes the counters and the sampler
+        thread reads them immediately after, so on a fast runner that divisor
+        is microseconds and the quotient is enormous — CI produced a 988%
+        "peak" on a normalized scale whose ceiling is 100, and it was being
+        averaged into metrics.json.
+
+        Driven by the clock rather than by racing a thread: the bug only
+        appears when thread-start latency happens to be short, which is
+        exactly why it passed on a laptop and failed on a runner.
+        """
+        s = ResourceSampler(interval=5.0)
+
+        s._last_cpu_at = time.monotonic()          # as if just read
+        s._sample_once()
+        assert s._cpu_proc == [], (
+            "recorded a CPU rate measured over a window of ~0 seconds")
+        assert len(s._rss_mb) == 1, (
+            "skipping the CPU rate cost the memory reading taken with it — "
+            "RSS is a reading, not a rate, and is valid at any interval")
+
+        s._last_cpu_at = time.monotonic() - 1.0    # a real window
+        s._sample_once()
+        assert len(s._cpu_proc) == 1
+        assert len(s._rss_mb) == 2
+
+    def test_a_stage_with_no_cpu_reading_still_reports_being_sampled(self):
+        """`samples` counts sampling passes. Deriving it from the CPU list
+        would make a stage too short to time a CPU rate look unsampled."""
+        s = ResourceSampler(interval=5.0)
+        s._last_cpu_at = time.monotonic()
+        s._sample_once()
+        summary = s.summary()
+        assert summary["samples"] == 1
+        assert "cpu_proc_pct_avg" not in summary
+        assert summary["rss_mb_peak"] > 0
+
+    def test_a_started_sampler_never_reports_an_impossible_percentage(self):
+        summary = ResourceSampler(interval=5.0).start().stop()
+        assert summary["samples"] >= 1
+        if "cpu_proc_pct_peak" in summary:
+            assert summary["cpu_proc_pct_peak"] <= 100.5, (
+                f"reported {summary['cpu_proc_pct_peak']}% on a normalized "
+                f"scale that tops out at 100")
+
     def test_stop_is_idempotent(self):
         s = ResourceSampler(interval=0.25).start()
         first = s.stop()
