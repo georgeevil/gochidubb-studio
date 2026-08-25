@@ -2583,13 +2583,25 @@ async def _stage_tts(job, work, ctx, update, perf):
     )
 
     # Apply Voice Design prefix ONLY in voice_design mode (VoxCPM-only:
-    # edge-tts would literally read the style description out loud)
+    # edge-tts would literally read the style description out loud).
+    #
+    # It goes on `tts_text`, NOT `translated_text`. The prefix is an
+    # instruction to the model, not part of the dialogue, and
+    # `translated_text` is what the rest of the system treats as the line:
+    # the assemble stage rewrites subtitles.srt from it, the translation
+    # editor shows it, and the partial-retry reuse check compares it. Writing
+    # the prefix there put "(middle-aged male voice, warm and calm, clear
+    # articulation)" at the head of all 1602 subtitle lines of a real dub,
+    # and made every reuse comparison mismatch (prefixed checkpoint text vs
+    # clean translation text), so a partial TTS retry re-synthesized
+    # everything. `tts_text` is absent from _serialize_segments' whitelist,
+    # so it never reaches a checkpoint.
     if mode == "voice_design" and isinstance(tts_used, VoxCPMSynthesizer):
         style = eff_style.strip().strip("()")
         for s in segments:
             base = s.get("translated_text") or s.get("text", "")
             if base and not base.startswith("("):
-                s["translated_text"] = f"({style}){base}"
+                s["tts_text"] = f"({style}){base}"
 
     # Keep already-rendered segments when this is a partial retry
     if ctx.get("tts_keep_existing"):
@@ -6995,7 +7007,12 @@ async def _run_tts_and_merge_stage(
         for s in segments:
             base = s.get("translated_text") or s.get("text", "")
             if base and not base.startswith("("):
-                s["translated_text"] = f"({style}){base}"
+                # `tts_text`, not `translated_text` — see the note on the
+                # same block in _stage_tts. The prefix is a model
+                # instruction; the SRT, the translation editor and the
+                # assembler's emotion-tag heuristic all read
+                # `translated_text` and must not see it.
+                s["tts_text"] = f"({style}){base}"
 
     # Preserve-mode: skip TTS for segments that already have valid audio
     if preserve_existing_audio_paths:

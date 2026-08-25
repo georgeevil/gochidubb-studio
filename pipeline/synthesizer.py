@@ -538,7 +538,12 @@ class VoxCPMSynthesizer(BaseTTSEngine):
                 break
 
         for i, seg in enumerate(segments):
-            text = seg.get("translated_text", seg["text"])
+            # `tts_text` carries synth-only decoration (the Voice Design
+            # "(style)" prefix). Only this engine understands it — an engine
+            # that reads it aloud must keep using `translated_text`.
+            text = (seg.get("tts_text")
+                    or seg.get("translated_text")
+                    or seg["text"])
             speaker = seg.get("speaker", "SPEAKER_00")
             out_file = os.path.join(output_dir, f"seg_{i:04d}.wav")
             # Try exact match first, then fall back to any available ref
