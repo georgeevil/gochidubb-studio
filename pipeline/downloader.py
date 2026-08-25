@@ -171,6 +171,114 @@ def _is_403(*outputs: str) -> bool:
     ) or "http error 403" in blob
 
 
+# ── Do-it-yourself recipes ──────────────────────────────────────────────
+# When the server cannot fetch a video, the user still can — and then upload
+# it, which resumes the job from the extract stage with nothing recomputed.
+# What was missing was the instructions: the rescue panel offered bare yt-dlp
+# one-liners, which are no help at all to somebody who does not have yt-dlp.
+#
+# The format selector below is not a generic "best quality" — it asks for
+# H.264 video and AAC audio specifically, because that is what the assembler
+# can stream-copy. Anything else (VP9, AV1, Opus) still works but costs a full
+# re-encode at the end of the job.
+#
+# Only first-party sources are named. Every one of these is the project's own
+# site or a store listing for it; none is a mirror or an APK host.
+
+def _diy_format() -> str:
+    """The yt-dlp -f selector to hand a user, matching what the pipeline wants."""
+    try:
+        from app.config import cfg as _cfg
+        cap = int(getattr(_cfg, "output_max_height", 1080) or 0)
+    except Exception:
+        cap = 1080
+    h = f"[height<={cap}]" if cap else ""
+    return (f"bv*{h}[vcodec^=avc1]+ba[acodec^=mp4a]/"
+            f"bv*{h}[ext=mp4]+ba[ext=m4a]/b{h}[ext=mp4]/b{h}/b")
+
+
+def download_guides(url: str = "") -> list:
+    """Per-platform instructions for fetching a video by hand.
+
+    Returns a list of {platform, steps: [{label, command?, url?}], note}.
+    `url` is quoted into the commands when given so they can be pasted as-is.
+    """
+    q = shlex.quote(url) if url else "<VIDEO URL>"
+    fmt = _diy_format()
+    dl = f'yt-dlp -f "{fmt}" --merge-output-format mp4 {q}'
+
+    return [
+        {
+            "platform": "macOS",
+            "steps": [
+                {"label": "Install once (Homebrew)",
+                 "command": "brew install yt-dlp ffmpeg"},
+                {"label": "Download", "command": dl},
+            ],
+            "note": "ffmpeg is what merges the video and audio streams back "
+                    "together; without it you get one or the other.",
+        },
+        {
+            "platform": "Windows",
+            "steps": [
+                {"label": "Install once (PowerShell)",
+                 "command": "winget install yt-dlp.yt-dlp Gyan.FFmpeg"},
+                {"label": "Download", "command": dl},
+            ],
+            "note": "Open a new terminal after installing so the PATH change "
+                    "takes effect.",
+        },
+        {
+            "platform": "Linux",
+            "steps": [
+                {"label": "Install once",
+                 "command": "pipx install yt-dlp   # plus ffmpeg from your package manager"},
+                {"label": "Download", "command": dl},
+            ],
+            "note": "Distro packages of yt-dlp are often months old, and "
+                    "YouTube breaks old versions constantly. pipx tracks "
+                    "upstream.",
+        },
+        {
+            "platform": "Android",
+            "steps": [
+                {"label": "Seal — a yt-dlp app, no terminal needed",
+                 "url": "https://github.com/JunkFood02/Seal"},
+                {"label": "Or Termux, then yt-dlp inside it",
+                 "url": "https://f-droid.org/packages/com.termux/"},
+                {"label": "In Termux, install once",
+                 "command": "pkg install python ffmpeg && pip install yt-dlp"},
+                {"label": "Then download", "command": dl},
+            ],
+            "note": "Save to your phone, then send the file to this machine "
+                    "and drop it below. Install Termux from F-Droid rather "
+                    "than the Play Store — the Play Store build is frozen and "
+                    "its packages no longer install.",
+        },
+        {
+            "platform": "iPhone / iPad",
+            "steps": [
+                {"label": "There is no reliable yt-dlp on iOS",
+                 "url": "https://github.com/yt-dlp/yt-dlp/wiki/FAQ"},
+            ],
+            "note": "Use a computer for this one, or AirDrop the file over "
+                    "from someone who has.",
+        },
+        {
+            "platform": "Any — official install docs",
+            "steps": [
+                {"label": "yt-dlp installation guide",
+                 "url": "https://github.com/yt-dlp/yt-dlp#installation"},
+                {"label": "ffmpeg downloads",
+                 "url": "https://ffmpeg.org/download.html"},
+            ],
+            "note": "Whatever you download, drop the file into the box below "
+                    "and the job carries on from where it stopped — the "
+                    "transcript and translation are not redone.",
+        },
+    ]
+
+
 class DownloadFailed(RuntimeError):
     """A download attempt failed, with a structured rescue hint attached.
 

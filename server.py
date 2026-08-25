@@ -177,7 +177,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse, Response
 from fastapi.staticfiles import StaticFiles
 
-from pipeline.downloader import download_video, probe_metadata, curate_metadata
+from pipeline.downloader import (download_video, probe_metadata,
+                                 curate_metadata, download_guides)
 from pipeline.audio import (
     extract_audio, extract_audio_hq, separate_background, get_duration,
     SeparationAborted,
@@ -8243,6 +8244,23 @@ async def retry_stage(
         "ok": True, "job_id": job_id,
         "retry_from": stage, "stop_after": stop_after or None,
     }
+
+
+@app.get("/api/download_guides")
+async def get_download_guides(job_id: str = "", url: str = ""):
+    """Per-platform instructions for fetching a video by hand.
+
+    Served rather than embedded in every job's `download_hint`, which is
+    persisted to SQLite — the recipes are the same for every failure and
+    would be dead weight on each row. Pass `job_id` (or `url`) to get the
+    commands with that video's URL already quoted into them.
+    """
+    if not url and job_id and job_id in jobs:
+        j = jobs[job_id]
+        url = str(j.get("url") or j.get("source") or "")
+        if not url.startswith(("http://", "https://")):
+            url = ""
+    return {"url": url, "guides": download_guides(url)}
 
 
 @app.post("/api/job/{job_id}/attach_source")

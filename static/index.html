@@ -3281,6 +3281,80 @@ function _openLogFocus(focus) {
   window.dispatchEvent(new CustomEvent('gcd:open-logs'));
 }
 
+// ── Do-it-yourself download instructions ──
+// The rescue panel used to offer bare yt-dlp one-liners, which are no help to
+// anybody who does not already have yt-dlp — and the people hitting this are
+// by definition not having a good day with downloads. Served from
+// /api/download_guides with the failing URL already quoted in, so every
+// command is paste-ready.
+function guessPlatform() {
+  const s = (navigator.userAgentData?.platform || navigator.platform ||
+             navigator.userAgent || '').toLowerCase();
+  if (s.includes('android')) return 'Android';
+  if (/iphone|ipad|ipod/.test(s)) return 'iPhone / iPad';
+  if (s.includes('win')) return 'Windows';
+  if (s.includes('mac')) return 'macOS';
+  if (s.includes('linux')) return 'Linux';
+  return 'macOS';
+}
+
+function DownloadGuides({ jobId }) {
+  const [data, setData] = useState(null);
+  const [pick, setPick] = useState(guessPlatform);
+  const [err, setErr] = useState('');
+
+  useEffect(() => {
+    fetch(`/api/download_guides?job_id=${encodeURIComponent(jobId)}`)
+      .then(r => r.json())
+      .then(d => d.error ? setErr(d.error) : setData(d))
+      .catch(e => setErr(String(e.message || e)));
+  }, [jobId]);
+
+  if (err) return <div style={{ fontSize: 11.5, color: 'var(--ink-3)' }}>{err}</div>;
+  if (!data) return <div style={{ fontSize: 11.5, color: 'var(--ink-3)' }}>Loading instructions…</div>;
+
+  const guides = data.guides || [];
+  const cur = guides.find(g => g.platform === pick) || guides[0];
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+      <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+        {guides.map(g => (
+          <button key={g.platform} className={'tab' + (g.platform === pick ? ' active' : '')}
+                  onClick={() => setPick(g.platform)}
+                  style={{ fontSize: 11, padding: '3px 9px' }}>
+            {g.platform}
+          </button>
+        ))}
+      </div>
+      {(cur?.steps || []).map((st, i) => (
+        <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div className="caps">{st.label}</div>
+            <div style={{ flex: 1 }}/>
+            {st.command && <CopyButton text={st.command}/>}
+          </div>
+          {st.command && (
+            <pre className="mono wrap-any" style={{ margin: 0, fontSize: 10.5, lineHeight: 1.5,
+                        whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+                        background: 'var(--bg-1)', border: '1px solid var(--line)',
+                        borderRadius: 5, padding: '6px 8px' }}>{st.command}</pre>
+          )}
+          {st.url && (
+            <a href={st.url} target="_blank" rel="noopener noreferrer"
+               className="mono wrap-any" style={{ fontSize: 10.5, color: 'var(--accent)' }}>
+              {st.url}
+            </a>
+          )}
+        </div>
+      ))}
+      {cur?.note && (
+        <div style={{ fontSize: 11, color: 'var(--ink-3)', lineHeight: 1.6 }}>{cur.note}</div>
+      )}
+    </div>
+  );
+}
+
 // ── Download rescue panel ──
 // Rendered inside JobErrorPanel when the download stage failed and the
 // server attached a `download_hint`: shows why yt-dlp failed, the exact
@@ -3291,6 +3365,7 @@ function DownloadRescuePanel({ job }) {
   const [uploading, setUploading] = useState(false);
   const [err, setErr] = useState('');
   const [drag, setDrag] = useState(false);
+  const [showHow, setShowHow] = useState(false);
   const inputRef = useRef(null);
   if (!hint) return null;
 
@@ -3340,6 +3415,14 @@ function DownloadRescuePanel({ job }) {
                       borderRadius: 5, padding: '6px 8px' }}>{cmd.command}</pre>
         </div>
       ))}
+      <div style={{ paddingTop: 4 }}>
+        <button className="btn btn-ghost" onClick={() => setShowHow(v => !v)}
+                style={{ fontSize: 11, padding: '3px 8px' }}>
+          {showHow ? 'Hide' : 'Download it yourself'}
+        </button>
+      </div>
+      {showHow && <DownloadGuides jobId={job.id}/>}
+
       <div
         className={'dropzone' + (drag ? ' dragging' : '')}
         onClick={() => !uploading && inputRef.current?.click()}
