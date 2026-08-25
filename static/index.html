@@ -675,7 +675,6 @@ function NoticeCard({ n }) {
 function LeftRail({ view, setView, runningJob, awaitingReviewCount, system,
                     publishPendingCount = 0,
                     narrow = false, open = false, onClose }) {
-  const mode = system?.mode || 'local';
   // Jobs consolidates History/Processing/Review/Batch, and the publish inbox
   // lives there too — it is a filter over the History list, not a screen of
   // its own. The badge therefore prefers whatever is blocking a human:
@@ -696,16 +695,16 @@ function LeftRail({ view, setView, runningJob, awaitingReviewCount, system,
       { id: 'library',  label: 'Library',    hint: 'Results · voices · glossary',
         ic: I.result },
     ]},
+    // Members folded into API keys (roles reference block) and Audit into the
+    // Agent feed (a tab), so the hosted-only Workspace group is gone and
+    // Billing rides with the rest of the developer surface. The group returns
+    // with real members (CLD-247).
     { label: 'Develop', items: [
       { id: 'apikeys',  label: 'API keys',   hint: 'Scoped access',    ic: I.key },
       { id: 'mcp',      label: 'MCP server', hint: 'Agent onboarding', ic: I.plug },
       { id: 'webhooks', label: 'Webhooks',   hint: 'Job events out',   ic: I.hook },
-    ]},
-    ...(mode === 'hosted' ? [{ label: 'Workspace', items: [
-      { id: 'members',  label: 'Members',    hint: 'Roles · invites',  ic: I.people },
       { id: 'billing',  label: 'Billing & usage', hint: 'Metered estimate', ic: I.card },
-      { id: 'audit',    label: 'Audit log',  hint: 'Key · job actions', ic: I.ledger },
-    ]}] : []),
+    ]},
   ];
 
   const vramTotal = system?.gpu?.vram_gb;
@@ -886,8 +885,7 @@ function TopBar({ view, runningJob, awaitingReviewCount, notices, mode = 'local'
   const TITLES = {
     feed: 'Agent feed', home: 'New dub', jobs: 'Jobs', library: 'Library',
     discover: 'Discover', apikeys: 'API keys', mcp: 'MCP server',
-    webhooks: 'Webhooks', members: 'Members', billing: 'Billing & usage',
-    audit: 'Audit log', system: 'Settings',
+    webhooks: 'Webhooks', billing: 'Billing & usage', system: 'Settings',
   };
   // ⌘K / Ctrl-K focuses the command field from anywhere in the app.
   const cmdRef = useRef(null);
@@ -3188,6 +3186,9 @@ function AgentFeedView({ jobs, system, narrow, onOpenJob, onSwitchToHome }) {
   const [filter, setFilter] = useState('all');
   const [events, setEvents] = useState([]);
   const [loaded, setLoaded] = useState(false);
+  // 'activity' | 'audit' — the audit log lives here as a tab (it used to be
+  // its own rail destination). Same screen, deliberately separate stores.
+  const [feedTab, setFeedTab] = useState('activity');
 
   // Same cadence logic as the jobs poll: brisk while something is running,
   // relaxed when the box is idle.
@@ -3226,13 +3227,29 @@ function AgentFeedView({ jobs, system, narrow, onOpenJob, onSwitchToHome }) {
                       gap: 14 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 10,
                         flexWrap: 'wrap' }}>
-            <div className="serif" style={{ fontSize: 15 }}>Agent activity</div>
-            <div style={{ marginLeft: 'auto' }}>
-              <FeedFilter value={filter} onChange={setFilter}/>
+            <div className="serif" style={{ fontSize: 15 }}>
+              {feedTab === 'audit' ? 'Audit log' : 'Agent activity'}
             </div>
+            <div style={{ display: 'flex', gap: 4 }}>
+              {[['activity', 'Activity'], ['audit', 'Audit log']].map(([id, label]) => (
+                <button key={id} onClick={() => setFeedTab(id)} className="mono" style={{
+                  fontSize: 10, padding: '4px 10px', borderRadius: 999,
+                  color: feedTab === id ? 'var(--ink)' : 'var(--ink-3)',
+                  background: feedTab === id ? 'var(--bg-2)' : 'transparent',
+                  border: '1px solid ' + (feedTab === id ? 'var(--line-2)' : 'transparent'),
+                }}>{label}</button>
+              ))}
+            </div>
+            {feedTab === 'activity' && (
+              <div style={{ marginLeft: 'auto' }}>
+                <FeedFilter value={filter} onChange={setFilter}/>
+              </div>
+            )}
           </div>
 
-          {!loaded ? (
+          {feedTab === 'audit' ? (
+            <AuditPanel/>
+          ) : !loaded ? (
             <div className="mono" style={{ fontSize: 11, color: 'var(--ink-3)' }}>
               Loading activity…
             </div>
@@ -3916,37 +3933,877 @@ function VoiceCastingPanel({ jobId, onCastChange }) {
 // ═══════════════════════════════════════════════════════════════════
 // REVIEW VIEW — the human gate in front of synthesis
 // ═══════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
+// REVIEW WORKBENCH — stage-level review & edit (design 4a, CLD-263/265)
+// One tabbed surface over the paused job: Translation · Pronunciation &
+// speakers · Sync fit · Subtitles · Final QC, with the gates and casting
+// in a right rail. Every tab renders server-shaped documents (/flags,
+// /subtitles, /sync_plan, /qc) — no client re-derivation, which is also
+// what keeps this file and creator.html from duplicating logic.
+// ═══════════════════════════════════════════════════════════════════
+
+// Tiny fetch-a-document hook. Refetches when the URL changes; `reload`
+// after any POST that invalidates the document.
+function useWbDoc(url) {
+  const [doc, setDoc] = useState(null);
+  const [err, setErr] = useState('');
+  const [loading, setLoading] = useState(!!url);
+  const reload = useCallback(async () => {
+    if (!url) { setDoc(null); return; }
+    setLoading(true); setErr('');
+    try {
+      const r = await fetch(url, { cache: 'no-store' });
+      const d = await r.json();
+      if (d.error) { setErr(d.error); setDoc(null); }
+      else setDoc(d);
+    } catch (e) { setErr(String(e.message || e)); setDoc(null); }
+    setLoading(false);
+  }, [url]);
+  useEffect(() => { setDoc(null); reload(); }, [reload]);
+  return { doc, err, loading, reload };
+}
+
+async function wbPost(url, body) {
+  // body: FormData | plain object (JSON). Returns parsed JSON; throws on
+  // {error} so callers funnel every failure into one catch.
+  const opts = { method: 'POST' };
+  if (body instanceof FormData) opts.body = body;
+  else if (body !== undefined) {
+    opts.headers = { 'Content-Type': 'application/json' };
+    opts.body = JSON.stringify(body);
+  } else opts.body = new FormData();
+  const r = await fetch(url, opts);
+  const d = await r.json();
+  if (d.error) throw new Error(d.error);
+  return d;
+}
+
+function wbForm(fields) {
+  const fd = new FormData();
+  Object.entries(fields).forEach(([k, v]) => fd.append(k, v));
+  return fd;
+}
+
+// One shared player so two ▶ buttons never talk over each other.
+const _wbAudio = { el: null };
+function wbPlay(url) {
+  if (_wbAudio.el) { _wbAudio.el.pause(); }
+  _wbAudio.el = new Audio(url);
+  _wbAudio.el.play().catch(() => {});
+}
+
+const WB_GATE_ORDER = ['transcript', 'translation', 'voice_cast', 'subtitles', 'final_qc'];
+const WB_GATE_LABEL = {
+  transcript: 'Transcript', translation: 'Translation',
+  voice_cast: 'Voice cast', subtitles: 'Subtitles', final_qc: 'Final mix QC',
+};
+const WB_TAB_FOR_STATUS = {
+  awaiting_transcript_review: 'translation',
+  awaiting_translation_review: 'translation',
+  awaiting_voice_review: 'translation',   // casting lives in the rail
+  awaiting_subtitle_review: 'subtitles',
+  awaiting_final_qc: 'qc',
+};
+
+function GatesRail({ job }) {
+  const gates = job.review_gates || {};
+  const cleared = job.gates_cleared || [];
+  const pending = job.pending_gate;
+  return (
+    <div style={{ border: '1px solid var(--line)', borderRadius: 10, padding: '12px 14px' }}>
+      <div className="caps" style={{ marginBottom: 8 }}>Review gates · this job</div>
+      {WB_GATE_ORDER.map(g => {
+        const mode = gates[g] || 'off';
+        const isPending = pending === g;
+        const isCleared = cleared.includes(g);
+        return (
+          <div key={g} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '4px 0', fontSize: 12 }}>
+            <span style={{ color: isPending ? 'var(--warn)' : 'var(--ink-2)' }}>{WB_GATE_LABEL[g]}</span>
+            <span className="mono" style={{ fontSize: 10, color: isCleared ? 'var(--accent)' : mode === 'off' ? 'var(--ink-4)' : isPending ? 'var(--warn)' : 'var(--ink-2)' }}>
+              {isCleared ? 'cleared ✓' : isPending ? mode + ' · now' : mode.replace('_', ' ')}
+            </span>
+          </div>
+        );
+      })}
+      <div style={{ fontSize: 10.5, color: 'var(--ink-4)', marginTop: 8, lineHeight: 1.5 }}>
+        Each armed gate pauses the job and fires <span className="mono">job.awaiting_review</span>. Defaults live in Settings.
+      </div>
+    </div>
+  );
+}
+
+function GlossaryQuickAdd({ lang, onSaved }) {
+  const [term, setTerm] = useState('');
+  const [dst, setDst] = useState('');
+  const [say, setSay] = useState('');
+  const [msg, setMsg] = useState('');
+  const save = async () => {
+    setMsg('');
+    try {
+      await wbPost('/api/glossary/term', wbForm({
+        term, translation: dst, say, target_lang: lang || '' }));
+      setMsg('Saved — applies to every later translation.');
+      setTerm(''); setDst(''); setSay('');
+      if (onSaved) onSaved();
+    } catch (e) { setMsg(String(e.message || e)); }
+  };
+  return (
+    <div style={{ border: '1px solid var(--line)', borderRadius: 10, padding: '12px 14px' }}>
+      <div className="caps" style={{ marginBottom: 8 }}>Glossary · {lang || 'all'}</div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+        <input className="field" placeholder="term (e.g. GoChi)" value={term} onChange={e => setTerm(e.target.value)}/>
+        <input className="field" placeholder="render as… (optional)" value={dst} onChange={e => setDst(e.target.value)}/>
+        <input className="field" placeholder='say it like… (e.g. "GOH-chee")' value={say} onChange={e => setSay(e.target.value)}/>
+        <button className="btn btn-ghost" onClick={save} disabled={!term || (!dst && !say)}>＋ Add term</button>
+        {msg && <div style={{ fontSize: 11, color: 'var(--ink-3)' }}>{msg}</div>}
+      </div>
+    </div>
+  );
+}
+
+// "What would this cost?" line, fed by /estimate_edits so the number is the
+// same marginal arithmetic the meter uses.
+function WbEstimateNote({ jobId, edits }) {
+  const [est, setEst] = useState(null);
+  useEffect(() => {
+    let dead = false;
+    if (!edits || !edits.length) { setEst(null); return; }
+    wbPost(`/api/dub/${jobId}/estimate_edits`, { edits })
+      .then(d => { if (!dead) setEst(d); })
+      .catch(() => { if (!dead) setEst(null); });
+    return () => { dead = true; };
+  }, [jobId, JSON.stringify(edits)]);
+  if (!est) return null;
+  return (
+    <span className="mono" style={{ fontSize: 10.5, color: est.free ? 'var(--accent)' : 'var(--ink-2)' }}>
+      {est.free ? (est.free_reason || 'free') :
+        `re-synth ${est.resynth_minutes} min · est. $${(est.est_cost_usd || 0).toFixed(2)}`}
+    </span>
+  );
+}
+
+// ── Translation tab ────────────────────────────────────────────────
+function WbTranslationTab({ job, onEdited }) {
+  const flagsDoc = useWbDoc(`/api/dub/${job.id}/flags`);
+  const subsDoc = useWbDoc(`/api/dub/${job.id}/subtitles`);
+  const [filter, setFilter] = useState('flagged');
+  const [editing, setEditing] = useState(null);   // idx
+  const [draft, setDraft] = useState('');
+  const [editedIdxs, setEditedIdxs] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const flags = (flagsDoc.doc && flagsDoc.doc.flags) || [];
+  const cues = (subsDoc.doc && subsDoc.doc.cues) || [];
+  const flagByIdx = {};
+  flags.forEach(f => { flagByIdx[f.idx] = f; });
+
+  const save = async (idx) => {
+    setBusy(true); setErr('');
+    try {
+      await wbPost(`/api/dub/${job.id}/edit_translations`,
+                   wbForm({ edits: JSON.stringify({ [String(idx)]: draft }) }));
+      setEditedIdxs(list => list.includes(idx) ? list : [...list, idx]);
+      setEditing(null);
+      await Promise.all([flagsDoc.reload(), subsDoc.reload()]);
+      if (onEdited) onEdited();
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  const teach = async (f) => {
+    setErr('');
+    try {
+      await wbPost('/api/glossary/term', wbForm({
+        term: f.source_span || '', translation: f.target_span || '',
+        target_lang: job.target_lang || '' }));
+      await flagsDoc.reload();
+    } catch (e) { setErr(String(e.message || e)); }
+  };
+
+  const shown = filter === 'flagged'
+    ? cues.filter(c => flagByIdx[c.idx] !== undefined)
+    : filter === 'edited'
+      ? cues.filter(c => editedIdxs.includes(c.idx))
+      : cues;
+
+  const audioUrl = flagsDoc.doc && flagsDoc.doc.audio_url;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>Segments</span>
+        <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>
+          {cues.length} segments · {flags.length} flagged
+        </span>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+          {['flagged', 'all', 'edited'].map(f => (
+            <button key={f} className="btn btn-ghost" onClick={() => setFilter(f)}
+                    style={{ padding: '3px 10px', fontSize: 11,
+                             background: filter === f ? 'var(--bg-2)' : 'transparent',
+                             border: '1px solid ' + (filter === f ? 'var(--line-2)' : 'transparent') }}>
+              {f[0].toUpperCase() + f.slice(1)}
+            </button>
+          ))}
+        </div>
+      </div>
+      {(flagsDoc.err || subsDoc.err) && (
+        <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{flagsDoc.err || subsDoc.err}</div>
+      )}
+      {err && <div style={{ fontSize: 12, color: 'var(--err)' }}>{err}</div>}
+      {!shown.length && !subsDoc.loading && (
+        <div style={{ fontSize: 12, color: 'var(--ink-3)', padding: '18px 0' }}>
+          {filter === 'flagged' ? 'Nothing flagged — the translation looks consistent. Switch to All to browse every line.'
+            : filter === 'edited' ? 'No edits yet this session.' : 'No segments in the checkpoint yet.'}
+        </div>
+      )}
+      {shown.map(c => {
+        const f = flagByIdx[c.idx];
+        return (
+          <div key={c.idx} style={{ border: '1px solid ' + (f ? 'var(--warn)' : 'var(--line)'), borderRadius: 10, padding: '11px 13px', display: 'flex', flexDirection: 'column', gap: 7 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 10.5 }} className="mono">
+              <span style={{ color: 'var(--accent)' }}>#{c.idx}</span>
+              <span style={{ color: 'var(--ink-4)' }}>{c.start.toFixed(1)}s – {c.end.toFixed(1)}s</span>
+              {c.speaker && <span style={{ color: 'var(--ink-3)' }}>{(job.speaker_labels || {})[c.speaker] || c.speaker}</span>}
+              {f && (
+                <span style={{ color: 'var(--warn)', border: '1px solid var(--warn)', borderRadius: 4, padding: '0 6px' }}>
+                  {f.reason || 'flag'}
+                </span>
+              )}
+              {audioUrl && (
+                <button className="btn btn-ghost" style={{ marginLeft: 'auto', padding: '1px 8px', fontSize: 10 }}
+                        onClick={() => wbPlay(`${audioUrl}#t=${c.start},${c.end}`)}>▶ source</button>
+              )}
+            </div>
+            {f && f.source_span && (
+              <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>
+                src: “…{f.source_span}…” {f.detail ? <span style={{ color: 'var(--ink-4)' }}> — {f.detail}</span> : null}
+              </div>
+            )}
+            {editing === c.idx ? (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                <textarea className="field" rows={2} value={draft}
+                          onChange={e => setDraft(e.target.value)} style={{ resize: 'vertical' }}/>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <button className="btn btn-primary" disabled={busy || !draft.trim()}
+                          onClick={() => save(c.idx)} style={{ padding: '5px 12px', fontSize: 11 }}>
+                    {busy ? 'Saving…' : 'Save line'}
+                  </button>
+                  <button className="btn btn-ghost" onClick={() => setEditing(null)} style={{ fontSize: 11 }}>Cancel</button>
+                  <WbEstimateNote jobId={job.id} edits={[{ kind: 'segment_text', idxs: [c.idx] }]}/>
+                </div>
+              </div>
+            ) : (
+              <div className="wrap-any" style={{ fontSize: 13, cursor: 'text' }}
+                   onClick={() => { setEditing(c.idx); setDraft(c.text); }}>
+                {c.text}
+              </div>
+            )}
+            {f && editing !== c.idx && (
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button className="btn btn-ghost" style={{ fontSize: 10.5 }} onClick={() => flagsDoc.reload()}>Accept</button>
+                <button className="btn btn-ghost" style={{ fontSize: 10.5 }} onClick={() => teach(f)}
+                        disabled={!f.source_span}>Add to glossary</button>
+                <button className="btn btn-ghost" style={{ fontSize: 10.5 }}
+                        onClick={() => { setEditing(c.idx); setDraft(c.text); }}>Edit</button>
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ── Pronunciation & speakers tab ───────────────────────────────────
+function WbPronSpeakersTab({ job, siblings }) {
+  const speakersDoc = useWbDoc(`/api/job/${job.id}/speakers`);
+  const glossaryDoc = useWbDoc('/api/glossary');
+  const subsDoc = useWbDoc(`/api/dub/${job.id}/subtitles`);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [note, setNote] = useState('');
+  const [fanout, setFanout] = useState(true);
+  const [sayTerm, setSayTerm] = useState('');
+  const [sayHow, setSayHow] = useState('');
+
+  const speakers = (speakersDoc.doc && speakersDoc.doc.speakers) || [];
+  const labels = job.speaker_labels || {};
+  const cues = (subsDoc.doc && subsDoc.doc.cues) || [];
+  const totalDur = speakers.reduce((a, s) => a + (s.duration_sec || 0), 0);
+
+  const runOps = async (ops) => {
+    setBusy(true); setErr(''); setNote('');
+    try {
+      const d = await wbPost(`/api/dub/${job.id}/speakers/edit`, {
+        ops, apply_to_siblings: fanout && siblings.length > 0 });
+      const a = d.applied || {};
+      setNote(`Applied — ${a.merged_segments || 0} merged, ${a.reassigned || 0} reassigned, `
+        + `${a.marked_non_speech || 0} non-speech, ${a.checkpoints_updated || 0} checkpoint(s)`
+        + (d.siblings && d.siblings.length ? ` · ${d.siblings.filter(s => s.ok).length}/${d.siblings.length} siblings` : ''));
+      await Promise.all([speakersDoc.reload(), subsDoc.reload()]);
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  // The pronunciation table: this language's terms that carry a `say`.
+  const lang = (job.target_lang || '').slice(0, 2);
+  const sayRows = [];
+  const gdoc = glossaryDoc.doc;
+  ((gdoc && gdoc.domains) || []).forEach(d => {
+    const dl = (d.target_lang || '').slice(0, 2);
+    if (dl && lang && dl !== lang) return;
+    Object.entries(d.terms || {}).forEach(([term, v]) => {
+      if (v && typeof v === 'object' && v.say) {
+        sayRows.push({ term, say: v.say, dst: v.dst || '', scope: dl || 'all langs' });
+      }
+    });
+  });
+
+  const addSay = async () => {
+    setErr('');
+    try {
+      await wbPost('/api/glossary/term', wbForm({
+        term: sayTerm, translation: '', say: sayHow, target_lang: job.target_lang || '' }));
+      setSayTerm(''); setSayHow('');
+      await glossaryDoc.reload();
+    } catch (e) { setErr(String(e.message || e)); }
+  };
+
+  const preview = async (term, say) => {
+    setErr(''); setNote('Rendering preview…');
+    try {
+      const d = await wbPost(`/api/dub/${job.id}/voice_preview`, {
+        per_speaker: 1, text: `Listen: ${say}. Once more — ${say}.` });
+      const first = ((d.previews || d.samples || [])[0] || {});
+      const url = first.url || (first.samples && first.samples[0] && first.samples[0].url);
+      if (url) { wbPlay(url); setNote(`Previewing “${term}” as “${say}”.`); }
+      else setNote('Preview rendered nothing — is a voice cast saved?');
+    } catch (e) { setErr(String(e.message || e)); setNote(''); }
+  };
+
+  // Low-minutes outlier: the "diarization found 3 · you said 2" card.
+  const outlier = speakers.length > 1 ? speakers.find(s =>
+    (s.duration_sec || 0) < Math.max(0.1 * totalDur, 5)) : null;
+
+  const consent = job.voice_consent || {};
+  const attest = async (sp, on) => {
+    setErr('');
+    try {
+      await wbPost(`/api/dub/${job.id}/consent`, wbForm({ speaker: sp, attested: on ? 'true' : 'false' }));
+      setNote(on ? `Consent recorded for ${sp}.` : `Consent withdrawn for ${sp}.`);
+    } catch (e) { setErr(String(e.message || e)); }
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+      {err && <div style={{ fontSize: 12, color: 'var(--err)' }}>{err}</div>}
+      {note && <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{note}</div>}
+
+      <div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 600 }}>Pronunciation</span>
+          <span className="mono" style={{ fontSize: 10, color: 'var(--ink-4)' }}>
+            “say it like” respellings · saved to the glossary, all future jobs · VoxCPM only
+          </span>
+        </div>
+        <div style={{ border: '1px solid var(--line)', borderRadius: 10, overflow: 'hidden' }}>
+          {sayRows.map(r => (
+            <div key={r.term + r.scope} style={{ display: 'grid', gridTemplateColumns: '1fr 1.2fr 0.6fr auto', gap: 10, padding: '8px 12px', borderBottom: '1px solid var(--line)', fontSize: 12, alignItems: 'center' }}>
+              <span>{r.term}</span>
+              <span className="mono" style={{ color: 'var(--ink-2)' }}>{r.say}</span>
+              <span className="mono" style={{ fontSize: 10, color: 'var(--ink-4)' }}>{r.scope}</span>
+              <button className="btn btn-ghost" style={{ fontSize: 10.5 }} onClick={() => preview(r.term, r.say)}>▶</button>
+            </div>
+          ))}
+          <div style={{ display: 'flex', gap: 8, padding: '10px 12px', alignItems: 'center' }}>
+            <input className="field" placeholder="term" value={sayTerm} onChange={e => setSayTerm(e.target.value)} style={{ flex: 1 }}/>
+            <input className="field" placeholder='say it like… ("GOH-chee")' value={sayHow} onChange={e => setSayHow(e.target.value)} style={{ flex: 1.2 }}/>
+            <button className="btn btn-ghost" disabled={!sayTerm || !sayHow} onClick={addSay}>＋ add</button>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 8, marginBottom: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 600 }}>Speakers</span>
+          {siblings.length > 0 && (
+            <label style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--ink-3)', display: 'flex', gap: 6, alignItems: 'center' }}>
+              <input type="checkbox" checked={fanout} onChange={e => setFanout(e.target.checked)}/>
+              apply to {siblings.length} sibling language{siblings.length > 1 ? 's' : ''}
+            </label>
+          )}
+        </div>
+        {speakersDoc.err && <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{speakersDoc.err}</div>}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          {speakers.map(s => {
+            const isOutlier = outlier && outlier.speaker === s.speaker;
+            return (
+              <div key={s.speaker} style={{ border: '1px solid ' + (isOutlier ? 'var(--warn)' : 'var(--line)'), borderRadius: 10, padding: '10px 13px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <span className="mono" style={{ fontSize: 10, color: isOutlier ? 'var(--warn)' : 'var(--accent)', border: '1px solid var(--line-2)', borderRadius: '50%', width: 26, height: 26, display: 'inline-flex', alignItems: 'center', justifyContent: 'center' }}>{s.speaker.replace('SPEAKER_', 'S')}</span>
+                  <input className="field" defaultValue={labels[s.speaker] || ''} placeholder="label (e.g. Host)"
+                         style={{ width: 130, padding: '4px 8px', fontSize: 12 }}
+                         onBlur={e => { const v = e.target.value.trim(); if (v && v !== (labels[s.speaker] || '')) runOps([{ op: 'rename', speaker: s.speaker, label: v }]); }}/>
+                  <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>
+                    {((s.duration_sec || 0) / 60).toFixed(1)} min
+                  </span>
+                  {s.exists && (
+                    <button className="btn btn-ghost" style={{ marginLeft: 'auto', fontSize: 10.5 }}
+                            onClick={() => wbPlay(`/api/job/${job.id}/speaker_ref/${encodeURIComponent(s.speaker)}/audio`)}>▶ sample</button>
+                  )}
+                </div>
+                {isOutlier && (
+                  <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <span className="mono" style={{ fontSize: 10, color: 'var(--warn)' }}>low speech share — real, or diarization noise?</span>
+                    {speakers.filter(o => o.speaker !== s.speaker).map(o => (
+                      <button key={o.speaker} className="btn btn-ghost" style={{ fontSize: 10.5 }} disabled={busy}
+                              onClick={() => runOps([{ op: 'merge', from: s.speaker, into: o.speaker }])}>
+                        Merge into {labels[o.speaker] || o.speaker.replace('SPEAKER_', 'S')}
+                      </button>
+                    ))}
+                    <button className="btn btn-ghost" style={{ fontSize: 10.5 }} disabled={busy}
+                            onClick={() => runOps([{ op: 'mark_non_speech', segment_idxs: cues.filter(c => c.speaker === s.speaker).map(c => c.idx) }])}>
+                      Mark as non-speech
+                    </button>
+                  </div>
+                )}
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', fontSize: 11 }}>
+                  <span style={{ color: consent[s.speaker] ? 'var(--accent)' : 'var(--ink-4)' }}>
+                    {consent[s.speaker] ? '✓ clone consent recorded' : 'no clone consent recorded'}
+                  </span>
+                  <button className="btn btn-ghost" style={{ fontSize: 10 }} disabled={busy}
+                          onClick={() => attest(s.speaker, !consent[s.speaker])}>
+                    {consent[s.speaker] ? 'withdraw' : 'attest'}
+                  </button>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {speakers.length > 1 && cues.length > 0 && (
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8 }}>Segment reassign</div>
+          <div style={{ border: '1px solid var(--line)', borderRadius: 10, maxHeight: 300, overflowY: 'auto' }}>
+            {cues.map(c => (
+              <div key={c.idx} style={{ display: 'flex', gap: 8, padding: '6px 12px', borderBottom: '1px solid var(--line)', fontSize: 11.5, alignItems: 'center' }}>
+                <span className="mono" style={{ color: 'var(--ink-4)', fontSize: 10 }}>#{c.idx}</span>
+                <span className="wrap-any" style={{ flex: 1 }}>{c.text.slice(0, 90)}</span>
+                <select className="field" style={{ width: 110, padding: '2px 6px', fontSize: 11 }}
+                        value={c.speaker || ''} disabled={busy}
+                        onChange={e => runOps([{ op: 'reassign', segment_idx: c.idx, to: e.target.value }])}>
+                  {speakers.map(o => (
+                    <option key={o.speaker} value={o.speaker}>{labels[o.speaker] || o.speaker.replace('SPEAKER_', 'S')}</option>
+                  ))}
+                </select>
+              </div>
+            ))}
+          </div>
+          <div style={{ fontSize: 10.5, color: 'var(--ink-4)', marginTop: 6 }}>
+            Fixing speakers before synthesis is free. The voice cast updates automatically after a merge.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Sync fit tab ───────────────────────────────────────────────────
+function WbSyncFitTab({ job, onChanged, setTab }) {
+  const planDoc = useWbDoc(`/api/dub/${job.id}/sync_plan`);
+  const [plan, setPlan] = useState({});         // staged {idx: {max_stretch|pad_ms}}
+  const [cap, setCap] = useState('1.1');
+  const [useAutoFit, setUseAutoFit] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [note, setNote] = useState('');
+  const [shortening, setShortening] = useState(null);
+  const [draft, setDraft] = useState('');
+
+  const rows = (planDoc.doc && planDoc.doc.rows) || [];
+  const offRows = rows.filter(r => r.off);
+
+  const stage = (idx, entry) => setPlan(p => ({ ...p, [idx]: entry }));
+
+  const applyPlan = async (reassemble) => {
+    setBusy(true); setErr(''); setNote('');
+    try {
+      const body = { per_segment: plan };
+      if (useAutoFit) body.auto_fit_cap = parseFloat(cap) || 1.1;
+      const d = await wbPost(`/api/dub/${job.id}/sync_plan`, body);
+      setNote(`Plan stored — ${d.segments_planned} segment(s) will change on re-assembly.`);
+      if (reassemble) {
+        const overrides = job.status === 'awaiting_final_qc'
+          ? { review_gates: { final_qc: 'on' } } : {};
+        await wbPost(`/api/dub/${job.id}/retry_stage/assemble`,
+                     wbForm({ overrides: JSON.stringify(overrides), stop_after: '' }));
+        setNote('Re-assembling with the plan — watch Jobs · Live. '
+          + (overrides.review_gates ? 'The job will come back to Final QC.' : ''));
+        if (onChanged) onChanged();
+      }
+      await planDoc.reload();
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  const regen = async (idx) => {
+    setBusy(true); setErr('');
+    try {
+      await wbPost(`/api/dub/${job.id}/regenerate_segment/${idx}`,
+                   wbForm({ translated_text: draft }));
+      setNote(`Segment #${idx} queued for regeneration with the shorter line.`);
+      setShortening(null);
+      if (onChanged) onChanged();
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>Sync fit</span>
+        <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>
+          dub vs source duration per segment · target ±{Math.round(((planDoc.doc && planDoc.doc.tolerance) || 0.05) * 100)}%
+          {rows.length ? ` · ${offRows.length} of ${rows.length} off` : ''}
+        </span>
+        <label style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', fontSize: 11, color: 'var(--ink-3)' }}>
+          <input type="checkbox" checked={useAutoFit} onChange={e => setUseAutoFit(e.target.checked)}/>
+          Auto-fit all ≤
+          <input className="field" value={cap} onChange={e => setCap(e.target.value)}
+                 style={{ width: 52, padding: '2px 6px', fontSize: 11 }}/>×
+        </label>
+      </div>
+      {planDoc.err && <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{planDoc.err}</div>}
+      {err && <div style={{ fontSize: 12, color: 'var(--err)' }}>{err}</div>}
+      {note && <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{note}</div>}
+      {!rows.length && !planDoc.loading && (
+        <div style={{ fontSize: 12, color: 'var(--ink-3)', padding: '18px 0' }}>
+          No placement data yet — the drift table appears after the dub has been assembled once.
+        </div>
+      )}
+      {rows.length > 0 && (
+        <div style={{ border: '1px solid var(--line)', borderRadius: 10, overflow: 'hidden' }}>
+          <div className="mono caps" style={{ display: 'grid', gridTemplateColumns: '90px 1fr 70px 1.4fr', gap: 10, padding: '7px 12px', borderBottom: '1px solid var(--line)', fontSize: 9.5 }}>
+            <span>Segment</span><span>Fit</span><span style={{ textAlign: 'right' }}>Drift</span><span>Fix</span>
+          </div>
+          <div style={{ maxHeight: 420, overflowY: 'auto' }}>
+            {rows.map(r => {
+              const pct = Math.round((r.stretch - 1) * 100);
+              const staged = plan[r.idx];
+              const early = r.stretch < 1;
+              return (
+                <div key={r.idx} style={{ borderBottom: '1px solid var(--line)', background: r.off ? 'color-mix(in srgb, var(--warn) 5%, transparent)' : 'transparent' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '90px 1fr 70px 1.4fr', gap: 10, padding: '8px 12px', fontSize: 11, alignItems: 'center' }}>
+                    <span className="mono" style={{ color: 'var(--ink-4)', fontSize: 10 }}>#{r.idx} · {Math.floor(r.src_start / 60)}:{String(Math.floor(r.src_start % 60)).padStart(2, '0')}</span>
+                    <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                      <span style={{ display: 'inline-block', width: Math.min(100, 60 * Math.min(r.stretch, 1)) + 'px', height: 5, background: 'var(--accent)', borderRadius: 2 }}/>
+                      {r.stretch > 1 && <span style={{ display: 'inline-block', width: Math.min(80, 60 * (r.stretch - 1) * 4) + 'px', height: 5, background: r.off ? 'var(--warn)' : 'var(--ink-4)', borderRadius: 2 }}/>}
+                    </span>
+                    <span className="mono" style={{ textAlign: 'right', fontSize: 10.5, color: r.off ? 'var(--warn)' : 'var(--ink-3)' }}>
+                      {pct >= 0 ? '+' : ''}{pct}%{early ? ' early' : ''}
+                    </span>
+                    <span style={{ display: 'flex', gap: 5, flexWrap: 'wrap' }}>
+                      {r.off && !early && (
+                        <button className="btn btn-ghost" style={{ fontSize: 10, background: staged && staged.max_stretch ? 'var(--bg-2)' : 'transparent' }}
+                                onClick={() => stage(r.idx, { max_stretch: Math.min(2.5, Math.round(r.stretch * 1.05 * 100) / 100) })}>
+                          speed {Math.min(2.5, Math.round(r.stretch * 1.05 * 100) / 100)}×
+                        </button>
+                      )}
+                      {r.off && early && (
+                        <button className="btn btn-ghost" style={{ fontSize: 10, background: staged && staged.pad_ms ? 'var(--bg-2)' : 'transparent' }}
+                                onClick={() => stage(r.idx, { pad_ms: 300 })}>pad 0.3s</button>
+                      )}
+                      {r.off && (
+                        <button className="btn btn-ghost" style={{ fontSize: 10 }}
+                                onClick={() => { setShortening(shortening === r.idx ? null : r.idx); setDraft(r.text); }}>
+                          shorten text
+                        </button>
+                      )}
+                      {staged && (
+                        <button className="btn btn-ghost" style={{ fontSize: 10, color: 'var(--ink-4)' }}
+                                onClick={() => setPlan(p => { const q = { ...p }; delete q[r.idx]; return q; })}>✕</button>
+                      )}
+                    </span>
+                  </div>
+                  {shortening === r.idx && (
+                    <div style={{ padding: '0 12px 10px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+                      <textarea className="field" rows={2} value={draft} onChange={e => setDraft(e.target.value)} style={{ resize: 'vertical' }}/>
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <button className="btn btn-primary" style={{ padding: '4px 12px', fontSize: 11 }} disabled={busy || !draft.trim()}
+                                onClick={() => regen(r.idx)}>Regenerate this line</button>
+                        <WbEstimateNote jobId={job.id} edits={[{ kind: 'segment_text', idxs: [r.idx] }]}/>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {(Object.keys(plan).length > 0 || useAutoFit) && (
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          <button className="btn btn-primary" disabled={busy} onClick={() => applyPlan(true)} style={{ padding: '7px 14px', fontSize: 12 }}>
+            Apply plan & re-assemble ▸
+          </button>
+          <button className="btn btn-ghost" disabled={busy} onClick={() => applyPlan(false)} style={{ fontSize: 11 }}>Store plan only</button>
+          <span className="mono" style={{ fontSize: 10, color: 'var(--accent)' }}>
+            re-assembly only — no re-synthesis, free
+          </span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Subtitles tab ──────────────────────────────────────────────────
+function WbSubtitlesTab({ job }) {
+  const subsDoc = useWbDoc(`/api/dub/${job.id}/subtitles`);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [editing, setEditing] = useState(null);
+  const [draft, setDraft] = useState('');
+  const [cueNow, setCueNow] = useState('');
+  const videoRef = useRef(null);
+  const [hasVideo, setHasVideo] = useState(true);
+
+  const doc = subsDoc.doc;
+  const cues = (doc && doc.cues) || [];
+  const limits = (doc && doc.limits) || {};
+
+  const save = async (idx, value) => {
+    setBusy(true); setErr('');
+    try {
+      await wbPost(`/api/dub/${job.id}/subtitles/edit`,
+                   wbForm({ edits: JSON.stringify({ [String(idx)]: value }) }));
+      setEditing(null);
+      await subsDoc.reload();
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  const autofix = async () => {
+    setBusy(true); setErr('');
+    try {
+      const d = await wbPost(`/api/dub/${job.id}/subtitles/autofix`);
+      await subsDoc.reload();
+      if (d.remaining_violations) setErr(`${d.remaining_violations} violation(s) need a human — auto-fix only does the mechanical ones.`);
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  const onTime = () => {
+    const t = videoRef.current ? videoRef.current.currentTime : 0;
+    const c = cues.find(x => t >= x.start && t <= x.end);
+    setCueNow(c ? (c.display_text || c.text) : '');
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      {hasVideo && (
+        <div style={{ position: 'relative', borderRadius: 10, overflow: 'hidden', border: '1px solid var(--line)', background: '#000' }}>
+          <video ref={videoRef} src={`/outputs/${job.id}/dubbed_video.mp4`} controls
+                 style={{ width: '100%', maxHeight: 260, display: 'block' }}
+                 onTimeUpdate={onTime} onError={() => setHasVideo(false)}/>
+          {cueNow && (
+            <div style={{ position: 'absolute', left: 0, right: 0, bottom: 44, textAlign: 'center', pointerEvents: 'none' }}>
+              <span style={{ background: 'rgba(0,0,0,0.75)', color: '#fff', fontSize: 15, padding: '3px 10px', borderRadius: 4, whiteSpace: 'pre-line' }}>{cueNow}</span>
+            </div>
+          )}
+        </div>
+      )}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>Cues</span>
+        <span className="mono" style={{ fontSize: 10, color: 'var(--ink-3)' }}>
+          limits: {limits.max_chars_per_line || 42} chars/line · {limits.max_lines || 2} lines · {limits.max_cps || 17} CPS · min gap {limits.min_gap_ms || 120}ms
+          {doc ? ` · ${doc.violation_count} warning(s)` : ''}
+        </span>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+          {doc && doc.violation_count > 0 && (
+            <button className="btn btn-ghost" style={{ fontSize: 11 }} disabled={busy} onClick={autofix}>Auto-fix warnings</button>
+          )}
+          {doc && doc.srt_url && <a className="btn btn-ghost" style={{ fontSize: 11 }} href={doc.srt_url} download>.srt ↓</a>}
+          {doc && doc.vtt_url && <a className="btn btn-ghost" style={{ fontSize: 11 }} href={doc.vtt_url} download>.vtt ↓</a>}
+        </div>
+      </div>
+      {subsDoc.err && <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{subsDoc.err}</div>}
+      {err && <div style={{ fontSize: 12, color: 'var(--err)' }}>{err}</div>}
+      {cues.length > 0 && (
+        <div style={{ border: '1px solid var(--line)', borderRadius: 10, overflow: 'hidden' }}>
+          <div className="mono caps" style={{ display: 'grid', gridTemplateColumns: '150px 1fr 50px 50px 60px', gap: 10, padding: '7px 12px', borderBottom: '1px solid var(--line)', fontSize: 9.5 }}>
+            <span>Timing</span><span>Text</span><span style={{ textAlign: 'right' }}>CPS</span><span style={{ textAlign: 'right' }}>Lines</span><span style={{ textAlign: 'right' }}>Gap</span>
+          </div>
+          <div style={{ maxHeight: 380, overflowY: 'auto' }}>
+            {cues.map(c => {
+              const bad = c.violations && c.violations.length > 0;
+              const cpsBad = c.violations && c.violations.some(v => v.kind === 'cps');
+              const gapBad = c.violations && c.violations.some(v => v.kind === 'gap');
+              const overridden = doc.overrides && doc.overrides[String(c.idx)];
+              return (
+                <div key={c.idx} style={{ borderBottom: '1px solid var(--line)', borderLeft: bad ? '2px solid var(--warn)' : '2px solid transparent' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '150px 1fr 50px 50px 60px', gap: 10, padding: '8px 12px', fontSize: 11.5, alignItems: 'center' }}>
+                    <span className="mono" style={{ fontSize: 10, color: gapBad ? 'var(--warn)' : 'var(--ink-4)' }}>
+                      {c.start.toFixed(1)} → {c.end.toFixed(1)}
+                    </span>
+                    {editing === c.idx ? (
+                      <textarea className="field" rows={2} autoFocus value={draft}
+                                onChange={e => setDraft(e.target.value)}
+                                onBlur={() => save(c.idx, { display_text: draft })}
+                                style={{ resize: 'vertical', fontSize: 12 }}/>
+                    ) : (
+                      <span className="wrap-any" style={{ cursor: 'text', whiteSpace: 'pre-line' }}
+                            onClick={() => { setEditing(c.idx); setDraft(c.display_text || c.text); }}>
+                        {c.display_text || c.text}
+                        {overridden && <span className="mono" style={{ fontSize: 9, color: 'var(--accent)', marginLeft: 6 }}>edited</span>}
+                      </span>
+                    )}
+                    <span className="mono" style={{ textAlign: 'right', fontSize: 10.5, color: cpsBad ? 'var(--err)' : 'var(--ink-3)' }}>{c.cps}{cpsBad ? ' ⚠' : ''}</span>
+                    <span className="mono" style={{ textAlign: 'right', fontSize: 10.5, color: 'var(--ink-3)' }}>{c.lines}</span>
+                    <span className="mono" style={{ textAlign: 'right', fontSize: 10.5, color: gapBad ? 'var(--err)' : 'var(--ink-4)' }}>{c.gap_ms == null ? '—' : Math.round(c.gap_ms) + 'ms'}</span>
+                  </div>
+                  {overridden && editing !== c.idx && (
+                    <div style={{ padding: '0 12px 6px' }}>
+                      <button className="btn btn-ghost" style={{ fontSize: 10, color: 'var(--ink-4)' }}
+                              onClick={() => save(c.idx, null)}>restore original</button>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      <div style={{ fontSize: 10.5, color: 'var(--ink-4)' }}>
+        Subtitle edits change what is shown, never what was spoken — they are free and re-export .srt/.vtt instantly.
+      </div>
+    </div>
+  );
+}
+
+// ── Final QC tab ───────────────────────────────────────────────────
+function WbFinalQCTab({ job, setTab, onApprove, busy }) {
+  const qcDoc = useWbDoc(`/api/dub/${job.id}/qc`);
+  const [noteDraft, setNoteDraft] = useState('');
+  const [err, setErr] = useState('');
+  const doc = qcDoc.doc;
+  const stateColor = { pass: 'var(--accent)', warn: 'var(--warn)', unavailable: 'var(--ink-4)' };
+  const stateMark = { pass: '✓', warn: '⚠', unavailable: '·' };
+
+  const addNote = async () => {
+    setErr('');
+    try {
+      await wbPost(`/api/dub/${job.id}/review_notes`, wbForm({ text: noteDraft }));
+      setNoteDraft('');
+      await qcDoc.reload();
+    } catch (e) { setErr(String(e.message || e)); }
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      {qcDoc.err && <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{qcDoc.err}</div>}
+      {err && <div style={{ fontSize: 12, color: 'var(--err)' }}>{err}</div>}
+      {doc && (
+        <div style={{ border: '1px solid var(--line)', borderRadius: 10, padding: '12px 14px' }}>
+          <div className="caps" style={{ marginBottom: 8 }}>QC checklist · {job.target_lang || ''}</div>
+          {doc.rows.map(r => (
+            <div key={r.id} style={{ display: 'flex', gap: 8, padding: '5px 0', fontSize: 12, alignItems: 'baseline' }}>
+              <span className="mono" style={{ color: stateColor[r.state] || 'var(--ink-3)' }}>{stateMark[r.state] || '·'}</span>
+              <span style={{ minWidth: 90 }}>{r.label}</span>
+              <span style={{ color: 'var(--ink-2)' }}>{r.value}</span>
+              <span style={{ color: 'var(--ink-4)', fontSize: 11 }}>{r.detail}</span>
+              {r.id === 'sync' && r.state === 'warn' && (
+                <button className="btn btn-ghost" style={{ fontSize: 10, marginLeft: 'auto' }} onClick={() => setTab('sync')}>fix →</button>
+              )}
+              {r.id === 'subtitles' && r.state === 'warn' && (
+                <button className="btn btn-ghost" style={{ fontSize: 10, marginLeft: 'auto' }} onClick={() => setTab('subtitles')}>fix →</button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      <div style={{ border: '1px solid var(--line)', borderRadius: 10, padding: '12px 14px' }}>
+        <div className="caps" style={{ marginBottom: 8 }}>Review notes</div>
+        {doc && (doc.review_notes || []).map((n, i) => (
+          <div key={i} style={{ fontSize: 11.5, color: 'var(--ink-2)', borderLeft: '2px solid var(--line-2)', paddingLeft: 9, marginBottom: 7 }}>
+            {n.text} <span className="mono" style={{ fontSize: 9.5, color: 'var(--ink-4)' }}>— {n.author || 'local'}</span>
+          </div>
+        ))}
+        <div style={{ display: 'flex', gap: 6 }}>
+          <input className="field" placeholder="add a note…" value={noteDraft}
+                 onChange={e => setNoteDraft(e.target.value)} style={{ flex: 1 }}/>
+          <button className="btn btn-ghost" disabled={!noteDraft.trim()} onClick={addNote}>Add</button>
+        </div>
+      </div>
+      {doc && (
+        <div style={{ border: '1px solid var(--line)', borderRadius: 10, padding: '12px 14px' }}>
+          <div className="caps" style={{ marginBottom: 8 }}>On approve</div>
+          <div className="mono" style={{ fontSize: 11, color: 'var(--ink-2)', lineHeight: 1.9 }}>
+            deliver {(doc.on_approve.deliverables || []).map(d => d.split('/').pop()).join(' + ') || 'the rendered files'}<br/>
+            fire job.completed → {doc.on_approve.webhooks} webhook{doc.on_approve.webhooks === 1 ? '' : 's'}
+          </div>
+          {job.status === 'awaiting_final_qc' && (
+            <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+              <button className="btn btn-primary" disabled={busy} onClick={onApprove} style={{ padding: '8px 16px' }}>
+                Approve & deliver ▸
+              </button>
+              {doc.warn_count > 0 && (
+                <span style={{ fontSize: 11, color: 'var(--warn)', alignSelf: 'center' }}>
+                  {doc.warn_count} warning(s) outstanding
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, onPickJob }) {
   const reviewJobs = jobs.filter(j => REVIEW_STATUSES.has(j.status));
   const job = selectedJobId ? jobs.find(j => j.id === selectedJobId) : reviewJobs[0];
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [notice, setNotice] = useState('');
   const [cast, setCast] = useState(null);      // {map, valid} from the panel
+  const [tab, setTab] = useState('translation');
+  const [rejecting, setRejecting] = useState(false);
   const onCastChange = useCallback(
     (map, valid) => setCast({ map, valid }), []);
+
+  // A newly selected job (or a status change) opens the tab its gate wants.
+  const statusKey = job ? job.id + ':' + job.status : '';
+  useEffect(() => {
+    if (job) {
+      setTab(WB_TAB_FOR_STATUS[job.status] || 'translation');
+      setNotice(''); setErr(''); setRejecting(false);
+    }
+  }, [statusKey]);
 
   if (!job) {
     return (
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 16, padding: 'var(--pad)', background: 'var(--bg)' }}>
         <div className="caps">No reviews pending</div>
         <div className="serif" style={{ fontSize: 'clamp(20px, 5.5vw, 32px)', letterSpacing: '-0.015em', textAlign: 'center', maxWidth: 480 }}>
-          Wizard mode is <span style={{ fontStyle: 'italic', color: 'var(--ink-3)' }}>quiet</span>.
+          Every gate is <span style={{ fontStyle: 'italic', color: 'var(--ink-3)' }}>quiet</span>.
         </div>
       </div>
     );
   }
 
   const casting = job.status === 'awaiting_voice_review';
+  const siblings = job.batch_id
+    ? jobs.filter(j => j.batch_id === job.batch_id && j.id !== job.id) : [];
 
-  // Actually resume the job. This used to only flip a tab, which left every
-  // wizard-mode job parked at its checkpoint forever unless you went and
-  // POSTed to /continue by hand.
+  // Actually resume the job — clears exactly the pending gate. Commit the
+  // cast first when the voice gate is up: continuing with an unsaved cast
+  // would run the whole synthesis against whatever was last persisted,
+  // which is the one mistake this screen exists to prevent.
   const proceed = async () => {
-    setBusy(true); setErr('');
+    setBusy(true); setErr(''); setNotice('');
     try {
-      // Commit the cast first. Continuing with an unsaved cast would run the
-      // whole synthesis stage against whatever was last persisted, which is
-      // the one mistake this screen exists to prevent.
       if (casting && cast && cast.valid) {
         const cr = await fetch(`/api/dub/${job.id}/voice_casting`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -3960,14 +4817,50 @@ function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, 
       });
       const d = await r.json();
       if (d.error) { setErr(d.error); setBusy(false); return; }
+      if (d.now_awaiting) {
+        // Same boundary, next gate — stay here; the poll will re-render.
+        setNotice(`Gate cleared — now awaiting ${WB_GATE_LABEL[d.now_awaiting] || d.now_awaiting}.`);
+        setBusy(false);
+        return;
+      }
       onContinued();
     } catch (e) { setErr(String(e.message || e)); }
     setBusy(false);
   };
 
+  const rejectToTranslate = async () => {
+    setBusy(true); setErr('');
+    try {
+      await wbPost(`/api/dub/${job.id}/retranslate`);
+      setNotice('Re-translating this language — the job will come back to this gate.');
+      setRejecting(false);
+      onContinued();
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  const translationGate = ['awaiting_transcript_review', 'awaiting_translation_review',
+                           'awaiting_voice_review'].includes(job.status);
+  const approveLabel = {
+    awaiting_transcript_review: 'Approve transcript ▸',
+    awaiting_translation_review: 'Approve → synthesize ▸',
+    awaiting_voice_review: 'Cast & synthesize ▸',
+    awaiting_subtitle_review: 'Approve subtitles ▸',
+    awaiting_final_qc: 'Approve & deliver ▸',
+  }[job.status] || 'Continue ▸';
+
+  const tabs = [
+    { id: 'translation', label: 'Translation' },
+    { id: 'voices', label: 'Pronunciation & speakers' },
+    { id: 'sync', label: 'Sync fit' },
+    { id: 'subtitles', label: 'Subtitles' },
+    { id: 'qc', label: 'Final QC' },
+  ];
+
   return (
     <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 'var(--pad)', background: 'var(--bg)' }}>
-      <div style={{ maxWidth: 680, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
+      <div style={{ maxWidth: 1060, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 14 }}>
+
         {reviewJobs.length > 1 && (
           <Field label="Waiting on you">
             <Select value={job.id} onChange={onPickJob}>
@@ -3986,28 +4879,79 @@ function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, 
             {job.title || job.source_label || job.id}
           </div>
           <StatusBadge status={job.status}/>
+          <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems: 'center' }}>
+            {translationGate && !rejecting && (
+              <button className="btn btn-ghost" disabled={busy} onClick={() => setRejecting(true)}
+                      style={{ fontSize: 11 }}>Reject to translate ↺</button>
+            )}
+            {rejecting && (
+              <span style={{ display: 'inline-flex', gap: 6, alignItems: 'center', fontSize: 11 }}>
+                redo the whole language?
+                <button className="btn btn-ghost" style={{ fontSize: 11, color: 'var(--err)' }}
+                        disabled={busy} onClick={rejectToTranslate}>Yes, retranslate</button>
+                <button className="btn btn-ghost" style={{ fontSize: 11 }}
+                        onClick={() => setRejecting(false)}>No</button>
+              </span>
+            )}
+            <button className="btn btn-primary" onClick={proceed}
+                    disabled={busy || (casting && cast && !cast.valid)}
+                    style={{ padding: '8px 16px' }}>
+              {busy ? 'Working…' : approveLabel}
+            </button>
+            <button className="btn btn-ghost" onClick={onCancel}>Later</button>
+          </div>
         </div>
-        {job.step_detail && (
-          <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{job.step_detail}</div>
-        )}
 
-        {casting && (
-          <div>
-            <SectionHeader title="Cast the voices"
-                           subtitle="one per speaker, before the long stage"/>
-            <VoiceCastingPanel jobId={job.id} onCastChange={onCastChange}/>
+        {siblings.length > 0 && (
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+            {[job, ...siblings].map(j => (
+              <button key={j.id} className="btn btn-ghost" onClick={() => onPickJob(j.id)} style={{
+                padding: '3px 10px', fontSize: 11, borderRadius: 999,
+                border: '1px solid ' + (j.id === job.id ? 'var(--line-2)' : 'transparent'),
+                background: j.id === job.id ? 'var(--bg-2)' : 'transparent' }}>
+                {(j.target_lang || '??')}
+                <span className="dot" style={{ marginLeft: 6, background: (STATUS_META[j.status] || {}).color || 'var(--ink-4)' }}/>
+              </button>
+            ))}
           </div>
         )}
 
+        {job.step_detail && (
+          <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{job.step_detail}</div>
+        )}
         {err && <div style={{ fontSize: 12, color: 'var(--err)' }}>{err}</div>}
+        {notice && <div style={{ fontSize: 12, color: 'var(--accent)' }}>{notice}</div>}
 
-        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
-          <button className="btn btn-primary" onClick={proceed}
-                  disabled={busy || (casting && cast && !cast.valid)}
-                  style={{ padding: '10px 16px' }}>
-            {busy ? 'Resuming…' : 'Continue'} {!busy && I.arrow}
-          </button>
-          <button className="btn btn-ghost" onClick={onCancel}>Later</button>
+        <div style={{ display: 'flex', gap: 6, borderBottom: '1px solid var(--line)', paddingBottom: 8 }}>
+          {tabs.map(t => (
+            <button key={t.id} onClick={() => setTab(t.id)} style={{
+              padding: '5px 11px', borderRadius: 999, fontSize: 11.5, fontWeight: 500,
+              border: '1px solid ' + (tab === t.id ? 'var(--line-2)' : 'transparent'),
+              background: tab === t.id ? 'var(--bg-2)' : 'transparent',
+              color: tab === t.id ? 'var(--ink)' : 'var(--ink-3)' }}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+
+        <div style={{ display: 'flex', gap: 18, alignItems: 'flex-start' }}>
+          <div style={{ flex: 1, minWidth: 0 }}>
+            {tab === 'translation' && <WbTranslationTab job={job} onEdited={() => {}}/>}
+            {tab === 'voices' && <WbPronSpeakersTab job={job} siblings={siblings}/>}
+            {tab === 'sync' && <WbSyncFitTab job={job} setTab={setTab} onChanged={onContinued}/>}
+            {tab === 'subtitles' && <WbSubtitlesTab job={job}/>}
+            {tab === 'qc' && <WbFinalQCTab job={job} setTab={setTab} onApprove={proceed} busy={busy}/>}
+          </div>
+          <div style={{ width: 270, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <GatesRail job={job}/>
+            {casting && (
+              <div>
+                <div className="caps" style={{ marginBottom: 8 }}>Cast the voices</div>
+                <VoiceCastingPanel jobId={job.id} onCastChange={onCastChange}/>
+              </div>
+            )}
+            <GlossaryQuickAdd lang={job.target_lang}/>
+          </div>
         </div>
       </div>
     </div>
@@ -6010,7 +6954,7 @@ function ApiKeysView({ mode }) {
                           minWidth: 620 }}>
             <thead>
               <tr>
-                {['Name', 'Token', 'Scopes', 'Created', 'Last used', ''].map(x => (
+                {['Name', 'Token', 'Scopes', 'Created', 'Expires', 'Last used', ''].map(x => (
                   <th key={x} className="caps" style={{
                     textAlign: 'left', padding: '11px 14px',
                     borderBottom: '1px solid var(--line)', whiteSpace: 'nowrap',
@@ -6020,12 +6964,15 @@ function ApiKeysView({ mode }) {
             </thead>
             <tbody>
               {keys.length === 0 && (
-                <tr><td colSpan={6} className="mono" style={{
+                <tr><td colSpan={7} className="mono" style={{
                   padding: '18px 14px', fontSize: 11, color: 'var(--ink-3)',
                 }}>No keys yet.</td></tr>
               )}
               {keys.map(k => {
-                const dead = !!k.revoked || (k.expires && k.expires * 1000 < Date.now());
+                // Revoked wins over expired when both hold — revocation is
+                // the explicit human action, so it is the one to show.
+                const expired = !k.revoked && k.expires && k.expires * 1000 < Date.now();
+                const dead = !!k.revoked || expired;
                 return (
                   <tr key={k.id} style={{ opacity: dead ? 0.5 : 1 }}>
                     <td style={{ padding: '11px 14px', fontSize: 12.5,
@@ -6055,6 +7002,13 @@ function ApiKeysView({ mode }) {
                     <td className="mono" style={{ padding: '11px 14px', fontSize: 10.5,
                                                   color: 'var(--ink-3)',
                                                   borderBottom: '1px solid var(--bg-2)' }}>
+                      {k.expires
+                        ? new Date(k.expires * 1000).toLocaleDateString()
+                        : '—'}
+                    </td>
+                    <td className="mono" style={{ padding: '11px 14px', fontSize: 10.5,
+                                                  color: 'var(--ink-3)',
+                                                  borderBottom: '1px solid var(--bg-2)' }}>
                       {k.last_used ? fmtAge(k.last_used) : '—'}
                     </td>
                     <td style={{ padding: '11px 14px', textAlign: 'right',
@@ -6062,6 +7016,11 @@ function ApiKeysView({ mode }) {
                       {k.revoked ? (
                         <span className="mono" style={{ fontSize: 10.5,
                                                         color: 'var(--ink-3)' }}>revoked</span>
+                      ) : expired ? (
+                        // No Revoke button here: revoking a key the server
+                        // already refuses would be meaningless noise.
+                        <span className="mono" style={{ fontSize: 10.5,
+                                                        color: 'var(--warn)' }}>expired</span>
                       ) : (
                         <button className="btn" onClick={() => revoke(k.id)}
                                 style={{ fontSize: 11 }}>Revoke</button>
@@ -6089,7 +7048,79 @@ function ApiKeysView({ mode }) {
           agent feed — it is informational and grants nothing.
         </div>
       </DevCard>
+
+      <RolesReference/>
     </DevPage>
+  );
+}
+
+// The permission matrix from the design, folded in here from the old Members
+// screen. It is a reference table, not an enforcement surface: local mode has
+// exactly one user and checks no permissions. Real members ride on CLD-247.
+const ROLES = ['Owner', 'Admin', 'Developer', 'Editor', 'Viewer', 'Agent'];
+const PERMISSIONS = [
+  ['Start / cancel dubs',        [1, 1, 1, 1, 0, 1]],
+  ['Review / edit translations', [1, 1, 0, 1, 0, 0]],
+  ['Retry pipeline stages',      [1, 1, 1, 1, 0, 1]],
+  ['Download outputs',           [1, 1, 1, 1, 1, 1]],
+  ['Create / revoke API keys',   [1, 1, 1, 0, 0, 0]],
+  ['Manage webhooks',            [1, 1, 1, 0, 0, 0]],
+  ['Invite members / set roles', [1, 1, 0, 0, 0, 0]],
+  ['View / manage billing',      [1, 2, 0, 0, 0, 0]],   // 2 = view only
+];
+
+function RolesReference() {
+  const [open, setOpen] = useState(false);
+  return (
+    <DevCard style={{ padding: 0, overflow: 'hidden' }}>
+      <div style={{ padding: '14px 16px', display: 'flex', alignItems: 'center',
+                    gap: 10, cursor: 'pointer' }}
+           onClick={() => setOpen(o => !o)}>
+        <div className="caps">Roles reference</div>
+        <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>
+          documentation, not enforcement — every key here acts as its creator
+        </span>
+        <span style={{ marginLeft: 'auto', color: 'var(--ink-3)', fontSize: 11 }}>
+          {open ? '▾' : '▸'}
+        </span>
+      </div>
+      {open && (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 560 }}>
+            <thead>
+              <tr>
+                <th className="caps" style={{ textAlign: 'left', padding: '9px 14px',
+                      borderTop: '1px solid var(--line)',
+                      borderBottom: '1px solid var(--line)' }}>Permission</th>
+                {ROLES.map(r => (
+                  <th key={r} className="caps" style={{ textAlign: 'center',
+                        padding: '9px 8px', borderTop: '1px solid var(--line)',
+                        borderBottom: '1px solid var(--line)' }}>{r}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {PERMISSIONS.map(([label, row]) => (
+                <tr key={label}>
+                  <td style={{ padding: '9px 14px', fontSize: 12,
+                               color: 'var(--ink-2)',
+                               borderBottom: '1px solid var(--bg-2)' }}>{label}</td>
+                  {row.map((v, i) => (
+                    <td key={i} className="mono" style={{ textAlign: 'center',
+                          padding: '9px 8px', fontSize: 11,
+                          color: v === 1 ? 'var(--accent)'
+                               : v === 2 ? 'var(--ink-2)' : 'var(--ink-4)',
+                          borderBottom: '1px solid var(--bg-2)' }}>
+                      {v === 1 ? '✓' : v === 2 ? 'view' : '—'}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </DevCard>
   );
 }
 
@@ -6583,139 +7614,6 @@ function BillingView() {
   );
 }
 
-// The permission matrix from the design. It is a reference table, not an
-// enforcement surface: local mode has exactly one user and enforces nothing.
-// Shipping it as documentation is honest; pretending it gates anything is not.
-const ROLES = ['Owner', 'Admin', 'Developer', 'Editor', 'Viewer', 'Agent'];
-const PERMISSIONS = [
-  ['Start / cancel dubs',        [1, 1, 1, 1, 0, 1]],
-  ['Review / edit translations', [1, 1, 0, 1, 0, 0]],
-  ['Retry pipeline stages',      [1, 1, 1, 1, 0, 1]],
-  ['Download outputs',           [1, 1, 1, 1, 1, 1]],
-  ['Create / revoke API keys',   [1, 1, 1, 0, 0, 0]],
-  ['Manage webhooks',            [1, 1, 1, 0, 0, 0]],
-  ['Invite members / set roles', [1, 1, 0, 0, 0, 0]],
-  ['View / manage billing',      [1, 2, 0, 0, 0, 0]],   // 2 = view only
-];
-
-function MembersView() {
-  const [keys, setKeys] = useState([]);
-  useEffect(() => {
-    fetch('/api/apikeys').then(r => r.json()).then(d => setKeys(d.keys || []))
-      .catch(() => {});
-  }, []);
-  // The only "members" that genuinely exist here: this machine's user, and any
-  // API key, which is what an agent actually authenticates as.
-  const agentKeys = keys.filter(k => !k.revoked);
-
-  return (
-    <DevPage title="Members & roles" subtitle="local workspace">
-      <EstimateNote>
-        <strong style={{ color: 'var(--ink)' }}>Reference, not enforcement.</strong>{' '}
-        This server runs one local user and checks no permissions. The matrix
-        below documents the roles a hosted workspace would have; the rows above
-        it are the real principals on this machine — you, and each live API key.
-      </EstimateNote>
-
-      <DevCard style={{ padding: 0, overflow: 'hidden' }}>
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 520 }}>
-            <thead>
-              <tr>{['Principal', 'Role', 'Kind', 'Last active'].map(x => (
-                <th key={x} className="caps" style={{ textAlign: 'left',
-                      padding: '11px 14px', borderBottom: '1px solid var(--line)' }}>{x}</th>
-              ))}</tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td style={{ padding: '11px 14px', fontSize: 12.5,
-                             borderBottom: '1px solid var(--bg-2)' }}>
-                  This machine
-                  <span className="mono" style={{ fontSize: 10, marginLeft: 6,
-                                                  color: 'var(--ink-3)' }}>local</span>
-                </td>
-                <td className="mono" style={{ padding: '11px 14px', fontSize: 11,
-                      color: 'var(--accent)', borderBottom: '1px solid var(--bg-2)' }}>owner</td>
-                <td className="mono" style={{ padding: '11px 14px', fontSize: 11,
-                      color: 'var(--ink-3)', borderBottom: '1px solid var(--bg-2)' }}>human</td>
-                <td className="mono" style={{ padding: '11px 14px', fontSize: 11,
-                      color: 'var(--ink-3)', borderBottom: '1px solid var(--bg-2)' }}>now</td>
-              </tr>
-              {agentKeys.map(k => (
-                <tr key={k.id}>
-                  <td style={{ padding: '11px 14px', fontSize: 12.5,
-                               borderBottom: '1px solid var(--bg-2)' }}>
-                    {k.name}
-                    <span className="mono" style={{ fontSize: 10, marginLeft: 6,
-                                                    color: 'var(--ink-3)' }}>{k.masked}</span>
-                  </td>
-                  <td className="mono" style={{ padding: '11px 14px', fontSize: 11,
-                        color: 'var(--ink-2)', borderBottom: '1px solid var(--bg-2)' }}>agent</td>
-                  <td className="mono" style={{ padding: '11px 14px', fontSize: 11,
-                        color: 'var(--ink-3)', borderBottom: '1px solid var(--bg-2)' }}>
-                    service account
-                  </td>
-                  <td className="mono" style={{ padding: '11px 14px', fontSize: 11,
-                        color: 'var(--ink-3)', borderBottom: '1px solid var(--bg-2)' }}>
-                    {k.last_used ? fmtAge(k.last_used) : 'never'}
-                  </td>
-                </tr>
-              ))}
-              {agentKeys.length === 0 && (
-                <tr><td colSpan={4} className="mono" style={{ padding: '14px',
-                      fontSize: 11, color: 'var(--ink-3)' }}>
-                  No API keys yet — create one under Develop → API keys.
-                </td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </DevCard>
-
-      <DevCard style={{ padding: 0, overflow: 'hidden' }}>
-        <div style={{ padding: '14px 16px 0' }}>
-          <div className="caps">Permission matrix</div>
-          <div className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)',
-                                         margin: '6px 0 12px' }}>
-            the agent role is what an MCP key can do — never more than its creator
-          </div>
-        </div>
-        <div style={{ overflowX: 'auto' }}>
-          <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 560 }}>
-            <thead>
-              <tr>
-                <th className="caps" style={{ textAlign: 'left', padding: '9px 14px',
-                      borderBottom: '1px solid var(--line)' }}>Permission</th>
-                {ROLES.map(r => (
-                  <th key={r} className="caps" style={{ textAlign: 'center',
-                        padding: '9px 8px', borderBottom: '1px solid var(--line)' }}>{r}</th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {PERMISSIONS.map(([label, row]) => (
-                <tr key={label}>
-                  <td style={{ padding: '9px 14px', fontSize: 12,
-                               color: 'var(--ink-2)',
-                               borderBottom: '1px solid var(--bg-2)' }}>{label}</td>
-                  {row.map((v, i) => (
-                    <td key={i} className="mono" style={{ textAlign: 'center',
-                          padding: '9px 8px', fontSize: 11,
-                          color: v === 1 ? 'var(--accent)'
-                               : v === 2 ? 'var(--ink-2)' : 'var(--ink-4)',
-                          borderBottom: '1px solid var(--bg-2)' }}>
-                      {v === 1 ? '✓' : v === 2 ? 'view' : '—'}
-                    </td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      </DevCard>
-    </DevPage>
-  );
-}
 
 const AUDIT_LABELS = {
   'apikey.create': 'API key created',
@@ -6724,7 +7622,10 @@ const AUDIT_LABELS = {
   'webhook.remove': 'Webhook removed',
 };
 
-function AuditView() {
+// Rendered as a tab inside the Agent feed: both are event streams, so they
+// share a screen — but NOT a store. The audit log stays its own append-only
+// audit.jsonl (nothing dropped, updated or deleted), with its own fetch.
+function AuditPanel() {
   const [d, setD] = useState(null);
   useEffect(() => {
     const pull = () => fetch('/api/audit').then(r => r.json()).then(setD)
@@ -6736,14 +7637,14 @@ function AuditView() {
   const entries = d?.entries || [];
 
   return (
-    <DevPage title="Audit log"
-             subtitle={d ? `${d.total} entr${d.total === 1 ? 'y' : 'ies'}` : ''}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
       <div style={{ fontSize: 12.5, color: 'var(--ink-2)', lineHeight: 1.6,
                     maxWidth: 620 }}>
-        An append-only record of key and webhook changes, written to
-        <span className="mono"> audit.jsonl</span> and flushed to disk on every
-        entry. Unlike the agent feed, nothing here is ever dropped, updated or
-        deleted — a trail with holes in it would be worse than none.
+        An append-only record of key and webhook changes
+        {d ? ` (${d.total} entr${d.total === 1 ? 'y' : 'ies'})` : ''}, written
+        to <span className="mono">audit.jsonl</span> and flushed to disk on
+        every entry. Unlike the activity feed, nothing here is ever dropped,
+        updated or deleted — a trail with holes in it would be worse than none.
       </div>
 
       <DevCard>
@@ -6770,7 +7671,7 @@ function AuditView() {
           </div>
         ))}
       </DevCard>
-    </DevPage>
+    </div>
   );
 }
 
@@ -6825,7 +7726,14 @@ function App() {
   useEffect(() => {
     const h = () => { _lsSet('system_tab', 'logs'); setView('system'); };
     window.addEventListener('gcd:open-logs', h);
-    return () => window.removeEventListener('gcd:open-logs', h);
+    // Same pattern for the review workbench's gates panel: its "defaults"
+    // link lands on Settings without threading setView through five layers.
+    const hs = () => setView('system');
+    window.addEventListener('gcd:open-settings', hs);
+    return () => {
+      window.removeEventListener('gcd:open-logs', h);
+      window.removeEventListener('gcd:open-settings', hs);
+    };
   }, []);
   const [navOpen, setNavOpen] = useState(false);
 
@@ -7002,9 +7910,7 @@ function App() {
         {view === 'apikeys' && <ApiKeysView mode={system?.mode || 'local'}/>}
         {view === 'mcp' && <McpServerView mode={system?.mode || 'local'}/>}
         {view === 'webhooks' && <WebhooksView/>}
-        {view === 'members' && <MembersView/>}
         {view === 'billing' && <BillingView/>}
-        {view === 'audit' && <AuditView/>}
 
         {view === 'system' && (
           <SystemView system={system} onRefreshSystem={refreshSystem}/>

@@ -89,6 +89,10 @@ def build_cues(segments: List[dict], overrides: Optional[dict] = None) -> List[d
         except (TypeError, ValueError):
             continue
         cue = {"idx": idx, "start": start, "end": end, "text": text}
+        if seg.get("speaker"):
+            # Who says the line — the workbench's reassign list reads it;
+            # the SRT/VTT writers ignore it.
+            cue["speaker"] = seg["speaker"]
         o = ov.get(idx)
         if o:
             dt = o.get("display_text")

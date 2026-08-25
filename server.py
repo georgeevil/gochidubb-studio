@@ -12027,6 +12027,50 @@ async def autofix_subtitles(job_id: str):
     return doc
 
 
+@app.get("/api/dub/{job_id}/sync_plan")
+async def get_sync_plan(job_id: str):
+    """The per-segment drift table the Sync tab renders, plus the stored
+    plan. Same placement rows the POST's auto-fit and the /qc sync row read
+    — the table, the plan and the re-assembly never disagree."""
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    job = jobs[job_id]
+    placements = await asyncio.to_thread(
+        _load_placements, OUTPUT_DIR / job_id)
+    segments, _seg_stage = await asyncio.to_thread(_subtitle_segments, job_id)
+    text_by_idx = {s.get("idx"): (s.get("translated_text") or s.get("text")
+                                  or "") for s in segments}
+    rows = []
+    for i, p in enumerate(placements):
+        try:
+            src_s = float(p.get("src_start", 0))
+            src_e = float(p.get("src_end", 0))
+            dub_s, dub_e = p.get("dub_start"), p.get("dub_end")
+            if src_e - src_s <= 0 or dub_s is None or dub_e is None:
+                continue
+            stretch = (float(dub_e) - float(dub_s)) / (src_e - src_s)
+            idx = p.get("idx", i)
+            rows.append({
+                "idx": idx,
+                "src_start": round(src_s, 2),
+                "src_dur": round(src_e - src_s, 2),
+                "dub_dur": round(float(dub_e) - float(dub_s), 2),
+                "stretch": round(stretch, 3),
+                "drift_ms": round(abs(float(dub_s) - src_s) * 1000.0, 1),
+                "off": abs(stretch - 1.0) > _SYNC_DRIFT_TOL,
+                "text": text_by_idx.get(idx, "")[:160],
+            })
+        except (TypeError, ValueError):
+            continue
+    return {
+        "job_id": job_id,
+        "rows": rows,
+        "tolerance": _SYNC_DRIFT_TOL,
+        "off_count": sum(1 for r in rows if r["off"]),
+        "sync_overrides": job.get("sync_overrides") or {},
+    }
+
+
 @app.post("/api/dub/{job_id}/sync_plan")
 async def set_sync_plan(job_id: str, request: Request):
     """Store the sync-fit plan: per-segment stretch/pad overrides + auto-fit.
