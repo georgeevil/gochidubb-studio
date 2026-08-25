@@ -759,9 +759,10 @@ function renderReview(d) {
         The design's queue also carries DMCA and copyright claims. Those are
         not detected here and are not listed as clear: a claim queue needs
         somewhere for a claim to arrive, and this server has no such intake.
-        Voice-clone items are a list to look at, not an accusation — nothing
-        in this build stores a consent attestation alongside an uploaded
-        voice sample, so there is nothing to check them against.
+        Voice-clone items are a list to look at, not an accusation — a clone
+        that carries a consent attestation (recorded at preset upload, or per
+        speaker via the review workbench) is checked and not listed; only
+        unattested clones appear here.
       </div>
     </div>`;
 }

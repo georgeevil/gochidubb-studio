@@ -372,7 +372,9 @@ def test_glossary_term_requires_its_fields(glossary):
     """
     r = _post(glossary)
     assert r.status_code == 400
-    assert r.json()["error"] == "term and translation are required"
+    assert r.json()["error"] == (
+        "term and a translation (or a 'say' respelling) are required"
+    )
 
 
 @pytest.mark.parametrize("field", ["term", "translation"])
