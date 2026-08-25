@@ -118,8 +118,9 @@ async def gochidubb_dub(
         keep_bg: Preserve background music under the new dub (default: on).
         auto_denoise: Denoise the voice reference before cloning.
         context_hint: Free-text hint for translator (e.g. "tech podcast").
-        wizard_mode: 'auto', or 'review_translation'/'review_transcript' to
-            pause the job for human review at that checkpoint.
+        wizard_mode: 'auto', or one of 'review_translation',
+            'review_transcript', 'review_voices' — pause the job for human
+            review at that checkpoint.
         mode: 'dub' (full pipeline) or 'reupload' (download + remux only —
             for music videos where dubbing makes no sense).
         scheduled_at: unix epoch seconds; a future timestamp parks the job
@@ -341,6 +342,62 @@ async def gochidubb_rebuild_showcase(batch_id: str, wait: bool = False) -> dict:
         res["status"] = info.get("status")
         res["url"] = c.showcase_url(batch_id)
     return res
+
+
+@mcp.tool()
+async def gochidubb_get_voice_casting(job_id: str) -> dict:
+    """Who speaks in this job, how each speaker is currently cast, and the
+    voices available to cast them in.
+
+    Available once the job has been translated. Returns per-speaker line
+    counts and share of the dialogue, so you can tell the lead from a
+    two-line walk-on before assigning anything.
+    """
+    c = await _get_client()
+    return await c.get_voice_casting(job_id)
+
+
+@mcp.tool()
+async def gochidubb_set_voice_casting(job_id: str, cast: dict) -> dict:
+    """Assign one voice per speaker: {"SPEAKER_00": "male_deep"}.
+
+    A voice is a built-in preset id, a library voice ("file:<name>"), a
+    free-text design ("design:gravelly old sailor"), or "source" to keep the
+    voice cloned from the video. Any speaker left out of the map keeps their
+    own voice — omission is not a reset.
+
+    Prefer this over the whole-job `voice_preset` on any video with more than
+    one speaker: a preset applies one voice to everybody and discards the
+    references diarization extracted.
+    """
+    c = await _get_client()
+    return await c.set_voice_casting(job_id, cast)
+
+
+@mcp.tool()
+async def gochidubb_preview_voice_casting(
+    job_id: str,
+    cast: Optional[dict] = None,
+    per_speaker: int = 1,
+) -> dict:
+    """Synthesize a real line per speaker in a proposed cast and return the
+    audio URLs. Writes nothing to the dub.
+
+    Slow — it drives the TTS engine — but a rounding error next to the
+    synthesis stage it lets you avoid re-running (a measured 12.25 hours for
+    1602 segments). Worth doing before continuing a job parked at the voice
+    review gate.
+    """
+    c = await _get_client()
+    return await c.preview_voice_casting(job_id, cast, per_speaker=per_speaker)
+
+
+@mcp.tool()
+async def gochidubb_continue_job(job_id: str) -> dict:
+    """Resume a job parked at a wizard review gate (awaiting_voice_review,
+    awaiting_translation_review, awaiting_transcript_review)."""
+    c = await _get_client()
+    return await c.continue_job(job_id)
 
 
 @mcp.tool()

@@ -9,8 +9,10 @@ bootstrap block first.
 import logging
 import os
 import random as _random
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import types
@@ -860,6 +862,97 @@ class VoxCPMSynthesizer(BaseTTSEngine):
             self._sample_rate = 48000
 
         return segments
+
+    def design_reference(self, style: str, output_path: str,
+                         voice_seed: Optional[int] = None,
+                         target_lang: str = "en",
+                         sample_text: str = "") -> Optional[str]:
+        """Render ONE clip in a designed voice, to be cloned from thereafter.
+
+        Voice design is not timbre-stable. A fixed seed pins the RNG stream,
+        not the voice: the sampled speaker latent is conditioned on the text
+        too, so the same style and the same seed on two different lines give
+        two different people. Measured on a 1602-segment dub that held seed,
+        tier and every inference parameter constant across the whole run: f0
+        across 40 same-speaker segments ranged 85-312 Hz.
+
+        Cloning, by contrast, IS stable — that is the mechanism behind the
+        `auto` path, where every segment of a speaker is cloned from one
+        extracted reference. So we take one design draw, keep the audio, and
+        clone from it for the rest of the job. One voice, by construction,
+        instead of one draw per line.
+
+        Returns the path written, or None if generation failed (callers are
+        expected to fall back to per-segment design rather than abort).
+        """
+        style = (style or "").strip().strip("()")
+        if not style:
+            return None
+
+        text = sample_text or DESIGN_SAMPLE_TEXT.get(
+            target_lang, DESIGN_SAMPLE_TEXT["en"])
+        out_dir = os.path.dirname(os.path.abspath(output_path)) or "."
+        os.makedirs(out_dir, exist_ok=True)
+
+        with tempfile.TemporaryDirectory(prefix="gochidubb_design_") as tmp:
+            # Goes through the ordinary segment path, which means the worker
+            # subprocess: the model loads and unloads outside this process,
+            # exactly as it does for a real stage. `speaker_refs` is empty and
+            # the text carries the "(style)" prefix, which is what makes
+            # tts_worker take its voice_design branch — single tier, no
+            # seed-mutating retries.
+            done = self.synthesize_segments(
+                [{"idx": 0, "translated_text": f"({style}){text}",
+                  "speaker": "DESIGN"}],
+                tmp,
+                speaker_refs={}, speaker_transcripts={},
+                voice_seed=voice_seed,
+                tts_speed="quality",
+                is_cross_lingual=False,
+                target_lang=target_lang,
+            )
+            made = (done or [{}])[0].get("audio_path")
+            if not made or not os.path.exists(made):
+                log.warning(f"[design] Could not render a reference for {style!r}")
+                return None
+            shutil.copy2(made, output_path)
+
+        log.info(f"[design] Rendered voice reference for {style!r} "
+                 f"(seed={voice_seed}, lang={target_lang}) -> "
+                 f"{os.path.basename(output_path)}")
+        return output_path
+
+
+# Neutral, punctuation-rich passage read once to fix a designed voice. Long
+# enough to give the cloner something to work with (VoxCPM's own guidance is
+# a few seconds minimum) and deliberately dull, so nothing in the wording
+# colours the timbre. Localised where we have a translation because the draw
+# is better when the model designs the voice on the phonetics it will go on
+# to speak; anything else falls back to English, which still clones fine —
+# cross-lingual dubs already clone English source refs into other languages.
+DESIGN_SAMPLE_TEXT = {
+    "en": ("Let me explain this simply. There are three points to cover, "
+           "and each one follows from the last. Once you see how they fit "
+           "together, the rest of it is straightforward."),
+    "ru": ("Позвольте объяснить просто. Есть три момента, которые нужно "
+           "разобрать, и каждый следует из предыдущего. Как только вы "
+           "поймёте, как они связаны, всё остальное станет понятным."),
+    "es": ("Déjame explicarlo de forma sencilla. Hay tres puntos que cubrir, "
+           "y cada uno se deriva del anterior. Una vez que veas cómo encajan, "
+           "el resto es bastante simple."),
+    "de": ("Lassen Sie es mich einfach erklären. Es gibt drei Punkte zu "
+           "behandeln, und jeder folgt aus dem vorherigen. Sobald Sie sehen, "
+           "wie sie zusammenpassen, ist der Rest unkompliziert."),
+    "fr": ("Laissez-moi vous expliquer simplement. Il y a trois points à "
+           "couvrir, et chacun découle du précédent. Une fois que vous voyez "
+           "comment ils s'assemblent, le reste est simple."),
+    "pt": ("Deixe-me explicar de forma simples. Há três pontos a abordar, "
+           "e cada um decorre do anterior. Assim que perceber como se "
+           "encaixam, o resto é simples."),
+    "it": ("Lascia che te lo spieghi semplicemente. Ci sono tre punti da "
+           "trattare, e ciascuno deriva dal precedente. Una volta capito "
+           "come si incastrano, il resto è semplice."),
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════
