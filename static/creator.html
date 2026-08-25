@@ -147,6 +147,9 @@ const state = {
   // whether the panel is open. Fetched on demand — nobody needs them until
   // something has already gone wrong.
   rescue: { open: false, guides: null, platform: "", busy: false, err: "" },
+  // Per-video drill-down: which files each language produced (fetched once
+  // per job), the background level being edited, and any in-flight action.
+  detail: { files: {}, bg: {}, busy: "", err: "", note: "", addLangs: [] },
   model: "",
   wizard: null,
   review: null,
@@ -467,6 +470,142 @@ function mobileTabsHTML() {
 // Screen 1 — Creator home
 // ═══════════════════════════════════════════════════════════════════
 
+// ═══════════════════════════════════════════════════════════════════
+// Per-video drill-down (#/video/<key>)
+// ═══════════════════════════════════════════════════════════════════
+// The videos page is a summary: one card per video, a chip per language,
+// Watch and Download. Everything past that — the subtitles, the separated
+// music bed, adding a language later, redoing one step instead of the whole
+// dub — existed only as API routes or Pro-mode panels. This is the screen
+// that spends them.
+//
+// The background level is here rather than in settings on purpose. It is a
+// property of one dub, not a preference, and re-running the final mux takes
+// seconds — so "the music is too quiet" is a slider and a button, not a
+// global change that only affects the next video.
+
+function videoHTML() {
+  const g = groups().find(x => x.key === state.route.param);
+  if (!g) {
+    return `<div class="shell"><div class="card empty">
+      <p><strong>That video isn't here.</strong></p>
+      <a class="btn" href="#/">← Back to your videos</a></div></div>`;
+  }
+  const d = state.detail;
+  const sorted = [...g.jobs].sort((a, b) =>
+    langName(a.target_lang).localeCompare(langName(b.target_lang)));
+  const have = new Set(g.jobs.map(j => j.target_lang));
+  const canAdd = state.languages.filter(c => !have.has(c));
+
+  return `<div class="shell">
+    <div class="wizbar" style="padding-left:0">
+      <a class="btn btn--ghost" href="#/"><span aria-hidden="true">←</span> Your videos</a>
+      <span style="font-weight:600;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
+        ${esc(groupTitle(g))}</span>
+    </div>
+
+    ${d.note ? `<p class="banner">${esc(d.note)}</p>` : ""}
+    ${d.err ? `<p class="banner banner--bad">${esc(d.err)}</p>` : ""}
+
+    <div class="section-head"><h2>Languages</h2></div>
+    ${sorted.map(j => videoLangHTML(j)).join("")}
+
+    <div class="section-head"><h2>Add another language</h2></div>
+    <div class="card">
+      <p class="muted" style="font-size:12.5px;margin:0 0 10px">
+        Re-uses the download and the transcript from this video, so a second
+        language costs the translation and the recording only.
+      </p>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px">
+        ${canAdd.slice(0, 14).map(c => `
+          <button type="button" class="langchip" data-act="detail-lang" data-c="${esc(c)}"
+                  ${d.addLangs.includes(c) ? 'aria-pressed="true"' : ""}
+            >${esc(langName(c))}</button>`).join("")}
+      </div>
+      <button type="button" class="btn btn--primary" data-act="detail-add"
+              data-id="${esc(g.jobs[0].id)}" ${d.addLangs.length && !d.busy ? "" : "disabled"}>
+        ${d.busy === "add" ? "Starting…"
+          : d.addLangs.length ? `Dub into ${d.addLangs.length} more` : "Pick a language"}
+      </button>
+    </div>
+  </div>`;
+}
+
+function videoLangHTML(j) {
+  const d = state.detail;
+  const files = d.files[j.id];
+  const k = jobState(j);
+  const done = k === "done";
+  const bg = d.bg[j.id];
+  const bgVal = bg === undefined ? 0.5 : bg;
+
+  return `<div class="card" style="margin-bottom:10px">
+    <div class="spread" style="align-items:center;flex-wrap:wrap;gap:8px">
+      ${langChip(j)}
+      <span style="flex:1"></span>
+      ${done && j.output_url
+        ? `<a class="btn btn--sm" href="${esc(j.output_url)}" target="_blank" rel="noopener">Watch</a>`
+        : ""}
+      ${k === "attn" ? `<a class="btn btn--primary btn--sm" href="#/review/${esc(j.id)}">Review</a>` : ""}
+      ${k === "fail" ? `<a class="btn btn--sm" href="#/review/${esc(j.id)}">See what happened</a>` : ""}
+      <button type="button" class="btn btn--sm" data-act="detail-files" data-id="${esc(j.id)}">
+        ${files ? "Hide files" : "Files & options"}
+      </button>
+    </div>
+
+    ${files ? `
+      <div style="margin-top:12px">
+        <p class="caps" style="margin:0 0 6px">Download</p>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          ${files.files.length
+            ? files.files.map(f => `
+                <a class="btn btn--sm" href="${esc(f.url)}" download
+                   aria-label="Download ${esc(f.label)} for ${esc(langName(j.target_lang))}"
+                  >${esc(f.label)} <span class="muted">${esc(f.size_label)}</span></a>`).join("")
+            : `<p class="muted" style="font-size:12.5px">Nothing produced yet.</p>`}
+        </div>
+        ${!files.files.some(f => f.key === "background")
+          ? `<p class="muted" style="font-size:12px;margin-top:8px">
+               ${files.kept_background
+                 ? "No separate music track — this video's audio wasn't split."
+                 : "Background was turned off for this dub, so there is no separate track."}
+             </p>` : ""}
+
+        ${done ? `
+          <p class="caps" style="margin:16px 0 6px">Music &amp; effects level</p>
+          <p class="muted" style="font-size:12px;margin:0 0 8px;line-height:1.6">
+            How loud the background sits when nobody is speaking. Changing it
+            re-does the final mix only — seconds, and the voices are untouched.
+          </p>
+          <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+            <input type="range" min="0" max="1" step="0.05" value="${bgVal}"
+                   data-act="detail-bg" data-id="${esc(j.id)}" style="flex:1;min-width:180px">
+            <span class="mono" style="font-size:12px;min-width:3ch">${Math.round(bgVal * 100)}%</span>
+            <button type="button" class="btn btn--primary btn--sm"
+                    data-act="detail-remix" data-id="${esc(j.id)}" ${d.busy ? "disabled" : ""}>
+              ${d.busy === "remix:" + j.id ? "Re-mixing…" : "Apply"}
+            </button>
+          </div>
+
+          <p class="caps" style="margin:16px 0 6px">Redo a step</p>
+          <div style="display:flex;gap:6px;flex-wrap:wrap">
+            <button type="button" class="btn btn--sm" data-act="detail-stage"
+                    data-id="${esc(j.id)}" data-stage="translate" ${d.busy ? "disabled" : ""}>
+              Translate again
+            </button>
+            <button type="button" class="btn btn--sm" data-act="detail-stage"
+                    data-id="${esc(j.id)}" data-stage="tts" ${d.busy ? "disabled" : ""}>
+              Record the voices again
+            </button>
+          </div>
+          <p class="muted" style="font-size:12px;margin-top:8px;line-height:1.6">
+            Each one picks up from the step before it — the video is not
+            downloaded again and the transcript is not redone.
+          </p>` : ""}
+      </div>` : ""}
+  </div>`;
+}
+
 function homeHTML() {
   if (state.loading) return `<div class="shell"><p class="muted">Loading your videos…</p></div>`;
   // An empty job list because the server is down is not the same as an empty
@@ -660,6 +799,8 @@ function videoCardHTML(g) {
         ${g.failed ? `<span class="chip chip--bad"><span class="chip__glyph" aria-hidden="true">✕</span>${g.failed} didn't finish</span>` : ""}
         ${g.failedJob ? `<a class="btn btn--sm" href="#/review/${esc(g.failedJob.id)}"
              aria-label="See what went wrong with ${esc(groupTitle(g))}">See what happened</a>` : ""}
+        <a class="btn btn--sm" href="#/video/${esc(g.key)}"
+           aria-label="Open ${esc(groupTitle(g))}">Files &amp; languages</a>
       </div>
       ${g.failReason ? `<p class="muted-3" style="font-size:11.5px">${esc(g.failReason)}</p>` : ""}
     </div>
@@ -1564,6 +1705,7 @@ function render() {
   let body = "", sticky = "";
   if (r.name === "new") { body = wizardHTML(); sticky = wizardStickyHTML(); }
   else if (r.name === "review") { body = reviewHTML(); sticky = reviewStickyHTML(); }
+  else if (r.name === "video") { body = videoHTML(); }
   else if (r.name === "voices") { body = voicesHTML(); }
   else if (r.name === "usage") { body = usageHTML(); }
   else {
@@ -1584,6 +1726,7 @@ function parseHash() {
   if (!parts.length) return { name: "home", param: "" };
   if (parts[0] === "new") return { name: "new", param: "" };
   if (parts[0] === "review") return { name: "review", param: parts[1] || "" };
+  if (parts[0] === "video") return { name: "video", param: parts[1] || "" };
   if (parts[0] === "voices") return { name: "voices", param: "" };
   if (parts[0] === "usage") return { name: "usage", param: "" };
   return { name: "home", param: "" };
@@ -1610,10 +1753,10 @@ function onRoute() {
 // One delegated listener per event type — no re-binding after a render
 // ═══════════════════════════════════════════════════════════════════
 
-document.addEventListener("click", async ev => {
-  const t = ev.target.closest("[data-act]");
-  if (!t || t.tagName === "FORM") return;
-  const act = t.dataset.act;
+// One handler for every data-act, reached from the click listener below and
+// from the change listener for controls that never fire click with a value
+// on them (a file input has no files until one is chosen).
+async function onAct(t, act) {
   const w = state.wizard, r = state.review;
 
   if (act === "filter") { state.filter = t.dataset.v; render(); return; }
@@ -1638,7 +1781,86 @@ document.addEventListener("click", async ev => {
 
   if (act === "rescue-os") { state.rescue.platform = t.dataset.v; render(); return; }
 
+  // ── Per-video drill-down ──
+  if (act === "detail-files") {
+    const d = state.detail, id = t.dataset.id;
+    if (d.files[id]) { delete d.files[id]; render(); return; }
+    d.err = ""; render();
+    try {
+      d.files[id] = await api(`/api/dub/${encodeURIComponent(id)}/files`);
+    } catch (e) {
+      d.err = e.message || "Couldn't list the files.";
+    }
+    render();
+    return;
+  }
+
+  if (act === "detail-remix") {
+    const d = state.detail, id = t.dataset.id;
+    const level = d.bg[id] === undefined ? 0.5 : d.bg[id];
+    d.busy = "remix:" + id; d.err = ""; d.note = ""; render();
+    try {
+      const fd = new FormData();
+      // Only the final mux re-runs: the dub track and every stage before it
+      // are read from their checkpoints untouched.
+      fd.append("overrides", JSON.stringify({ bg_volume: level }));
+      await api(`/api/dub/${encodeURIComponent(id)}/retry_stage/merge`,
+                { method: "POST", body: fd });
+      d.note = "Re-mixing — the video will refresh here when it's done.";
+      await loadJobs();
+    } catch (e) {
+      d.err = e.message || "Couldn't re-mix that.";
+    }
+    d.busy = ""; render();
+    return;
+  }
+
+  if (act === "detail-stage") {
+    const d = state.detail, id = t.dataset.id, stage = t.dataset.stage;
+    d.busy = "stage:" + id; d.err = ""; d.note = ""; render();
+    try {
+      await api(`/api/dub/${encodeURIComponent(id)}/retry_stage/${encodeURIComponent(stage)}`,
+                { method: "POST", body: new FormData() });
+      d.note = stage === "tts" ? "Recording the voices again." : "Translating again.";
+      await loadJobs();
+    } catch (e) {
+      d.err = e.message || "Couldn't start that.";
+    }
+    d.busy = ""; render();
+    return;
+  }
+
+  if (act === "detail-lang") {
+    const d = state.detail, c = t.dataset.c;
+    const i = d.addLangs.indexOf(c);
+    if (i >= 0) d.addLangs.splice(i, 1); else d.addLangs.push(c);
+    render();
+    return;
+  }
+
+  if (act === "detail-add") {
+    const d = state.detail;
+    if (!d.addLangs.length) return;
+    d.busy = "add"; d.err = ""; d.note = ""; render();
+    try {
+      const fd = new FormData();
+      fd.append("target_langs", d.addLangs.join(","));
+      fd.append("mode", "compare");
+      await api(`/api/job/${encodeURIComponent(t.dataset.id)}/redub`,
+                { method: "POST", body: fd });
+      d.note = `Started ${d.addLangs.length} more language${d.addLangs.length === 1 ? "" : "s"}.`;
+      d.addLangs = [];
+      await loadJobs();
+    } catch (e) {
+      d.err = e.message || "Couldn't start those.";
+    }
+    d.busy = ""; render();
+    return;
+  }
+
   if (act === "rescue-file") {
+    // Reached from the change listener below — a file input has no files on
+    // click, only once one has been chosen.
     const file = t.files && t.files[0];
     if (!file) return;
     const rs = state.rescue;
@@ -1754,6 +1976,12 @@ document.addEventListener("click", async ev => {
     recordIt();
     return;
   }
+}
+
+document.addEventListener("click", async ev => {
+  const t = ev.target.closest("[data-act]");
+  if (!t || t.tagName === "FORM") return;
+  await onAct(t, t.dataset.act);
 });
 
 document.addEventListener("submit", ev => {
@@ -1794,12 +2022,28 @@ document.addEventListener("change", async ev => {
     w.preset = "";
     render();
   }
+  if (t.dataset.act === "rescue-file") {
+    // Same handler as every other action, reached from the event a file
+    // input actually fires.
+    await onAct(t, "rescue-file");
+  }
 });
 
 // Keep the URL field's value without re-rendering on every keystroke —
 // a render here would blow away the caret.
 document.addEventListener("input", ev => {
   if (ev.target.id === "src" && state.wizard) state.wizard.url = ev.target.value;
+
+  // The background slider updates its own readout rather than re-rendering:
+  // a render mid-drag replaces the input and the thumb stops following the
+  // pointer. The value is read back at Apply time from state.
+  const t = ev.target.closest && ev.target.closest('[data-act="detail-bg"]');
+  if (t) {
+    const v = Number(t.value);
+    state.detail.bg[t.dataset.id] = v;
+    const out = t.parentElement && t.parentElement.querySelector(".mono");
+    if (out) out.textContent = `${Math.round(v * 100)}%`;
+  }
 });
 
 // Drag-and-drop onto the wizard's drop zone.
