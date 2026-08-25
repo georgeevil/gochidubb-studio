@@ -104,8 +104,12 @@ def _parse_loudnorm_stderr(text: str) -> dict:
         return {}
 
 
-def _normalize_loudness_inplace(wav_path: str):
+def _normalize_loudness_inplace(wav_path: str, target_i=None, target_tp=None):
     """Apply ffmpeg loudnorm + anti-screech chain to wav_path in place.
+
+    `target_i`/`target_tp` override the integrated-loudness / true-peak
+    targets; None falls back to the module constants LN_I/LN_TP, so
+    standalone callers keep the historic behaviour unchanged.
 
     VoxCPM occasionally produces brief inter-segment pops/clicks and spiky
     transients that sound like "screech" or "digital crunch" to the ear.
@@ -124,7 +128,9 @@ def _normalize_loudness_inplace(wav_path: str):
     Returns the measurement dict on success ({} when the stderr block could
     not be parsed — non-fatal) or None when normalization itself failed.
     """
-    ln = f"loudnorm=I={LN_I}:TP={LN_TP}:LRA={LN_LRA}:print_format=json"
+    ti = LN_I if target_i is None else float(target_i)
+    tp = LN_TP if target_tp is None else float(target_tp)
+    ln = f"loudnorm=I={ti}:TP={tp}:LRA={LN_LRA}:print_format=json"
     try:
         tmp = wav_path + ".ln.wav"
         # Filter chain: declick → DC-block/rumble-cut → limit → normalize
@@ -243,7 +249,8 @@ def _max_stretch_setting() -> float:
 
 
 def assemble_dubbed_audio(segments, total_duration, output_path,
-                          sample_rate=48000, apply_loudnorm=True):
+                          sample_rate=48000, apply_loudnorm=True,
+                          loudness_target=None, loudness_true_peak=None):
     """Place each TTS segment at its original timestamp (numpy-based mix).
 
     Handling of overlong TTS segments (Russian/Spanish are often 20-30%
@@ -253,6 +260,9 @@ def assemble_dubbed_audio(segments, total_duration, output_path,
       segment's slot — slight overlap sounds FAR better than the chipmunk
       effect from aggressive pitch-shift.
     - Total audio may exceed total_duration; caller should NOT use -shortest.
+
+    `loudness_target`/`loudness_true_peak` are handed to
+    _normalize_loudness_inplace (None = the module defaults LN_I/LN_TP).
 
     Returns an info dict: {"output_path", "valid_count", "stretched_count",
     "loudnorm"} — loudnorm is the ffmpeg measurement parsed from
@@ -419,7 +429,8 @@ def assemble_dubbed_audio(segments, total_duration, output_path,
     # Global loudness normalization so YouTube/TV playback matches broadcast levels
     loudnorm_info = None
     if apply_loudnorm and valid_count > 0:
-        loudnorm_info = _normalize_loudness_inplace(output_path)
+        loudnorm_info = _normalize_loudness_inplace(
+            output_path, target_i=loudness_target, target_tp=loudness_true_peak)
 
     return {
         "output_path": output_path,

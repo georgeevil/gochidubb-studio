@@ -241,4 +241,8 @@ def payload_for_job(job: Dict[str, Any]) -> Dict[str, Any]:
         # the same verdicts the UI shows, so an agent can act on the payload
         # without a second round trip.
         "quality_gate": job.get("quality_gate"),
+        # Which review gate is holding the job when status is awaiting_* —
+        # the receiver of a job.awaiting_review event needs to know *what*
+        # to review without fetching the job.
+        "pending_gate": job.get("pending_gate"),
     }

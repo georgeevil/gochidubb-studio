@@ -77,6 +77,10 @@ const S_ATTN = new Set([
   "awaiting_translation_review",
   "awaiting_transcript_review",
   "awaiting_voice_review",
+  // Creator can't arm these two, but a shared server can — a job parked at
+  // an unknown status must not be drawn as though the machine were working.
+  "awaiting_subtitle_review",
+  "awaiting_final_qc",
 ]);
 const needsReviewStatus = s => S_ATTN.has(s);
 const S_FAIL = new Set(["error", "cancelled", "interrupted"]);

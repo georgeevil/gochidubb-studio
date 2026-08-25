@@ -213,7 +213,8 @@ from app.db import init_db, save_job_sync, load_all_jobs, delete_job_db
 from app import (logbuf, artifact_store, reuse_runtime, reuse as app_reuse,
                  activity, apikeys as app_apikeys, webhooks as app_webhooks,
                  billing as app_billing, audit as app_audit,
-                 estimate as app_estimate, admin as app_admin)
+                 estimate as app_estimate, admin as app_admin,
+                 review_gates as app_review_gates)
 
 
 # Force UTF-8 stdout for foreign-language transcripts on Windows cp1252 consoles
@@ -1550,6 +1551,10 @@ async def _resolve_casting(cast: dict, speakers, ctx: dict, job_id: str,
 async def lifespan(app: FastAPI):
     # Init SQLite store (creates table + migrates legacy JSON files)
     init_db(BASE / "gochidubb.db")
+    # Activity-feed persistence (hasattr: tolerate an app/activity.py from
+    # before attach_store existed — the feed then stays in-memory only).
+    if hasattr(activity, "attach_store"):
+        activity.attach_store(BASE / "gochidubb.db")
     # Beta stage-reuse store, same file as the job store.
     artifact_store.init_store(BASE / "gochidubb.db")
     load_jobs_from_disk()
@@ -1729,13 +1734,19 @@ def _tool_for_path(path: str) -> str:
 
 _MAIN_LOOP = None
 
-# Job status -> the webhook event it corresponds to. Only these three fire;
-# they are the ones the design names.
+# Job status -> the webhook event it corresponds to. Only these three events
+# fire; they are the ones the design names. Every awaiting_* gate status maps
+# to job.awaiting_review — awaiting_transcript_review was missing from this
+# table for as long as it existed, so the transcript gate silently fired no
+# webhook at all.
 _WEBHOOK_EVENT_FOR_STATUS = {
     "complete": "job.completed",
     "error": "job.failed",
+    "awaiting_transcript_review": "job.awaiting_review",
     "awaiting_translation_review": "job.awaiting_review",
     "awaiting_voice_review": "job.awaiting_review",
+    "awaiting_subtitle_review": "job.awaiting_review",
+    "awaiting_final_qc": "job.awaiting_review",
 }
 
 
@@ -2959,6 +2970,8 @@ async def _stage_assemble(job, work, ctx, update, perf):
         assemble_dubbed_audio,
         segments, ctx["duration"], dubbed_wav,
         ctx.get("sample_rate", 48000), apply_loudnorm=True,
+        loudness_target=getattr(cfg, "loudness_target", None),
+        loudness_true_peak=getattr(cfg, "loudness_true_peak", None),
     )
     _save_placements(work, segments)
     ctx["dubbed_wav"] = dubbed_wav
@@ -3015,14 +3028,16 @@ async def _stage_merge(job, work, ctx, update, perf):
         perf["mp4_mb"] = round(os.path.getsize(output_mp4) / 1024 / 1024, 1)
     except OSError:
         pass
+    # No status here: the driver owns the complete transition (a final_qc
+    # gate must be able to intercept before job.completed fires — see the
+    # tail of run_pipeline_stages). This stage only publishes its artifacts.
     update(
-        status="complete",
         progress=100,
         output_url=f"/outputs/{job['id']}/dubbed_video.mp4?v={int(time.time())}",
         completed_at=time.time(),
-        step_detail="Done!",
+        step_detail="Rendered — finishing up",
     )
-    log.info(f"Pipeline complete: {output_mp4}")
+    log.info(f"Pipeline render complete: {output_mp4}")
 
 
 async def _finalize_reupload(job, work, ctx, update):
@@ -3088,45 +3103,130 @@ STAGE_HANDLERS = {
 # ─────────────────────────────────────────────────────────────
 # Pipeline driver
 # ─────────────────────────────────────────────────────────────
-def _wizard_pause_after(stage_id: str, ctx: dict) -> Optional[tuple]:
-    """Return (status, detail, checkpoint) if the wizard pauses after a stage."""
-    mode = ctx.get("wizard_mode", "auto")
-    if stage_id == "diarize" and mode == "review_transcript":
-        return ("awaiting_transcript_review",
-                "Review transcription — edit or approve to continue",
-                "transcription_done")
-    if stage_id == "translate" and mode == "review_translation":
-        return ("awaiting_translation_review",
-                "Review translation — edit, retranslate, or approve to continue",
-                "translation_done")
-    if stage_id == "translate" and mode == "review_voices":
-        # After translate, not after diarize, even though the speaker
-        # references exist by then. Casting is only worth reviewing if you can
-        # hear it, and a preview has to speak the lines the dub will actually
-        # speak — at the diarize gate the text is still in the source
-        # language, so a cross-lingual preview would demonstrate the wrong
-        # phonetics. Translation is minutes; the stage this gate protects is
-        # hours (a measured 12.25h for 1602 segments), so the gate still sits
-        # in front of essentially all of the cost.
-        return ("awaiting_voice_review",
-                "Cast the voices — assign one per speaker, preview, then continue",
-                "translation_done")
-    return None
+# One evaluator behind every human pause. The gate model (which gates exist,
+# which stage boundary arms each one, what status/checkpoint each parks at,
+# how off/on/flagged_only resolve) lives in app/review_gates.py; this section
+# adapts it to the driver — findings computation, the legacy quality gate,
+# and the pause tuple the loop consumes.
+#
+# Gates are deliberately placed *before* the expensive stage each one
+# protects: transcription is checked before a translator is paid for it,
+# translation before the GPU synthesizes it. A gate after the last stage can
+# only ask for a retry; a gate before one can save the work entirely.
 
-
-# Which stage's gate runs after which pipeline stage, and where it parks.
-# Deliberately placed *before* the expensive stage each one protects:
-# transcription is checked before a translator is paid for it, translation
-# before the GPU synthesizes it. A gate after the last stage can only ask for
-# a retry; a gate before one can save the work entirely.
-_GATE_AFTER_STAGE = {
-    "diarize": ("asr", "awaiting_transcript_review", "transcription_done"),
-    "translate": ("translation", "awaiting_translation_review", "translation_done"),
+# What the pause status line tells the user, per gate.
+_GATE_DETAILS = {
+    "transcript": "Review transcription — edit or approve to continue",
+    "translation": ("Review translation — edit, retranslate, or approve "
+                    "to continue"),
+    "voice_cast": ("Cast the voices — assign one per speaker, preview, "
+                   "then continue"),
+    "subtitles": "Review subtitles — edit cues or approve to continue",
+    "final_qc": "Final QC — review the checklist, then approve to deliver",
 }
 
+# The legacy score-driven quality gate checks one quality stage per boundary.
+_LEGACY_QUALITY_STAGE = {"diarize": "asr", "translate": "translation"}
 
-def _quality_gate_after(stage_id: str, ctx: dict, job: dict,
-                        job_id: str) -> Optional[tuple]:
+
+def _resolved_review_gates(explicit: Optional[dict], wizard_mode: Optional[str],
+                           job: dict) -> dict:
+    """Resolve a job's effective gate set (see review_gates.resolve_gates).
+
+    Showcase siblings force the subtitle and final_qc gates off regardless of
+    what was asked: _maybe_assemble_showcase fires when the last sibling
+    *completes*, and one sibling parked at QC would stall the whole reel.
+    quick_test batches gate normally — they are Pro's main fan-out.
+    """
+    gates = app_review_gates.resolve_gates(
+        explicit, wizard_mode, app_review_gates.defaults_from_cfg(cfg))
+    if (job or {}).get("batch_kind") == "showcase":
+        gates["subtitles"] = "off"
+        gates["final_qc"] = "off"
+    return gates
+
+
+def _parse_review_gates_form(raw: str):
+    """(explicit dict | None, error string | None) from a form field.
+
+    Empty string means "not sent" — wizard_mode/cfg decide. The JSON is
+    validated here so a submit with a typo'd gate name is a 400 at submit
+    time, not a silently unarmed gate discovered hours into a dub.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None
+    try:
+        explicit = json.loads(raw)
+        return app_review_gates.sanitize_explicit(explicit), None
+    except (ValueError, TypeError) as e:
+        return None, f"Bad review_gates: {e}"
+
+
+def _gate_findings(gate_name: str, ctx: dict, job: dict,
+                   job_id: str) -> Optional[int]:
+    """Findings count for one flagged_only gate; None when uncomputable.
+
+    None makes first_pending() pause — a review the user explicitly asked
+    for must not be skipped because its check crashed (see the fail-safe
+    note in app/review_gates.py).
+    """
+    segments = ctx.get("segments") or []
+    target_lang = ctx.get("target_lang") or job.get("target_lang") or ""
+    source_lang = ctx.get("effective_src") or ""
+    try:
+        if gate_name == "transcript":
+            from pipeline.quality import full_report, gate
+            result = gate(full_report(segments, target_lang=target_lang,
+                                      source_lang=source_lang), "asr")
+            return 0 if result["pass"] else max(len(result["reasons"]), 1)
+
+        if gate_name == "translation":
+            from pipeline.quality import full_report, gate
+            n = len(flag_segments(
+                segments, target_lang=target_lang, source_lang=source_lang,
+                glossary=_read_user_glossary(), max_flags=20))
+            result = gate(full_report(segments, target_lang=target_lang,
+                                      source_lang=source_lang), "translation")
+            if not result["pass"]:
+                n += max(len(result["reasons"]), 1)
+            return n
+
+        if gate_name == "voice_cast":
+            speakers = {s.get("speaker") for s in segments if s.get("speaker")}
+            cast = ctx.get("speaker_voice_map") or {}
+            return 1 if len(speakers) > 1 and not cast else 0
+
+        if gate_name == "subtitles":
+            # pipeline/subtitles.py may not exist yet (it lands with the
+            # subtitle workbench task) — ImportError falls through to the
+            # fail-safe None below, exactly like any other compute failure.
+            from pipeline import subtitles as _subs
+            cues = _subs.build_cues(segments, job.get("subtitle_overrides"))
+            return len(_subs.validate_cues(cues, _subtitle_limits()))
+
+        if gate_name == "final_qc":
+            return _build_qc_checklist(job_id)["warn_count"]
+    except Exception as e:
+        log.warning(f"[gate] {gate_name} findings uncomputable ({e}) — "
+                    f"pausing for review instead of shipping unreviewed")
+        return None
+    return 0
+
+
+def _subtitle_limits() -> dict:
+    """Subtitle validator limits from cfg (fields land with the subtitle
+    task; getattr defaults mirror pipeline.subtitles.DEFAULT_LIMITS)."""
+    return {
+        "max_chars_per_line": int(getattr(cfg, "subtitle_max_chars_per_line", 42)),
+        "max_lines": int(getattr(cfg, "subtitle_max_lines", 2)),
+        "max_cps": float(getattr(cfg, "subtitle_max_cps", 17.0)),
+        "min_gap_ms": int(getattr(cfg, "subtitle_min_gap_ms", 120)),
+    }
+
+
+def _legacy_quality_pause(stage_id: str, ctx: dict, job: dict,
+                          job_id: str) -> Optional[tuple]:
     """Pause the job when this stage's output is not worth building on.
 
     Off unless `quality_gate` is enabled, and never fatal: a scorer that
@@ -3140,10 +3240,9 @@ def _quality_gate_after(stage_id: str, ctx: dict, job: dict,
     # degrade to "gate off" rather than failing the whole pipeline.
     if not getattr(cfg, "quality_gate", False):
         return None
-    mapping = _GATE_AFTER_STAGE.get(stage_id)
-    if not mapping:
+    stage_name = _LEGACY_QUALITY_STAGE.get(stage_id)
+    if not stage_name:
         return None
-    stage_name, status, cp_name = mapping
     try:
         from pipeline.quality import full_report, gate
         report = full_report(
@@ -3173,10 +3272,64 @@ def _quality_gate_after(stage_id: str, ctx: dict, job: dict,
     why = "; ".join(result["reasons"])
     log.warning(f"[gate] {stage_name} gate FAILED for {job_id}: {why}")
     app_audit.record("job.quality_gate", target=job_id, detail=why)
+    # Park at the boundary's first gate so /continue's one-gate bookkeeping
+    # treats a quality pause exactly like a requested review of the same
+    # artifact ("transcript" for diarize, "translation" for translate).
+    gate_name = app_review_gates.BOUNDARY_GATES[stage_id][0]
+    status, cp_name = app_review_gates.GATE_STATUS[gate_name]
+    job["pending_gate"] = gate_name
     return (status,
             f"Paused by the {stage_name} quality gate — {why}. "
             f"Review, retranslate, or continue anyway.",
             cp_name)
+
+
+def _evaluate_gate(stage_id: str, ctx: dict, job: dict,
+                   job_id: str) -> Optional[tuple]:
+    """Return (status, detail, checkpoint) if a gate pauses after this stage.
+
+    Order: requested gates first (in boundary order — translation before
+    voice_cast at the translate boundary), then the legacy score-driven
+    quality gate as a backstop when the boundary's own gate is off. A
+    cleared gate (see job["gates_cleared"]) never re-fires until its stage
+    is re-run — that is what lets /continue advance exactly one gate without
+    destroying the pause config.
+    """
+    if stage_id not in app_review_gates.BOUNDARY_GATES:
+        return None
+    gates = ctx.get("review_gates")
+    if not isinstance(gates, dict):
+        # Legacy checkpoint / legacy queued job: derive from wizard_mode the
+        # way submissions always have, and remember the answer so the next
+        # checkpoint carries it.
+        gates = _resolved_review_gates(None, ctx.get("wizard_mode", "auto"), job)
+        ctx["review_gates"] = gates
+        job.setdefault("review_gates", gates)
+    cleared = ctx.get("gates_cleared") or []
+
+    findings: dict = {}
+    for g in app_review_gates.BOUNDARY_GATES[stage_id]:
+        if gates.get(g) == "flagged_only" and g not in cleared:
+            findings[g] = _gate_findings(g, ctx, job, job_id)
+
+    pending = app_review_gates.first_pending(stage_id, gates, cleared, findings)
+    if pending:
+        status, cp_name = app_review_gates.GATE_STATUS[pending]
+        detail = _GATE_DETAILS[pending]
+        count = findings.get(pending)
+        if gates.get(pending) == "flagged_only":
+            detail += (f" ({count} finding(s))" if isinstance(count, int)
+                       else " (checks could not run — reviewing to be safe)")
+        job["pending_gate"] = pending
+        return (status, detail, cp_name)
+
+    # Legacy auto-gate backstop: only when this boundary's own gate is off
+    # and not already cleared — an armed gate handled (or skipped) the same
+    # artifact above, and a cleared one was just approved by a human.
+    first_gate = app_review_gates.BOUNDARY_GATES[stage_id][0]
+    if gates.get(first_gate, "off") == "off" and first_gate not in cleared:
+        return _legacy_quality_pause(stage_id, ctx, job, job_id)
+    return None
 
 
 async def run_pipeline_stages(
@@ -3249,6 +3402,10 @@ async def run_pipeline_stages(
             # Anchor for the failure log window: if this stage dies, the UI
             # shows exactly the ring entries produced since this point.
             job["_stage_log_from"] = logbuf.current_seq()
+            # Re-running a stage re-arms its boundary's gates and every later
+            # one — a retranslate must pause at the translation gate again.
+            ctx["gates_cleared"] = job["gates_cleared"] = \
+                app_review_gates.reset_cleared(sid, ctx.get("gates_cleared"))
             update(
                 status=spec["status"], progress=lo, stage_id=sid,
                 step_detail=spec["hint"],
@@ -3299,13 +3456,13 @@ async def run_pipeline_stages(
             _save_checkpoint(job_id, work, stage=spec["checkpoint"],
                              data=_ctx_for_checkpoint(ctx))
 
-            pause = _wizard_pause_after(sid, ctx) or _quality_gate_after(
-                sid, ctx, job, job_id)
+            pause = _evaluate_gate(sid, ctx, job, job_id)
             if pause:
                 status, detail, cp_name = pause
                 update(status=status, progress=hi, step_detail=detail,
                        checkpoint_stage=cp_name)
-                log.info(f"[wizard] Paused after '{sid}' for job {job_id}")
+                log.info(f"[gate] Paused after '{sid}' for job {job_id} "
+                         f"(gate={job.get('pending_gate')})")
                 return
 
         # A partial run (stop_after set, or a stage list that doesn't reach
@@ -3327,6 +3484,15 @@ async def run_pipeline_stages(
                     stage_id=None,
                     checkpoint_stage=PIPELINE_STAGES[stop_i]["checkpoint"],
                 )
+        else:
+            # The driver, not _stage_merge, owns the final transition: a
+            # final_qc gate has to intercept *before* "complete" (and its
+            # job.completed webhook) fires, so merge only publishes its
+            # artifacts and the complete happens here — one firing site,
+            # shared with nothing. (_finalize_reupload above keeps its own
+            # complete: reupload jobs never gate.)
+            job.pop("pending_gate", None)
+            update(status="complete", step_detail="Done!")
 
         log.info(
             f"[perf] ═ pipeline job={job_id} finished "
@@ -3387,17 +3553,27 @@ async def run_pipeline(
     # Per-job VoxCPM overrides; 0 = follow Settings → Voice & TTS (CLD-189)
     voxcpm_cfg: float = 0.0,
     voxcpm_steps: int = 0,
+    # Resolved {gate: mode} dict from the submit route; None = resolve here
+    # from wizard_mode (legacy enqueue sites, batch/showcase fan-outs).
+    review_gates: Optional[dict] = None,
 ):
     """Main dubbing pipeline entry point.
 
     Builds the initial stage context from the request and runs every stage.
-    When wizard_mode != 'auto' the driver pauses at the matching checkpoint
-    with status='awaiting_review' so the user can inspect/edit intermediate
-    results before continuing."""
+    An armed review gate (from `review_gates`, wizard_mode, or cfg defaults —
+    see app/review_gates.py) makes the driver pause at the matching
+    checkpoint so the user can inspect/edit intermediate results before
+    continuing."""
     job = jobs[job_id]
     job["wizard_mode"] = wizard_mode
     job["mode"] = normalize_job_mode(mode) or "dub"
+    gates = (dict(review_gates) if isinstance(review_gates, dict)
+             else _resolved_review_gates(None, wizard_mode, job))
+    job["review_gates"] = gates
+    job["gates_cleared"] = []
     ctx = {
+        "review_gates": gates,
+        "gates_cleared": [],
         "source": source,
         "source_lang": source_lang,
         "target_lang": target_lang,
@@ -4388,6 +4564,7 @@ async def start_dub(
     tts_speed: str = Form("balanced"),
     wizard_mode: str = Form("auto"),  # "auto" | "review_translation"
                                       # | "review_transcript" | "review_voices"
+    review_gates: str = Form(""),  # JSON {gate: mode}; wins over wizard_mode
     auto_denoise: bool = Form(False),
     lip_sync: bool = Form(False),  # if True, auto-run Wav2Lip after pipeline completes
     mode: str = Form("dub"),  # "dub" | "reupload" (3E: reupload = no dubbing)
@@ -4404,6 +4581,10 @@ async def start_dub(
         voxcpm_cfg, voxcpm_steps)
     if _vox_err:
         return JSONResponse({"error": _vox_err}, 400)
+
+    explicit_gates, _gate_err = _parse_review_gates_form(review_gates)
+    if _gate_err:
+        return JSONResponse({"error": _gate_err}, 400)
 
     # Validate translation model exists in Ollama - fall back gracefully
     # otherwise. Reupload jobs never translate, so they skip the check —
@@ -4503,6 +4684,9 @@ async def start_dub(
     # time arrives (and survives restarts, since both persist to disk).
     now = time.time()
     is_scheduled = scheduled_at > now + 10  # 10s grace for clock skew
+    # Resolved at submit so the UI can show the job's gates while it is
+    # still queued/scheduled; run_pipeline takes this dict as-is.
+    resolved_gates = _resolved_review_gates(explicit_gates, wizard_mode, {})
     pipeline_args = {
         "source": actual_source,
         "source_lang": source_lang,
@@ -4521,6 +4705,7 @@ async def start_dub(
         "mode": mode,
         "voxcpm_cfg": voxcpm_cfg,
         "voxcpm_steps": voxcpm_steps,
+        "review_gates": resolved_gates,
     }
 
     jobs[job_id] = {
@@ -4542,6 +4727,8 @@ async def start_dub(
         "voxcpm_cfg": voxcpm_cfg,
         "voxcpm_steps": voxcpm_steps,
         "wizard_mode": wizard_mode,
+        "review_gates": resolved_gates,
+        "gates_cleared": [],
         "lip_sync": bool(lip_sync),
         "mode": mode,
         "created": time.time(),
@@ -5295,6 +5482,7 @@ async def start_quick_test(
     context_hint: str = Form(""),
     batch_label: str = Form(""),
     wizard_mode: str = Form("auto"),       # "auto" | "review_translation" | …
+    review_gates: str = Form(""),          # JSON {gate: mode}; wins over wizard_mode
     lip_sync: bool = Form(False),
     scheduled_at: float = Form(0.0),
     voxcpm_cfg: float = Form(0.0),         # 0 = use the global setting
@@ -5321,6 +5509,12 @@ async def start_quick_test(
         voxcpm_cfg, voxcpm_steps)
     if _vox_err:
         return JSONResponse({"error": _vox_err}, 400)
+    explicit_gates, _gate_err = _parse_review_gates_form(review_gates)
+    if _gate_err:
+        return JSONResponse({"error": _gate_err}, 400)
+    # quick_test batches gate normally (they're Pro's main fan-out); only
+    # showcase batches force the delivery gates off, in _resolved_review_gates.
+    resolved_gates = _resolved_review_gates(explicit_gates, wizard_mode, {})
     if not video and not source.strip():
         return JSONResponse({"error": "Provide either a video file or a URL"}, 400)
     if video and source.strip():
@@ -5421,6 +5615,8 @@ async def start_quick_test(
                 "whisper_model": whisper_model,
                 "keep_bg": keep_bg,
                 "wizard_mode": wizard_mode,
+                "review_gates": dict(resolved_gates),
+                "gates_cleared": [],
                 "lip_sync": lip_sync,
                 "auto_denoise": auto_denoise,
                 # Every sibling shares the source's metadata; the translate
@@ -5469,6 +5665,7 @@ async def start_quick_test(
             "auto_denoise": auto_denoise,
             "voxcpm_cfg": voxcpm_cfg,
             "voxcpm_steps": voxcpm_steps,
+            "review_gates": dict(resolved_gates),
         }
 
     async def _materialize():
@@ -7602,6 +7799,7 @@ _RETRY_OVERRIDE_KEYS = {
     "tts_speed", "auto_denoise", "wizard_mode", "reference_audio",
     "skip_diarization", "translate_failed_only", "tts_keep_existing",
     "voxcpm_cfg", "voxcpm_steps", "bg_volume", "bg_ducking",
+    "review_gates",
 }
 
 # Retry overrides that are numbers handed straight to VoxCPM rather than
@@ -8208,13 +8406,23 @@ async def retry_stage(
         for k in ("stage", "job_id", "saved_at"):
             ctx.pop(k, None)
 
-    # A retry always runs to the end unless told otherwise, so drop any
-    # wizard pause inherited from the original run.
-    ctx["wizard_mode"] = "auto"
+    # A retry always runs to the end unless told otherwise: every gate is
+    # off, UNLESS the override payload re-arms some via `review_gates` —
+    # that is how the workbench's re-assemble comes back to the QC screen.
+    # ("auto" as wizard_mode makes resolve start from all-off; the explicit
+    # dict, validated, lands on top.)
+    try:
+        ctx["review_gates"] = _resolved_review_gates(
+            ov.get("review_gates"), "auto", job)
+    except ValueError as e:
+        return JSONResponse({"error": f"Bad review_gates: {e}"}, 400)
+    ctx["gates_cleared"] = []
     for k, v in ov.items():
         if k not in _RETRY_OVERRIDE_KEYS:
             log.warning(f"[retry] Ignoring non-overridable key '{k}'")
             continue
+        if k == "review_gates":
+            continue  # resolved above, not copied raw
         if k in _RETRY_NUMERIC_KEYS:
             try:
                 v = coerce_field(k, v) if v not in (None, "", 0, "0") else 0
@@ -8235,6 +8443,9 @@ async def retry_stage(
 
     _clear_job_error(job)
     job.pop("cancel_requested", None)
+    job.pop("pending_gate", None)
+    job["review_gates"] = dict(ctx["review_gates"])
+    job["gates_cleared"] = []
     job["status"] = "queued"
     job["step_detail"] = f"Queued — retrying from '{stage}'"
     # Surface the changed settings on the job so History/Result reflect them.
@@ -9165,12 +9376,14 @@ async def continue_pipeline(
     tts_speed: str = Form(""),
     reference: Optional[UploadFile] = File(None),
 ):
-    """Continue the pipeline from the most recent checkpoint. Called after
-    the user has reviewed (and possibly edited) the transcript/translation
-    in wizard mode.
+    """Continue the pipeline from the most recent checkpoint.
 
-    - If stopped at translation_done: runs TTS + merge.
-    - If stopped at transcription_done: runs translate + TTS + merge.
+    Approving a review clears exactly ONE gate — the one the job's status
+    names. When another gate is armed at the same boundary (translation
+    cleared, voice_cast still pending) the job flips straight to that gate's
+    status and no stage runs; the response then carries `now_awaiting`.
+    Non-gate statuses (error, interrupted, paused) resume as before —
+    crash-resume never touched a gate.
 
     Voice settings, if provided, override what was originally requested."""
     if job_id not in jobs:
@@ -9193,6 +9406,52 @@ async def continue_pipeline(
     if not cp:
         return JSONResponse({"error": "No checkpoint to continue from"}, 404)
 
+    gate = app_review_gates.GATE_FOR_STATUS.get(job.get("status") or "")
+    if gate:
+        cleared = list(job.get("gates_cleared") or [])
+        if gate not in cleared:
+            cleared.append(gate)
+        job["gates_cleared"] = cleared
+        job.pop("pending_gate", None)
+
+        # Same-boundary re-check: is another gate armed right here?
+        gates = job.get("review_gates") or cp.get("review_gates")
+        if not isinstance(gates, dict):
+            gates = _resolved_review_gates(
+                None, job.get("wizard_mode", "auto"), job)
+        boundary = app_review_gates.BOUNDARY_FOR_GATE[gate]
+        ctx_like = dict(cp)
+        for k in ("stage", "job_id", "saved_at"):
+            ctx_like.pop(k, None)
+        findings: dict = {}
+        for g in app_review_gates.BOUNDARY_GATES[boundary]:
+            if gates.get(g) == "flagged_only" and g not in cleared:
+                findings[g] = _gate_findings(g, ctx_like, job, job_id)
+        nxt = app_review_gates.first_pending(boundary, gates, cleared, findings)
+        if nxt:
+            status, cp_name = app_review_gates.GATE_STATUS[nxt]
+            job["pending_gate"] = nxt
+            job["status"] = status
+            job["step_detail"] = _GATE_DETAILS[nxt]
+            job["checkpoint_stage"] = cp_name
+            save_job(job)
+            try:
+                activity.record_job(
+                    job_id, status,
+                    title=job.get("title") or job.get("source_label"))
+            except Exception:
+                log.debug("[activity] could not record transition",
+                          exc_info=True)
+            try:
+                _fire_webhooks(status, job)
+            except Exception:
+                log.debug("[webhooks] could not schedule delivery",
+                          exc_info=True)
+            log.info(f"[continue] Job {job_id} cleared '{gate}' — "
+                     f"now awaiting '{nxt}' at the same boundary")
+            return {"ok": True, "job_id": job_id,
+                    "now_awaiting": nxt, "status": status}
+
     # Reset error/stale flags so the History UI immediately reflects that
     # the job is alive again. _continue_from_checkpoint will set status
     # to "translating"/"synthesizing" as it starts each stage.
@@ -9200,7 +9459,7 @@ async def continue_pipeline(
     _clear_job_error(job)
     save_job(job)
 
-    asyncio.create_task(_continue_from_checkpoint(
+    _spawn_background(_continue_from_checkpoint(
         job_id, cp, final_style, final_preset, final_speed, ref_path,
     ))
     return {"ok": True, "job_id": job_id, "resuming_from": cp.get("stage")}
@@ -9234,8 +9493,24 @@ async def _continue_from_checkpoint(
     stage = cp.get("stage", "")
     next_stage = _stage_after_checkpoint(stage)
     if not next_stage:
+        # merge_done: nothing left to run — the final_qc Approve lands here.
+        # This bypasses the driver's webhook-firing update() closure, so the
+        # complete transition fires its webhook and activity record
+        # explicitly (exactly once — the driver never sees this job again).
         log.info(f"[continue] Job {job_id} is already at the final stage")
-        job.update(status="complete", progress=100); save_job(job)
+        job.update(status="complete", progress=100)
+        job.pop("pending_gate", None)
+        save_job(job)
+        try:
+            activity.record_job(
+                job_id, "complete",
+                title=job.get("title") or job.get("source_label"))
+        except Exception:
+            log.debug("[activity] could not record transition", exc_info=True)
+        try:
+            _fire_webhooks("complete", job)
+        except Exception:
+            log.debug("[webhooks] could not schedule delivery", exc_info=True)
         return
 
     ctx = dict(cp)
@@ -9250,8 +9525,13 @@ async def _continue_from_checkpoint(
         ctx["tts_speed"] = tts_speed
     if ref_path:
         ctx["reference_audio"] = ref_path
-    # The user just approved this checkpoint — don't pause on it again.
-    ctx["wizard_mode"] = "auto"
+    # The user just approved this checkpoint. The approved gate is in
+    # job["gates_cleared"] (appended by /continue), so it won't re-fire —
+    # but LATER gates stay armed, which is the point: wizard_mode is no
+    # longer forced to "auto" here.
+    ctx["gates_cleared"] = list(job.get("gates_cleared") or [])
+    if isinstance(job.get("review_gates"), dict):
+        ctx["review_gates"] = job["review_gates"]
 
     log.info(
         f"[continue] Resuming job {job_id} from checkpoint '{stage}' "
@@ -10753,6 +11033,234 @@ async def beta_reuse_purge(stage: str = Form(""), job_id: str = Form("")):
     log.info(f"[artifacts] purged {removed} row(s) "
              f"(stage={stage or 'all'}, job={job_id or 'all'})")
     return {"ok": True, "removed": removed}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Review gates: final-QC checklist + review notes (CLD-264 / CLD-270)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Row states: "pass" (checked, fine), "warn" (checked, needs a look),
+# "unavailable" (could not be computed — module not present yet, artifact
+# missing, or the check is not enforced). Only "warn" rows count toward
+# warn_count, which is also the final_qc gate's flagged_only findings.
+
+def _qc_row(row_id: str, label: str, state: str, value: str,
+            detail: str = "") -> dict:
+    return {"id": row_id, "label": label, "state": state,
+            "value": value, "detail": detail}
+
+
+def _qc_loudness_row(loudnorm, target_i: float, target_tp: float) -> dict:
+    from pipeline.quality import loudness_quality
+    ld = loudness_quality(loudnorm)
+    if not ld.get("available"):
+        return _qc_row("loudness", "Loudness", "unavailable", "not measured",
+                       "No loudnorm measurement yet — assemble the dub first.")
+    out_i, tp = ld.get("output_i"), ld.get("true_peak")
+    problems = []
+    if out_i is not None and abs(out_i - target_i) > 1.0:
+        problems.append(f"integrated {out_i:g} LUFS is more than 1 LU from "
+                        f"the {target_i:g} target")
+    if tp is not None and tp > target_tp:
+        problems.append(f"true peak {tp:g} dBTP is above the "
+                        f"{target_tp:g} ceiling")
+    if tp is not None and tp > 0:
+        problems.append("true peak above 0 dBTP — clipping")
+    value = (f"{out_i:g} LUFS" if out_i is not None else "?") + \
+            (f" · peak {tp:g} dBTP" if tp is not None else "")
+    if problems:
+        return _qc_row("loudness", "Loudness", "warn", value,
+                       "; ".join(problems))
+    return _qc_row("loudness", "Loudness", "pass", value,
+                   f"Within ±1 LU of {target_i:g} LUFS, "
+                   f"peak under {target_tp:g} dBTP")
+
+
+def _qc_subtitles_row(job: dict, segments: list) -> dict:
+    # pipeline/subtitles.py lands with the subtitle workbench task; until
+    # then (or on any failure) this row degrades to "unavailable" rather
+    # than claiming a pass it never checked.
+    try:
+        from pipeline import subtitles as _subs
+    except ImportError:
+        return _qc_row("subtitles", "Subtitles", "unavailable", "not computed",
+                       "Subtitle checks arrive with the subtitle module.")
+    try:
+        cues = _subs.build_cues(segments, job.get("subtitle_overrides"))
+        violations = _subs.validate_cues(cues, _subtitle_limits())
+    except Exception as e:
+        return _qc_row("subtitles", "Subtitles", "unavailable", "not computed",
+                       f"Subtitle validation failed: {e}")
+    if violations:
+        return _qc_row("subtitles", "Subtitles", "warn",
+                       f"{len(violations)} violation(s) in {len(cues)} cues",
+                       "Line length / CPS / gap limits — see the Subtitles tab.")
+    return _qc_row("subtitles", "Subtitles", "pass",
+                   f"{len(cues)} cues clean", "All cues inside the limits.")
+
+
+def _qc_sync_row(placements: list) -> tuple:
+    """(row, offsync idx list). ±5% stretch is the design's tolerance."""
+    if not placements:
+        return (_qc_row("sync", "Sync", "unavailable", "not computed",
+                        "No placement data yet — assemble the dub first."), [])
+    total, off = 0, []
+    for i, p in enumerate(placements):
+        try:
+            src = float(p.get("src_end", 0)) - float(p.get("src_start", 0))
+            dub_s, dub_e = p.get("dub_start"), p.get("dub_end")
+            if src <= 0 or dub_s is None or dub_e is None:
+                continue
+            total += 1
+            stretch = (float(dub_e) - float(dub_s)) / src
+            if abs(stretch - 1.0) > 0.05:
+                off.append(p.get("idx", i))
+        except (TypeError, ValueError):
+            continue
+    if not total:
+        return (_qc_row("sync", "Sync", "unavailable", "not computed",
+                        "Placement rows carried no usable timings."), [])
+    if off:
+        return (_qc_row("sync", "Sync", "warn",
+                        f"{len(off)} of {total} segments outside ±5%",
+                        "Segments stretched or drifted beyond the tolerance — "
+                        "see the Sync tab."), off)
+    return (_qc_row("sync", "Sync", "pass", f"{total} segments inside ±5%",
+                    "Every placed segment within the stretch tolerance."), off)
+
+
+def _qc_glossary_row(job: dict, segments: list) -> dict:
+    from pipeline.flags import glossary_terms, _contains_phrase
+    terms = glossary_terms(_read_user_glossary(), job.get("target_lang") or "")
+    matched, honored = 0, 0
+    for term, mapped in terms.items():
+        if not term.strip() or not mapped.strip():
+            continue
+        hit = miss = False
+        for seg in segments:
+            if not _contains_phrase(seg.get("text") or "", term):
+                continue
+            hit = True
+            if not _contains_phrase(seg.get("translated_text") or "", mapped):
+                miss = True
+        if hit:
+            matched += 1
+            if not miss:
+                honored += 1
+    if not matched:
+        return _qc_row("glossary", "Glossary", "pass", "no terms triggered",
+                       "No glossary term appears in this source.")
+    state = "pass" if honored == matched else "warn"
+    return _qc_row("glossary", "Glossary", state,
+                   f"{honored}/{matched} terms honored",
+                   "" if state == "pass" else
+                   "A decided-on term was not used — see translation flags.")
+
+
+def _qc_consent_row(job: dict, segments: list) -> dict:
+    # voice_consent_policy and the consent records land with the consent
+    # task; getattr keeps this row honest either way.
+    policy = getattr(cfg, "voice_consent_policy", "off")
+    if policy == "off":
+        return _qc_row("consent", "Voice consent", "unavailable",
+                       "not enforced",
+                       "Consent policy is off — enable it in Settings.")
+    consent = job.get("voice_consent") or {}
+    speakers = sorted({s.get("speaker") for s in segments if s.get("speaker")})
+    missing = [sp for sp in speakers if not consent.get(sp)]
+    if missing:
+        return _qc_row("consent", "Voice consent", "warn",
+                       f"{len(missing)} of {len(speakers)} unattested",
+                       "No consent record for: " + ", ".join(missing))
+    return _qc_row("consent", "Voice consent", "pass",
+                   f"{len(speakers)} speaker(s) attested", "")
+
+
+def _build_qc_checklist(job_id: str) -> dict:
+    """The one final-QC document: what /qc serves the workbench, and what
+    the final_qc gate's flagged_only mode counts. Assembled from persisted
+    artifacts only — nothing is recomputed or stored."""
+    job = jobs[job_id]
+    segments, seg_stage, placements, loudnorm = _quality_inputs(job_id)
+    target_i = float(getattr(cfg, "loudness_target", -16.0))
+    target_tp = float(getattr(cfg, "loudness_true_peak", -1.5))
+
+    sync_row, offsync_idxs = _qc_sync_row(placements)
+    rows = [
+        _qc_loudness_row(loudnorm, target_i, target_tp),
+        _qc_subtitles_row(job, segments),
+        sync_row,
+        _qc_glossary_row(job, segments),
+        _qc_consent_row(job, segments),
+    ]
+    warn_count = sum(1 for r in rows if r["state"] == "warn")
+
+    work = OUTPUT_DIR / job_id
+    deliverables = [
+        f"/outputs/{job_id}/{name}"
+        for name in ("dubbed_video.mp4", "subtitles.srt", "subtitles.vtt")
+        if (work / name).exists()
+    ]
+    return {
+        "job_id": job_id,
+        "rows": rows,
+        "warn_count": warn_count,
+        "loudness_target": target_i,
+        "loudness_true_peak": target_tp,
+        "segments_from": seg_stage,
+        "pending_gate": job.get("pending_gate"),
+        "review_notes": job.get("review_notes") or [],
+        "pending_fixes": {
+            "offsync_segments": offsync_idxs,
+        },
+        "on_approve": {
+            # Approve = /continue: it clears the final_qc gate and marks the
+            # job complete — nothing is resynthesized by the approval itself.
+            "resynth_segments": 0,
+            "est_cost": 0.0,
+            "deliverables": deliverables,
+            "webhooks": len(app_webhooks.hooks_for("job.completed")),
+        },
+    }
+
+
+@app.get("/api/dub/{job_id}/qc")
+async def get_qc_checklist(job_id: str):
+    """Final-QC checklist — render-ready rows, no client re-derivation.
+
+    Every row degrades to state="unavailable" rather than failing the whole
+    document; a checklist with one uncomputable row is still a checklist.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    return await asyncio.to_thread(_build_qc_checklist, job_id)
+
+
+_REVIEW_NOTES_CAP = 100
+
+
+@app.post("/api/dub/{job_id}/review_notes")
+async def add_review_note(job_id: str, text: str = Form("")):
+    """Append one reviewer note to the job (kept with it, capped at 100).
+
+    Author is "local" until real members exist (CLD-247).
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    text = (text or "").strip()
+    if not text:
+        return JSONResponse({"error": "Note text is empty"}, 400)
+    if len(text) > 4000:
+        return JSONResponse({"error": "Note is too long (4000 chars max)"}, 400)
+    job = jobs[job_id]
+    notes = job.get("review_notes")
+    if not isinstance(notes, list):
+        notes = []
+    notes.append({"text": text, "at": time.time(), "author": "local"})
+    job["review_notes"] = notes[-_REVIEW_NOTES_CAP:]
+    save_job(job)
+    return {"ok": True, "count": len(job["review_notes"]),
+            "notes": job["review_notes"]}
 
 
 if __name__ == "__main__":

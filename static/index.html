@@ -104,7 +104,7 @@ const WHISPER_MODELS = [
 // waiting on a decision, not on the machine.
 const REVIEW_STATUSES = new Set([
   'awaiting_translation_review', 'awaiting_transcript_review',
-  'awaiting_voice_review',
+  'awaiting_voice_review', 'awaiting_subtitle_review', 'awaiting_final_qc',
 ]);
 
 // Active job status set
@@ -137,6 +137,7 @@ const stageForStatus = (status) => {
     case 'synthesizing':
       return 4;
     case 'assembling': case 'merging':
+    case 'awaiting_subtitle_review': case 'awaiting_final_qc':
       return 5;
     case 'complete':
       return 6;
@@ -159,6 +160,8 @@ const STATUS_META = {
   scheduled:                      { color: '#8a9aff',       label: 'Scheduled' },
   awaiting_transcript_review:     { color: 'var(--warn)',   label: 'Awaiting transcript review' },
   awaiting_voice_review:          { color: 'var(--warn)',   label: 'Awaiting voice casting' },
+  awaiting_subtitle_review:       { color: 'var(--warn)',   label: 'Awaiting subtitle review' },
+  awaiting_final_qc:              { color: 'var(--warn)',   label: 'Awaiting final QC' },
   running:                        { color: 'var(--accent)', label: 'Running' },
   downloading:                    { color: 'var(--accent)', label: 'Downloading' },
   extracting:                     { color: 'var(--accent)', label: 'Extracting' },
