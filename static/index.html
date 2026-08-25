@@ -4655,6 +4655,26 @@ function LogsTab() {
     catch (_) { return null; }
   };
   const [focus, setFocus] = useState(readFocus);
+
+  // A focus is "show me the lines around this failure", not a preference —
+  // but it was persisted to localStorage and never expired, so it outlived
+  // the failure it described. A job that failed at download, was rescued,
+  // and finished still pinned "Failure window — acquire video" over an empty
+  // box, because the ring had long since evicted those lines. Drop it once
+  // the job it names is no longer carrying an error.
+  useEffect(() => {
+    if (!focus || !focus.job) return;
+    let stopped = false;
+    fetch(`/api/job/${encodeURIComponent(focus.job)}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(d => {
+        if (stopped || !d) return;
+        const j = d.job || d;
+        if (!j.last_error && j.status !== 'error') clearFocus();
+      })
+      .catch(() => { /* can't tell: leave it alone rather than guess */ });
+    return () => { stopped = true; };
+  }, [focus && focus.job, focus && focus.to]);
   useEffect(() => {
     const h = () => setFocus(readFocus());
     window.addEventListener('gcd:open-logs', h);
@@ -4727,7 +4747,9 @@ function LogsTab() {
           </span>
           {entries.length === 0 && (
             <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>
-              these lines have been evicted from the ring — only recent output is kept
+              nothing left for this window — the ring keeps only recent output,
+              and these lines have scrolled out of it. The job's own error
+              panel still has the traceback.
             </span>
           )}
           <div style={{ flex: 1 }}/>

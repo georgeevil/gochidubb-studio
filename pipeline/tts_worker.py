@@ -94,7 +94,16 @@ except Exception:
     pass
 
 
+# The job this worker is currently processing. Stamped onto every event so
+# the parent can tell whose output it is reading — see the matching comment
+# in synthesizer.py. A daemon that handles job after job over one pipe has no
+# other way to say "these lines are not yours".
+_JOB_TOKEN = ""
+
+
 def _log_event(**kw):
+    if _JOB_TOKEN:
+        kw.setdefault("token", _JOB_TOKEN)
     print(json.dumps(kw, ensure_ascii=False), flush=True)
 
 
@@ -541,6 +550,29 @@ def main(job_path):
     _process_job(model, job)
 
 
+def _run_one(model, job):
+    """Process one job, always closing it with a job_done carrying its token.
+
+    A job that ends without job_done leaves the parent blocked or, worse,
+    reading this job's events as the next job's — which is exactly what
+    happened: a run whose eight segments all synthesized cleanly was reported
+    as "All 8 TTS segments failed" because the parent had already stopped
+    reading, and the next run then consumed those eight events as its own.
+    """
+    global _JOB_TOKEN
+    _JOB_TOKEN = str(job.get("job_token") or "")
+    try:
+        _process_job(model, job)
+    except Exception as e:
+        _log_event(event="job_error", error=f"{type(e).__name__}: {e}",
+                   traceback=traceback.format_exc())
+    finally:
+        # In the finally block on purpose: the parent's read loop ends on
+        # job_done and nothing else is guaranteed to arrive.
+        _log_event(event="job_done")
+        _JOB_TOKEN = ""
+
+
 def main_daemon():
     """Daemon mode: load model ONCE, then wait on stdin for job paths.
     Parent writes a line `<path_to_job.json>\\n` to our stdin; we process
@@ -555,8 +587,7 @@ def main_daemon():
     with open(first_job_path, "r", encoding="utf-8") as f:
         first_job = json.load(f)
     model = _load_model(first_job)
-    _process_job(model, first_job)
-    _log_event(event="job_done")
+    _run_one(model, first_job)
 
     # Subsequent jobs arrive via stdin lines (one path per line)
     for raw in sys.stdin:
@@ -564,16 +595,18 @@ def main_daemon():
         if not line or line == "SHUTDOWN":
             break
         if not os.path.exists(line):
+            # No token to stamp — the parent cannot match this to its job, so
+            # it is emitted untokenized and treated as a hard stop.
             _log_event(event="job_error", error=f"job file not found: {line}")
             continue
         try:
             with open(line, "r", encoding="utf-8") as f:
                 job = json.load(f)
-            _process_job(model, job)
-            _log_event(event="job_done")
         except Exception as e:
             _log_event(event="job_error", error=f"{type(e).__name__}: {e}",
                        traceback=traceback.format_exc())
+            continue
+        _run_one(model, job)
 
 
 if __name__ == "__main__":
