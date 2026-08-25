@@ -1365,6 +1365,186 @@ def resolve_voice_config(voice_preset: str, voice_style: str, job_id: str):
     return eff_style, seed, ""
 
 
+# ─────────────────────────────────────────────────────────────
+# Designed voices: one draw, then clone
+# ─────────────────────────────────────────────────────────────
+# A style preset ("middle-aged male voice, warm and calm") is a prompt, not a
+# voice. VoxCPM draws a new speaker from it on every generate call, and the
+# seed does not pin that draw — the sampled speaker latent is conditioned on
+# the text as well, so the same style and seed on two different lines is two
+# different people. Measured on a 1602-segment dub with seed, tier and every
+# inference parameter held constant: f0 across 40 segments of one speaker
+# ranged 85-312 Hz. The dub sounded like a different narrator each line.
+#
+# Cloning is stable, which is why the `auto` path has never had this problem.
+# So a style preset is materialised: drawn ONCE into a reference clip, then
+# cloned from for every segment. The clip is cached by (style, seed, language)
+# under presets/voices/.designed/, so a preset also sounds the same across
+# jobs instead of being re-rolled per run.
+#
+# The cache lives in a dotted subdirectory of presets/voices/ on purpose:
+# scan_file_presets() iterates that folder for audio FILES, so a directory is
+# skipped and these never show up as user voices in the picker.
+DESIGNED_VOICES_DIR = VOICE_PRESETS_DIR / ".designed"
+
+# Internal routing mode -> the coarse label the UI, the job record and the
+# publisher have always shown. "designed_ref" is a designed voice that was
+# rendered once and cloned from, so it is still the user's "custom" choice;
+# "cast" is its own thing because it is the only mode with more than one
+# answer for a job.
+_VOICE_MODE_LABEL = {
+    "file_ref": "upload",
+    "voice_design": "custom",
+    "designed_ref": "custom",
+    "cast": "cast",
+    "source_refs": "source",
+}
+
+
+def _designed_voice_path(style: str, seed, target_lang: str) -> Path:
+    """Cache location for one (style, seed, language) triple."""
+    import hashlib
+    key = f"{style.strip().lower()}|{seed}|{target_lang}"
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()[:16]
+    return DESIGNED_VOICES_DIR / f"{digest}.wav"
+
+
+def _materialize_designed_voice(engine, style: str, seed,
+                                target_lang: str = "en") -> str:
+    """Return a reference clip speaking in `style`, rendering it if needed.
+
+    Blocking — it drives the TTS worker subprocess. Call through _blocking().
+    Returns "" on failure; callers fall back to per-segment voice design
+    rather than failing the run, because a wobbly voice still beats no dub.
+    """
+    style = (style or "").strip().strip("()")
+    if not style:
+        return ""
+    dest = _designed_voice_path(style, seed, target_lang)
+    # >1 KB guards against a truncated write from an interrupted run being
+    # served forever as a "cached" voice.
+    if dest.exists() and dest.stat().st_size > 1000:
+        log.info(f"[design] Reusing cached voice for {style!r} -> {dest.name}")
+        return str(dest)
+    DESIGNED_VOICES_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        made = engine.design_reference(
+            style, str(dest), voice_seed=seed, target_lang=target_lang)
+    except Exception as e:
+        log.warning(f"[design] Materialising {style!r} failed: {e}")
+        return ""
+    return made or ""
+
+
+def _voice_choices() -> dict:
+    """Every assignable voice, keyed by the id the casting map stores.
+
+    "source" is not in here — it is per-speaker (whatever was cut from the
+    video for that person) and so has no single reference to describe.
+    """
+    out = {}
+    for pid, p in VOICE_PRESETS.items():
+        if pid == "auto" or not p.get("style"):
+            continue
+        out[pid] = {"id": pid, "name": p["name"], "kind": "design",
+                    "style": p["style"], "seed": p.get("seed")}
+    for pid, p in scan_file_presets().items():
+        out[pid] = {"id": pid, "name": p["name"], "kind": "library",
+                    "style": p.get("style", ""), "seed": p.get("seed"),
+                    "audio_url": p.get("audio_url", "")}
+    return out
+
+
+def _source_ref_for(speaker: str, ctx: dict, job_id: str) -> str:
+    """The reference cut from the video for this speaker, if there is one.
+
+    Prefers ctx["speaker_refs"] so a clip the user replaced through
+    edit_speaker_ref wins — but only when that path is still inside this
+    job's own speaker_refs/ folder. After a run that used a preset, the same
+    key holds a path in presets/voices/, which is emphatically not the source
+    voice; that case falls through to the untouched source_speaker_refs copy.
+    """
+    job_refs = str((OUTPUT_DIR / job_id / "speaker_refs").resolve())
+    cur = (ctx.get("speaker_refs") or {}).get(speaker) or ""
+    if cur and os.path.exists(cur):
+        try:
+            if str(Path(cur).resolve()).startswith(job_refs):
+                return cur
+        except OSError:
+            pass
+    fallback = (ctx.get("source_speaker_refs") or {}).get(speaker) or ""
+    return fallback if fallback and os.path.exists(fallback) else ""
+
+
+async def _resolve_casting(cast: dict, speakers, ctx: dict, job_id: str,
+                           engine, target_lang: str) -> tuple:
+    """Turn {speaker: voice_id} into ({speaker: ref_wav}, {speaker: ""}, report).
+
+    Every speaker present in the audio gets an entry, whether or not the map
+    mentions them: an unassigned speaker keeps their own voice, which is the
+    only default that cannot surprise anyone. A voice that will not resolve
+    (deleted preset file, failed render) degrades to the source voice for
+    that speaker alone and says so in the report, rather than taking the
+    whole dub down or silently recasting everyone.
+    """
+    choices = _voice_choices()
+    refs, transcripts, report = {}, {}, []
+
+    for sp in speakers:
+        want = (cast.get(sp) or "source").strip()
+        src = _source_ref_for(sp, ctx, job_id)
+        chosen, resolved_id = "", want
+
+        if want and want != "source":
+            spec = choices.get(want)
+            if spec is None and want.startswith("design:"):
+                free = want[len("design:"):].strip()
+                spec = {"kind": "design", "style": free, "seed": None}
+            if spec is None:
+                report.append({"speaker": sp, "voice": want,
+                               "status": "unknown", "used": "source"})
+                resolved_id = "source"
+            elif spec["kind"] == "library":
+                ref_file = scan_file_presets().get(want, {}).get("reference_file", "")
+                if ref_file and os.path.exists(ref_file):
+                    chosen = ref_file
+                else:
+                    report.append({"speaker": sp, "voice": want,
+                                   "status": "missing_file", "used": "source"})
+                    resolved_id = "source"
+            else:
+                seed = spec.get("seed")
+                if seed is None:
+                    import hashlib
+                    seed = int(hashlib.md5(spec["style"].encode()).hexdigest()[:8],
+                               16) & 0x7FFFFFFF
+                chosen = await _blocking(
+                    _materialize_designed_voice, engine, spec["style"], seed,
+                    target_lang,
+                )
+                if not chosen:
+                    report.append({"speaker": sp, "voice": want,
+                                   "status": "render_failed", "used": "source"})
+                    resolved_id = "source"
+
+        if not chosen:
+            chosen = src
+            if not chosen:
+                report.append({"speaker": sp, "voice": resolved_id,
+                               "status": "no_source_ref", "used": "none"})
+        if chosen:
+            refs[sp] = chosen
+            # Empty transcript = Controllable Cloning (reference only). A
+            # prompt transcript would have to match the reference audio word
+            # for word, and none of these references have one.
+            transcripts[sp] = ""
+            if not any(r["speaker"] == sp for r in report):
+                report.append({"speaker": sp, "voice": resolved_id,
+                               "status": "ok", "used": resolved_id})
+
+    return refs, transcripts, report
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Init SQLite store (creates table + migrates legacy JSON files)
@@ -1554,6 +1734,7 @@ _WEBHOOK_EVENT_FOR_STATUS = {
     "complete": "job.completed",
     "error": "job.failed",
     "awaiting_translation_review": "job.awaiting_review",
+    "awaiting_voice_review": "job.awaiting_review",
 }
 
 
@@ -2543,21 +2724,75 @@ async def _stage_tts(job, work, ctx, update, perf):
     # VoxCPM has 3 mutually-exclusive modes; pick one based on the user's
     # choice. NEVER mix style prefix with speaker refs — the model will
     # literally read the style description out loud in the cloned voice.
-    has_ref = any(speaker_refs.values())
-    if reference_audio and os.path.exists(reference_audio):
-        mode = "file_ref"          # user uploaded / file preset
-    elif eff_style and eff_style.strip() and not has_ref:
-        mode = "voice_design"
-    elif eff_style and eff_style.strip() and has_ref:
-        # User picked a style preset but we already extracted refs from the
-        # source video. They presumably want a fresh designed voice.
-        log.info("[pipeline] Style preset + source refs → dropping refs "
-                 "for Voice Design")
-        speaker_refs = {}
-        speaker_transcripts = {}
-        mode = "voice_design"
+    #
+    # A casting map beats all of it. Every other mode here is a whole-job
+    # decision, which is the flaw they share: a style preset silently
+    # discarded diarization and collapsed a three-speaker interview onto one
+    # voice, and an uploaded reference assigned the same clip to everyone.
+    # A cast job resolves each speaker independently, so speakers survive.
+    cast = dict(ctx.get("speaker_voice_map") or {})
+    speakers = sorted({s.get("speaker") or "SPEAKER_00" for s in segments})
+    if cast and isinstance(tts_used, VoxCPMSynthesizer):
+        speaker_refs, speaker_transcripts, cast_report = await _resolve_casting(
+            cast, speakers, ctx, job["id"], tts_used, target_lang,
+        )
+        ctx["voice_cast_report"] = cast_report
+        perf["cast"] = cast_report
+        mode = "cast"
+        log.info(f"[tts] Cast {len(speaker_refs)}/{len(speakers)} speaker(s): "
+                 + ", ".join(f"{r['speaker']}={r['used']}" for r in cast_report))
+        if eff_style or (reference_audio and os.path.exists(reference_audio)):
+            # Both were set. The cast is the more specific instruction and it
+            # is the one the user auditioned, so it wins — but say so, because
+            # a preset that appears to be selected and does nothing is exactly
+            # the kind of thing that gets debugged for an hour.
+            log.info("[tts] A whole-job voice preset/upload is also set; the "
+                     "casting map overrides it")
+        has_ref = any(speaker_refs.values())
     else:
-        mode = "source_refs"
+        if cast:
+            log.warning(
+                f"[tts] Ignoring the casting map: {target_lang} synthesizes "
+                f"with {type(tts_used).__name__}, which has fixed voices and "
+                f"cannot clone")
+        has_ref = any(speaker_refs.values())
+        if reference_audio and os.path.exists(reference_audio):
+            mode = "file_ref"          # user uploaded / file preset
+        elif eff_style and eff_style.strip() and not has_ref:
+            mode = "voice_design"
+        elif eff_style and eff_style.strip() and has_ref:
+            # User picked a style preset but we already extracted refs from
+            # the source video. They presumably want a fresh designed voice.
+            log.info("[pipeline] Style preset + source refs → dropping refs "
+                     "for Voice Design")
+            speaker_refs = {}
+            speaker_transcripts = {}
+            mode = "voice_design"
+        else:
+            mode = "source_refs"
+
+    # Materialise the designed voice instead of designing it per segment.
+    # See the DESIGNED_VOICES_DIR block: the style prompt draws a new speaker
+    # on every call and the seed does not pin the draw, so designing 1602
+    # times gives 1602 voices. Drawing once and cloning from the result gives
+    # one. On failure we fall through to the old per-segment prefix — a
+    # wobbly voice is still a dub, and no voice is not.
+    if mode == "voice_design" and isinstance(tts_used, VoxCPMSynthesizer):
+        designed = await _blocking(
+            _materialize_designed_voice, tts_used, eff_style, voice_seed,
+            target_lang,
+        )
+        if designed:
+            speaker_refs = {sp: designed for sp in speakers}
+            speaker_transcripts = {sp: "" for sp in speakers}
+            mode = "designed_ref"
+            has_ref = True
+            perf["designed_voice"] = os.path.basename(designed)
+            log.info(f"[tts] Designed voice materialised for {len(speakers)} "
+                     f"speaker(s): {os.path.basename(designed)}")
+        else:
+            log.warning("[tts] Could not materialise the designed voice; "
+                        "falling back to per-segment voice design")
 
     # On a retry, prefer the ORIGINAL source refs over whatever preset the
     # previous run baked into speaker_refs — otherwise "retry with source
@@ -2577,19 +2812,30 @@ async def _stage_tts(job, work, ctx, update, perf):
     update(
         step_detail=f"Generating speech (mode={mode}, "
                     f"preset={ctx.get('voice_preset', 'auto')}, seed={voice_seed})...",
-        voice_mode=("upload" if mode == "file_ref" else
-                    ("custom" if mode == "voice_design" else "source")),
+        voice_mode=_VOICE_MODE_LABEL.get(mode, "source"),
         voice_seed=voice_seed,
     )
 
     # Apply Voice Design prefix ONLY in voice_design mode (VoxCPM-only:
-    # edge-tts would literally read the style description out loud)
+    # edge-tts would literally read the style description out loud).
+    #
+    # It goes on `tts_text`, NOT `translated_text`. The prefix is an
+    # instruction to the model, not part of the dialogue, and
+    # `translated_text` is what the rest of the system treats as the line:
+    # the assemble stage rewrites subtitles.srt from it, the translation
+    # editor shows it, and the partial-retry reuse check compares it. Writing
+    # the prefix there put "(middle-aged male voice, warm and calm, clear
+    # articulation)" at the head of all 1602 subtitle lines of a real dub,
+    # and made every reuse comparison mismatch (prefixed checkpoint text vs
+    # clean translation text), so a partial TTS retry re-synthesized
+    # everything. `tts_text` is absent from _serialize_segments' whitelist,
+    # so it never reaches a checkpoint.
     if mode == "voice_design" and isinstance(tts_used, VoxCPMSynthesizer):
         style = eff_style.strip().strip("()")
         for s in segments:
             base = s.get("translated_text") or s.get("text", "")
             if base and not base.startswith("("):
-                s["translated_text"] = f"({style}){base}"
+                s["tts_text"] = f"({style}){base}"
 
     # Keep already-rendered segments when this is a partial retry
     if ctx.get("tts_keep_existing"):
@@ -2832,6 +3078,18 @@ def _wizard_pause_after(stage_id: str, ctx: dict) -> Optional[tuple]:
     if stage_id == "translate" and mode == "review_translation":
         return ("awaiting_translation_review",
                 "Review translation — edit, retranslate, or approve to continue",
+                "translation_done")
+    if stage_id == "translate" and mode == "review_voices":
+        # After translate, not after diarize, even though the speaker
+        # references exist by then. Casting is only worth reviewing if you can
+        # hear it, and a preview has to speak the lines the dub will actually
+        # speak — at the diarize gate the text is still in the source
+        # language, so a cross-lingual preview would demonstrate the wrong
+        # phonetics. Translation is minutes; the stage this gate protects is
+        # hours (a measured 12.25h for 1602 segments), so the gate still sits
+        # in front of essentially all of the cost.
+        return ("awaiting_voice_review",
+                "Cast the voices — assign one per speaker, preview, then continue",
                 "translation_done")
     return None
 
@@ -3102,7 +3360,8 @@ async def run_pipeline(
     voice_style: str = "",
     voice_preset: str = "auto",
     tts_speed: str = "balanced",
-    wizard_mode: str = "auto",  # "auto" | "review_translation" | "review_transcript"
+    wizard_mode: str = "auto",  # "auto" | "review_translation"
+                                # | "review_transcript" | "review_voices"
     auto_denoise: bool = True,  # apply ffmpeg denoise before WhisperX
     mode: str = "dub",  # "dub" | "reupload" (3E: reupload = download only)
     # Per-job VoxCPM overrides; 0 = follow Settings → Voice & TTS (CLD-189)
@@ -4107,7 +4366,8 @@ async def start_dub(
     voice_style: str = Form(""),
     voice_preset: str = Form("auto"),
     tts_speed: str = Form("balanced"),
-    wizard_mode: str = Form("auto"),  # "auto" | "review_translation" | "review_transcript"
+    wizard_mode: str = Form("auto"),  # "auto" | "review_translation"
+                                      # | "review_transcript" | "review_voices"
     auto_denoise: bool = Form(False),
     lip_sync: bool = Form(False),  # if True, auto-run Wav2Lip after pipeline completes
     mode: str = Form("dub"),  # "dub" | "reupload" (3E: reupload = no dubbing)
@@ -6987,15 +7247,48 @@ async def _run_tts_and_merge_stage(
     tts = get_tts_engine()
     # Languages the cloning engines don't cover (e.g. bg) drop to edge-tts.
     tts_used = _tts_engine_for_lang(tts, state.get("target_lang", "ru"))
+    target_lang_for_voice = state.get("target_lang", "ru")
+    speakers = sorted({s.get("speaker") or "SPEAKER_00" for s in segments})
 
-    # Voice Design style prefix — ONLY when mode is voice_design AND the
-    # engine actually used is VoxCPM (edge-tts would speak the prefix).
+    # A casting map overrides every whole-job mode above — see the matching
+    # block in _stage_tts. Retries and per-segment regens go through here, so
+    # without this a re-run of a cast job would quietly recast it.
+    cast = dict(state.get("speaker_voice_map") or {})
+    if cast and isinstance(tts_used, VoxCPMSynthesizer):
+        speaker_refs, speaker_transcripts, cast_report = await _resolve_casting(
+            cast, speakers, state, job_id, tts_used, target_lang_for_voice,
+        )
+        mode = "cast"
+        update(voice_mode="cast")
+        log.info(f"[stage] Cast {len(speaker_refs)}/{len(speakers)} speaker(s): "
+                 + ", ".join(f"{r['speaker']}={r['used']}" for r in cast_report))
+
+    # Draw the designed voice once and clone from it, rather than designing
+    # it afresh on every line. See DESIGNED_VOICES_DIR for why the seed alone
+    # does not hold a voice still.
     if mode == "voice_design" and isinstance(tts_used, VoxCPMSynthesizer):
-        style = eff_style.strip().strip("()")
-        for s in segments:
-            base = s.get("translated_text") or s.get("text", "")
-            if base and not base.startswith("("):
-                s["translated_text"] = f"({style}){base}"
+        designed = await _blocking(
+            _materialize_designed_voice, tts_used, eff_style, voice_seed,
+            target_lang_for_voice,
+        )
+        if designed:
+            speaker_refs = {sp: designed for sp in speakers}
+            speaker_transcripts = {sp: "" for sp in speakers}
+            mode = "designed_ref"
+            log.info(f"[stage] Designed voice materialised: "
+                     f"{os.path.basename(designed)}")
+        else:
+            # Fall back to the per-segment style prefix. It goes on
+            # `tts_text`, never `translated_text`: the SRT, the translation
+            # editor and the assembler's emotion-tag heuristic all read the
+            # latter and must not see a model instruction.
+            log.warning("[stage] Could not materialise the designed voice; "
+                        "falling back to per-segment voice design")
+            style = eff_style.strip().strip("()")
+            for s in segments:
+                base = s.get("translated_text") or s.get("text", "")
+                if base and not base.startswith("("):
+                    s["tts_text"] = f"({style}){base}"
 
     # Preserve-mode: skip TTS for segments that already have valid audio
     if preserve_existing_audio_paths:
@@ -8094,6 +8387,286 @@ async def edit_speaker_ref(
              f"({n_updated} checkpoints updated)")
     return {"ok": True, "speaker_id": speaker_id,
             "new_ref_path": user_ref, "checkpoints_updated": n_updated}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Voice casting — one voice per speaker, auditioned before the GPU runs
+# ═══════════════════════════════════════════════════════════════════════
+# Every voice control that came before these routes was a whole-job switch:
+# a style preset, or one uploaded clip, applied to everyone. On the common
+# case — a video with more than one person in it — that is not a choice
+# between voices, it is the loss of the other speakers. Diarization would run,
+# references would be cut, and then _stage_tts threw them away.
+#
+# Casting replaces the switch with an assignment: {speaker: voice_id}, stored
+# on the job's checkpoints and honoured by both the pipeline stage and the
+# retry path. "source" (the default for any speaker left unassigned) keeps
+# the voice cut from the video, which is the only default that cannot
+# surprise anyone.
+#
+# The audition matters more than it looks. TTS is by far the most expensive
+# stage — a measured 12.25 hours for 1602 segments — and until now the first
+# time anyone heard the cast was after all of it. Three preview segments cost
+# about a minute.
+# ═══════════════════════════════════════════════════════════════════════
+
+def _casting_state(job_id: str) -> Optional[dict]:
+    """The newest checkpoint that can support casting, or None.
+
+    Needs translated text (to preview real lines) and speaker labels, so the
+    translation checkpoint is the earliest one that qualifies; tts_done is
+    preferred when present because it carries the user's per-segment edits.
+    """
+    return (_load_checkpoint(job_id, "tts_done")
+            or _load_checkpoint(job_id, "translation_done"))
+
+
+def _speaker_rows(state: dict, job_id: str) -> list:
+    """Per-speaker summary: how much they say, and a line to preview it with."""
+    segs = state.get("segments") or []
+    by_speaker: dict = {}
+    for sg in segs:
+        sp = sg.get("speaker") or "SPEAKER_00"
+        row = by_speaker.setdefault(sp, {"segments": 0, "seconds": 0.0, "lines": []})
+        row["segments"] += 1
+        row["seconds"] += max(0.0, float(sg.get("end", 0)) - float(sg.get("start", 0)))
+        text = (sg.get("translated_text") or "").strip()
+        if text:
+            row["lines"].append((sg.get("idx"), text))
+
+    refs_dir = OUTPUT_DIR / job_id / "speaker_refs"
+    out = []
+    for sp, row in sorted(by_speaker.items(),
+                          key=lambda kv: -kv[1]["segments"]):
+        # A mid-length line auditions better than the longest or the
+        # shortest: "Да." proves nothing about a voice, and a 40-second
+        # paragraph makes the preview as slow as the thing it is meant to
+        # save you from.
+        lines = sorted(row["lines"], key=lambda t: len(t[1]))
+        pick = lines[len(lines) // 2] if lines else (None, "")
+        has_ref = (refs_dir / f"ref_{sp}.wav").exists()
+        out.append({
+            "speaker": sp,
+            "segments": row["segments"],
+            "seconds": round(row["seconds"], 1),
+            "share": round(row["segments"] / max(len(segs), 1), 3),
+            "sample_idx": pick[0],
+            "sample_text": pick[1][:200],
+            "has_source_ref": has_ref,
+            "audio_url": (f"/api/job/{job_id}/speaker_ref/{sp}/audio"
+                          if has_ref else ""),
+            "waveform_url": (f"/api/job/{job_id}/speaker_ref/{sp}/waveform"
+                             if has_ref else ""),
+        })
+    return out
+
+
+def _validate_cast(cast: dict, speakers: set) -> tuple:
+    """Return (clean_map, errors). Unknown speakers and voices are rejected
+    rather than dropped — a typo that silently does nothing is worse than a
+    400, because you only find out after the render."""
+    choices = _voice_choices()
+    clean, errors = {}, []
+    for sp, vid in (cast or {}).items():
+        vid = str(vid or "").strip()
+        if sp not in speakers:
+            errors.append(f"unknown speaker {sp!r}")
+            continue
+        if vid in ("", "source"):
+            clean[sp] = "source"
+        elif vid in choices or vid.startswith("design:"):
+            clean[sp] = vid
+        else:
+            errors.append(f"unknown voice {vid!r} for {sp}")
+    return clean, errors
+
+
+def _persist_cast(job_id: str, cast: dict) -> int:
+    """Write the map onto every checkpoint a later run might resume from.
+
+    The same shape as edit_speaker_ref: whichever checkpoint /continue or a
+    stage retry picks up, it has to carry the cast, or the re-run silently
+    reverts to whole-job voice mode.
+    """
+    work = OUTPUT_DIR / job_id
+    n = 0
+    for stage in ("transcription_done", "translation_done", "tts_done"):
+        cp = _load_checkpoint(job_id, stage)
+        if cp:
+            cp["speaker_voice_map"] = dict(cast)
+            _save_checkpoint(job_id, work, stage=stage, data=cp)
+            n += 1
+    return n
+
+
+@app.get("/api/dub/{job_id}/voice_casting")
+async def get_voice_casting(job_id: str):
+    """Who speaks in this job, what they are currently cast as, and what
+    else they could be cast as."""
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    state = _casting_state(job_id)
+    if not state:
+        return JSONResponse(
+            {"error": "Nothing to cast yet — this job has not been "
+                      "translated. Casting opens at the translation "
+                      "checkpoint."}, 409)
+    rows = _speaker_rows(state, job_id)
+    cast = dict(state.get("speaker_voice_map") or {})
+    return {
+        "job_id": job_id,
+        "status": jobs[job_id].get("status", ""),
+        "target_lang": state.get("target_lang", ""),
+        "speakers": rows,
+        "map": {r["speaker"]: cast.get(r["speaker"], "source") for r in rows},
+        "voices": sorted(_voice_choices().values(), key=lambda v: v["name"]),
+        "report": jobs[job_id].get("voice_cast_report") or [],
+    }
+
+
+@app.post("/api/dub/{job_id}/voice_casting")
+async def set_voice_casting(job_id: str, request: _ScoutRequest):
+    """Assign voices to speakers. Body: {"map": {"SPEAKER_00": "male_deep"}}.
+
+    Voice ids are a built-in preset ("male_deep"), a library voice
+    ("file:my_clip"), a free-text design ("design:gravelly old sailor"), or
+    "source" to keep the voice from the video. Anything not named keeps its
+    source voice.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    state = _casting_state(job_id)
+    if not state:
+        return JSONResponse({"error": "Nothing to cast yet"}, 409)
+    body = await _json_body(request)
+    speakers = {r["speaker"] for r in _speaker_rows(state, job_id)}
+    clean, errors = _validate_cast(body.get("map") or {}, speakers)
+    if errors:
+        return JSONResponse({"error": "; ".join(errors)}, 400)
+
+    n = _persist_cast(job_id, clean)
+    job = jobs[job_id]
+    job["speaker_voice_map"] = dict(clean)
+    save_job(job)
+    log.info(f"[cast] job={job_id} " +
+             ", ".join(f"{k}={v}" for k, v in sorted(clean.items())) +
+             f" ({n} checkpoints updated)")
+    return {"ok": True, "map": clean, "checkpoints_updated": n}
+
+
+@app.post("/api/dub/{job_id}/voice_preview")
+async def preview_voice_casting(job_id: str, request: _ScoutRequest):
+    """Synthesize a couple of real lines per speaker in the proposed cast.
+
+    Body: {"map": {...}, "per_speaker": 1}. The map is optional — without it
+    the saved cast is previewed. Nothing is persisted: this renders into
+    outputs/<job>/voice_preview/ and hands back URLs, so auditioning a cast
+    never touches the dub.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    job = jobs[job_id]
+    # The preview and the dub want the same GPU, and the worker is a single
+    # process holding a single model. Auditioning mid-synthesis would
+    # contend for it and slow down the very stage this feature exists to
+    # avoid re-running.
+    if job.get("status") in ("synthesizing", "assembling", "merging"):
+        return JSONResponse(
+            {"error": f"Job is {job['status']} — wait for it to pause or "
+                      f"finish before previewing voices"}, 409)
+    state = _casting_state(job_id)
+    if not state:
+        return JSONResponse({"error": "Nothing to preview yet"}, 409)
+
+    body = await _json_body(request)
+    rows = _speaker_rows(state, job_id)
+    speakers = {r["speaker"] for r in rows}
+    raw = body.get("map")
+    if raw is None:
+        cast = dict(state.get("speaker_voice_map") or {})
+    else:
+        cast, errors = _validate_cast(raw, speakers)
+        if errors:
+            return JSONResponse({"error": "; ".join(errors)}, 400)
+    per_speaker = max(1, min(3, int(body.get("per_speaker") or 1)))
+
+    target_lang = state.get("target_lang", "ru")
+    tts_used = _tts_engine_for_lang(get_tts_engine(), target_lang)
+    if not isinstance(tts_used, VoxCPMSynthesizer):
+        return JSONResponse(
+            {"error": f"Voice casting needs a cloning engine; {target_lang} "
+                      f"falls back to edge-tts, which has fixed voices"}, 409)
+
+    refs, transcripts, report = await _resolve_casting(
+        cast, sorted(speakers), state, job_id, tts_used, target_lang,
+    )
+
+    # Pick the lines: the same mid-length rule as the summary, widened when
+    # more than one per speaker is asked for.
+    by_speaker: dict = {}
+    for sg in state.get("segments") or []:
+        text = (sg.get("translated_text") or "").strip()
+        if text:
+            by_speaker.setdefault(sg.get("speaker") or "SPEAKER_00", []).append(sg)
+    chosen = []
+    for sp in sorted(speakers):
+        pool = sorted(by_speaker.get(sp, []), key=lambda g: len(g.get("translated_text", "")))
+        if not pool:
+            continue
+        mid = len(pool) // 2
+        for off in range(per_speaker):
+            i = mid + off - per_speaker // 2
+            if 0 <= i < len(pool):
+                chosen.append(pool[i])
+
+    if not chosen:
+        return JSONResponse({"error": "No translated lines to preview"}, 409)
+
+    # Fresh directory each time: the worker names files by position, so a
+    # shorter second preview would otherwise leave the first one's audio
+    # behind and play it back as if it were the new cast.
+    out_dir = OUTPUT_DIR / job_id / "voice_preview"
+    if out_dir.exists():
+        shutil.rmtree(out_dir, ignore_errors=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    specs = [{"idx": i, "speaker": sg.get("speaker") or "SPEAKER_00",
+              "translated_text": sg.get("translated_text", ""),
+              "text": sg.get("text", "")}
+             for i, sg in enumerate(chosen)]
+    src_lang = state.get("effective_src") or state.get("source_lang", "en")
+    t0 = time.time()
+    done = await _blocking(
+        tts_used.synthesize_segments, specs, str(out_dir),
+        speaker_refs=refs, speaker_transcripts=transcripts,
+        voice_seed=state.get("voice_seed"),
+        tts_speed=state.get("tts_speed", "balanced"),
+        is_cross_lingual=(src_lang != target_lang),
+        target_lang=target_lang,
+    )
+    took = round(time.time() - t0, 1)
+
+    samples = []
+    for spec, sg in zip(done or [], chosen):
+        path = spec.get("audio_path") or ""
+        if not path or not os.path.exists(path):
+            continue
+        samples.append({
+            "speaker": spec.get("speaker"),
+            "voice": cast.get(spec.get("speaker"), "source"),
+            "text": spec.get("translated_text", "")[:200],
+            "start": sg.get("start"),
+            "url": f"/outputs/{job_id}/voice_preview/{os.path.basename(path)}"
+                   f"?v={int(time.time())}",
+        })
+    log.info(f"[cast] Previewed {len(samples)}/{len(specs)} line(s) for "
+             f"job={job_id} in {took}s")
+    if not samples:
+        return JSONResponse(
+            {"error": "Preview produced no audio — check the TTS engine logs",
+             "report": report}, 500)
+    return {"ok": True, "samples": samples, "report": report,
+            "took_sec": took}
 
 
 # ═══════════════════════════════════════════════════════════════════════

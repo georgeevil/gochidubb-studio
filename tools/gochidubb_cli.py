@@ -323,6 +323,71 @@ async def cmd_voices(c: GoChiDUBBClient, a) -> None:
             print(v)
 
 
+def _parse_cast(pairs) -> dict:
+    """--set SPEAKER_00=male_deep, repeated. Kept out of the client so the
+    server stays the single validator of voice ids."""
+    out = {}
+    for item in pairs or []:
+        if "=" not in item:
+            raise ValueError(f"--set expects SPEAKER=voice, got {item!r}")
+        sp, voice = item.split("=", 1)
+        out[sp.strip()] = voice.strip()
+    return out
+
+
+async def cmd_cast(c: GoChiDUBBClient, a) -> None:
+    """Show, set, or audition the voice assigned to each speaker."""
+    cast = _parse_cast(a.set)
+    if cast:
+        res = await c.set_voice_casting(a.job_id, cast)
+        if a.json:
+            _print_json(res)
+        else:
+            print(f"cast saved ({res.get('checkpoints_updated', 0)} checkpoints)")
+
+    if a.preview:
+        res = await c.preview_voice_casting(
+            a.job_id, cast or None, per_speaker=a.per_speaker)
+        if a.json:
+            _print_json(res)
+        else:
+            print(f"previewed {len(res.get('samples', []))} line(s) "
+                  f"in {res.get('took_sec', '?')}s")
+            for smp in res.get("samples", []):
+                print(f"  {smp['speaker']:<12} {smp['voice']:<28} {smp['url']}")
+        return
+
+    if cast:
+        return
+
+    data = await c.get_voice_casting(a.job_id)
+    if a.json:
+        _print_json(data)
+        return
+    current = data.get("map") or {}
+    print(f"cast — job {a.job_id}  (target {data.get('target_lang', '?')}, "
+          f"{data.get('status', '?')})")
+    for sp in data.get("speakers", []):
+        print(f"  {sp['speaker']:<12} {sp['segments']:>5} lines "
+              f"{round(sp['share'] * 100):>3}%  "
+              f"{'ref' if sp['has_source_ref'] else 'NO REF':<6}  "
+              f"→ {current.get(sp['speaker'], 'source')}")
+    print("\navailable voices:")
+    for v in data.get("voices", []):
+        print(f"  {v['id']:<22} {v['kind']:<8} {v['name']}")
+    print("  source                 —        keep the voice cloned from the video")
+    print("  design:<description>   design   describe one in words")
+
+
+async def cmd_continue(c: GoChiDUBBClient, a) -> None:
+    """Resume a job parked at a review gate."""
+    res = await c.continue_job(a.job_id)
+    if a.json:
+        _print_json(res)
+    else:
+        print(f"resuming {a.job_id} from {res.get('resuming_from', '?')}")
+
+
 async def cmd_quality(c: GoChiDUBBClient, a) -> None:
     q = await c.get_quality(a.job_id)
     if a.json:
@@ -526,7 +591,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--mode", default="dub", choices=["dub", "reupload"],
                    help="reupload = download + remux only (music videos)")
     s.add_argument("--wizard-mode", default="auto",
-                   choices=["auto", "review_translation", "review_transcript"],
+                   choices=["auto", "review_translation", "review_transcript",
+                            "review_voices"],
                    help="Pause for human review at a checkpoint")
     s.add_argument("--at", metavar="WHEN",
                    help="Schedule start: unix epoch or ISO datetime "
@@ -599,6 +665,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.set_defaults(handler=cmd_showcase_rebuild)
 
     # quality / audit
+    s = sub.add_parser("cast", help="Assign one voice per speaker, and audition it")
+    s.add_argument("job_id")
+    s.add_argument("--set", action="append", metavar="SPEAKER=VOICE",
+                   help="Assign a voice. VOICE is a preset id, file:<name>, "
+                        "design:<description>, or source. Repeatable.")
+    s.add_argument("--preview", action="store_true",
+                   help="Synthesize a real line per speaker and print the URLs")
+    s.add_argument("--per-speaker", type=int, default=1, dest="per_speaker",
+                   help="Lines to preview per speaker (1-3, default 1)")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(handler=cmd_cast)
+
+    s = sub.add_parser("continue", help="Resume a job parked at a review gate")
+    s.add_argument("job_id")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(handler=cmd_continue)
+
     s = sub.add_parser("quality", help="Per-stage quality scores + actionable verdicts")
     s.add_argument("job_id")
     s.add_argument("--json", action="store_true")

@@ -49,6 +49,9 @@ gochidubb.db-journal
 # User-supplied reference voices (may be private)
 presets/voices/*.wav
 presets/voices/*.mp3
+# Designed-voice cache: clips VoxCPM drew from a style description, keyed by
+# (style, seed, language). Regenerated on demand and machine-specific.
+presets/voices/.designed/
 !presets/voices/.gitkeep
 
 # Bundled binaries

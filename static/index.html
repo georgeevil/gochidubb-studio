@@ -99,6 +99,14 @@ const WHISPER_MODELS = [
   { id: 'small', name: 'small', size: '460 MB', detail: 'Fast · clean audio only' },
 ];
 
+// Statuses that park a job in front of a human. Every one of them is a
+// pipeline gate placed before an expensive stage, so a job sitting in one is
+// waiting on a decision, not on the machine.
+const REVIEW_STATUSES = new Set([
+  'awaiting_translation_review', 'awaiting_transcript_review',
+  'awaiting_voice_review',
+]);
+
 // Active job status set
 const ACTIVE_STATUSES = new Set([
   'queued', 'running', 'downloading', 'extracting', 'resuming',
@@ -124,7 +132,7 @@ const stageForStatus = (status) => {
       return 1;
     case 'translating':
       return 2;
-    case 'awaiting_translation_review':
+    case 'awaiting_translation_review': case 'awaiting_voice_review':
       return 3;
     case 'synthesizing':
       return 4;
@@ -150,6 +158,7 @@ const STATUS_META = {
   queued:                         { color: 'var(--ink-3)',  label: 'Queued' },
   scheduled:                      { color: '#8a9aff',       label: 'Scheduled' },
   awaiting_transcript_review:     { color: 'var(--warn)',   label: 'Awaiting transcript review' },
+  awaiting_voice_review:          { color: 'var(--warn)',   label: 'Awaiting voice casting' },
   running:                        { color: 'var(--accent)', label: 'Running' },
   downloading:                    { color: 'var(--accent)', label: 'Downloading' },
   extracting:                     { color: 'var(--accent)', label: 'Extracting' },
@@ -1033,7 +1042,11 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
   const [autoDenoise, setAutoDenoise] = useState(() => _lsGet('autoDenoise', false));
   const [lipSync, setLipSync] = useState(() => _lsGet('lipSync', false));
   const [llmRegroup, setLlmRegroup] = useState(() => _lsGet('llmRegroup', false));
-  const [wizardReview, setWizardReview] = useState(() => _lsGet('wizardReview', false));
+  // Was a boolean ("pause after translation, y/n"). It is a mode now, since
+  // there is more than one thing worth pausing for; the old stored boolean
+  // still maps onto the gate it used to mean.
+  const [wizardMode, setWizardMode] = useState(
+    () => _lsGet('wizardMode', _lsGet('wizardReview', false) ? 'review_translation' : 'auto'));
   // Per-job VoxCPM overrides. 0 = "auto", i.e. follow Settings -> Voice & TTS.
   const [voxCfg, setVoxCfg] = useState(() => _lsGet('voxCfg', 0));
   const [voxSteps, setVoxSteps] = useState(() => _lsGet('voxSteps', 0));
@@ -1145,7 +1158,7 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
   useEffect(() => { _lsSet('autoDenoise', autoDenoise); }, [autoDenoise]);
   useEffect(() => { _lsSet('lipSync', lipSync); }, [lipSync]);
   useEffect(() => { _lsSet('llmRegroup', llmRegroup); }, [llmRegroup]);
-  useEffect(() => { _lsSet('wizardReview', wizardReview); }, [wizardReview]);
+  useEffect(() => { _lsSet('wizardMode', wizardMode); }, [wizardMode]);
   useEffect(() => { _lsSet('voxCfg', voxCfg); }, [voxCfg]);
   useEffect(() => { _lsSet('voxSteps', voxSteps); }, [voxSteps]);
   useEffect(() => { _lsSet('qtTrim', qtTrimSeconds); }, [qtTrimSeconds]);
@@ -1175,7 +1188,7 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
     fd.append('tts_speed', ttsSpeed);
     fd.append('voxcpm_cfg', String(voxCfg));
     fd.append('voxcpm_steps', String(voxSteps));
-    fd.append('wizard_mode', wizardReview ? 'review_translation' : 'auto');
+    fd.append('wizard_mode', wizardMode);
     fd.append('auto_denoise', autoDenoise);
     fd.append('llm_regroup', llmRegroup);
     fd.append('lip_sync', lipSync);
@@ -1249,7 +1262,7 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
     fd.append('keep_bg', keepBg);
     fd.append('auto_denoise', autoDenoise);
     fd.append('context_hint', contextHint);
-    fd.append('wizard_mode', wizardReview ? 'review_translation' : 'auto');
+    fd.append('wizard_mode', wizardMode);
     fd.append('lip_sync', lipSync);
     try {
       const r = await fetch('/api/quick_test', { method: 'POST', body: fd });
@@ -1534,7 +1547,18 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
                   ? 'Wav2Lip not detected. Install via System tab to enable. Adds 2-5x video duration to processing time.'
                   : 'Auto-runs Wav2Lip after dubbing. Best for talking-head footage; fails on action shots or far-away faces. Adds 2-5x video duration.'}/>
         <Toggle value={llmRegroup}  onChange={setLlmRegroup}  label="LLM segment regrouping" hint="+20-40s on long videos · fixes mid-sentence breaks · best for podcasts, lectures, seminars"/>
-        <Toggle value={wizardReview} onChange={setWizardReview} label="Wizard mode — pause for review" hint="Pause after translation so you can edit segments and replace voice references."/>
+        <div style={{ marginTop: 12 }}>
+          <Field label="Pause for review"
+                 hint="Both gates sit in front of synthesis, which is by far the
+                       longest stage — a 1602-segment dub spent 12 hours in it.
+                       Anything caught here is caught before that.">
+            <Select value={wizardMode} onChange={setWizardMode}>
+              <option value="auto">Don't pause — run straight through</option>
+              <option value="review_translation">After translation — edit the lines</option>
+              <option value="review_voices">After translation — cast a voice per speaker</option>
+            </Select>
+          </Field>
+        </div>
 
         {/* Per-job VoxCPM tuning. The same two knobs live in Settings ->
             Voice & TTS as global defaults; these override them for this run
@@ -3600,12 +3624,221 @@ function ProcessingView({ runningJob, sphereOn, system, voicePresets, onJobCance
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// REVIEW VIEW (placeholder)
+// VOICE CASTING — one voice per speaker, auditioned before the GPU runs
+// ═══════════════════════════════════════════════════════════════════
+// Every voice control before this one was a whole-job switch: a style preset,
+// or one uploaded clip, for everybody. On a video with more than one person
+// in it that is not a choice between voices, it is the loss of the other
+// speakers — diarization ran, references were cut, and the TTS stage threw
+// them away. This assigns a voice per speaker instead, and plays it back
+// before committing to the longest stage in the pipeline.
+function VoiceCastingPanel({ jobId, onCastChange }) {
+  const [data, setData] = useState(null);
+  const [err, setErr] = useState('');
+  const [map, setMap] = useState({});
+  const [custom, setCustom] = useState({});      // speaker -> free-text style
+  const [samples, setSamples] = useState([]);
+  const [busy, setBusy] = useState('');
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    setData(null); setErr(''); setSamples([]);
+    fetch(`/api/dub/${jobId}/voice_casting`)
+      .then(r => r.json())
+      .then(d => {
+        if (d.error) { setErr(d.error); return; }
+        setData(d);
+        const m = {}, c = {};
+        for (const [sp, vid] of Object.entries(d.map || {})) {
+          if (typeof vid === 'string' && vid.startsWith('design:')) {
+            m[sp] = 'design:'; c[sp] = vid.slice('design:'.length);
+          } else { m[sp] = vid || 'source'; }
+        }
+        setMap(m); setCustom(c);
+      })
+      .catch(e => setErr(String(e.message || e)));
+  }, [jobId]);
+
+  // What the server should store: the select's value, except that a custom
+  // design carries its text along with it.
+  const resolved = () => {
+    const out = {};
+    for (const [sp, vid] of Object.entries(map)) {
+      out[sp] = vid === 'design:'
+        ? ('design:' + (custom[sp] || '').trim())
+        : vid;
+    }
+    return out;
+  };
+  const customIncomplete = Object.entries(map)
+    .some(([sp, v]) => v === 'design:' && !(custom[sp] || '').trim());
+
+  const pick = (sp, vid) => {
+    setMap(m => ({ ...m, [sp]: vid }));
+    setSaved(false); setSamples([]);
+  };
+
+  // Hand the current cast up so Continue can commit it. Reported from an
+  // effect rather than from the change handlers: a custom description is
+  // typed a character at a time, and every one of those keystrokes has to
+  // reach the parent or Continue saves a truncated style.
+  useEffect(() => {
+    if (onCastChange) onCastChange(resolved(), !customIncomplete);
+  }, [map, custom, data]);
+
+  const save = async () => {
+    setBusy('save'); setErr('');
+    try {
+      const r = await fetch(`/api/dub/${jobId}/voice_casting`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ map: resolved() }),
+      });
+      const d = await r.json();
+      if (d.error) setErr(d.error); else setSaved(true);
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy('');
+  };
+
+  const preview = async () => {
+    setBusy('preview'); setErr(''); setSamples([]);
+    try {
+      const r = await fetch(`/api/dub/${jobId}/voice_preview`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ map: resolved(), per_speaker: 1 }),
+      });
+      const d = await r.json();
+      if (d.error) setErr(d.error); else setSamples(d.samples || []);
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy('');
+  };
+
+  if (err && !data) {
+    return <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{err}</div>;
+  }
+  if (!data) {
+    return <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>Loading speakers…</div>;
+  }
+
+  const byName = (a, b) => a.name.localeCompare(b.name);
+  const library = (data.voices || []).filter(v => v.kind === 'library').sort(byName);
+  const designs = (data.voices || []).filter(v => v.kind === 'design').sort(byName);
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <div style={{ fontSize: 12, color: 'var(--ink-3)', lineHeight: 1.6 }}>
+        {data.speakers.length} speaker{data.speakers.length === 1 ? '' : 's'} in
+        this audio. Unassigned speakers keep the voice cut from the video.
+      </div>
+
+      {data.speakers.map(sp => (
+        <div key={sp.speaker} style={{
+          border: '1px solid var(--line)', borderRadius: 'var(--r-md)',
+          padding: 12, display: 'flex', flexDirection: 'column', gap: 8,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+            <div className="mono" style={{ fontSize: 12 }}>{sp.speaker}</div>
+            <div style={{ fontSize: 11, color: 'var(--ink-3)' }}>
+              {sp.segments} line{sp.segments === 1 ? '' : 's'} ·{' '}
+              {Math.round(sp.share * 100)}% · {Math.round(sp.seconds)}s
+            </div>
+            <div style={{ flex: 1 }}/>
+            {sp.audio_url && (
+              <audio controls preload="none" src={sp.audio_url}
+                     style={{ height: 28, maxWidth: 220 }}/>
+            )}
+          </div>
+
+          <Select value={map[sp.speaker] || 'source'}
+                  onChange={v => pick(sp.speaker, v)}>
+            <option value="source">
+              {sp.has_source_ref
+                ? 'Keep their own voice (cloned from the video)'
+                : 'Keep their own voice — no reference was extracted'}
+            </option>
+            {library.length > 0 && (
+              <optgroup label="Your voices">
+                {library.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+              </optgroup>
+            )}
+            <optgroup label="Designed">
+              {designs.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+              <option value="design:">Describe a voice…</option>
+            </optgroup>
+          </Select>
+
+          {map[sp.speaker] === 'design:' && (
+            <input className="field" value={custom[sp.speaker] || ''}
+                   placeholder="e.g. gravelly older man, unhurried, slight rasp"
+                   onChange={e => {
+                     const v = e.target.value;
+                     setCustom(c => ({ ...c, [sp.speaker]: v }));
+                     setSaved(false); setSamples([]);
+                   }}/>
+          )}
+
+          {sp.sample_text && (
+            <div className="wrap-any" style={{ fontSize: 11, color: 'var(--ink-4)' }}>
+              “{sp.sample_text}”
+            </div>
+          )}
+        </div>
+      ))}
+
+      {samples.length > 0 && (
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+          <div className="caps">Audition</div>
+          {samples.map((s, i) => (
+            <div key={i} style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              <div style={{ fontSize: 11, color: 'var(--ink-3)' }}>
+                <span className="mono">{s.speaker}</span> · {s.voice}
+              </div>
+              <audio controls src={s.url} style={{ width: '100%', height: 32 }}/>
+              <div className="wrap-any" style={{ fontSize: 11, color: 'var(--ink-4)' }}>
+                “{s.text}”
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {err && <div style={{ fontSize: 12, color: 'var(--err)' }}>{err}</div>}
+
+      <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+        <button className="btn btn-ghost" onClick={preview}
+                disabled={!!busy || customIncomplete}>
+          {busy === 'preview' ? 'Rendering…' : 'Preview this cast'}
+        </button>
+        <button className="btn btn-ghost" onClick={save}
+                disabled={!!busy || customIncomplete}>
+          {busy === 'save' ? 'Saving…' : saved ? '✓ Saved' : 'Save cast'}
+        </button>
+        {customIncomplete && (
+          <span style={{ fontSize: 11, color: 'var(--ink-4)' }}>
+            Describe the custom voice first
+          </span>
+        )}
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--ink-4)', lineHeight: 1.6 }}>
+        A preview renders one real line per speaker — about a minute, and it
+        writes nothing to the dub. Continue saves the cast for you; Save cast
+        keeps it without resuming the job.
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// REVIEW VIEW — the human gate in front of synthesis
 // ═══════════════════════════════════════════════════════════════════
 function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, onPickJob }) {
-  const reviewJobs = jobs.filter(j => j.status === 'awaiting_translation_review' || j.status === 'awaiting_transcript_review');
+  const reviewJobs = jobs.filter(j => REVIEW_STATUSES.has(j.status));
   const job = selectedJobId ? jobs.find(j => j.id === selectedJobId) : reviewJobs[0];
-  
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [cast, setCast] = useState(null);      // {map, valid} from the panel
+  const onCastChange = useCallback(
+    (map, valid) => setCast({ map, valid }), []);
+
   if (!job) {
     return (
       <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 16, padding: 'var(--pad)', background: 'var(--bg)' }}>
@@ -3616,10 +3849,81 @@ function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, 
       </div>
     );
   }
+
+  const casting = job.status === 'awaiting_voice_review';
+
+  // Actually resume the job. This used to only flip a tab, which left every
+  // wizard-mode job parked at its checkpoint forever unless you went and
+  // POSTed to /continue by hand.
+  const proceed = async () => {
+    setBusy(true); setErr('');
+    try {
+      // Commit the cast first. Continuing with an unsaved cast would run the
+      // whole synthesis stage against whatever was last persisted, which is
+      // the one mistake this screen exists to prevent.
+      if (casting && cast && cast.valid) {
+        const cr = await fetch(`/api/dub/${job.id}/voice_casting`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ map: cast.map }),
+        });
+        const cd = await cr.json();
+        if (cd.error) { setErr(cd.error); setBusy(false); return; }
+      }
+      const r = await fetch(`/api/dub/${job.id}/continue`, {
+        method: 'POST', body: new FormData(),
+      });
+      const d = await r.json();
+      if (d.error) { setErr(d.error); setBusy(false); return; }
+      onContinued();
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
   return (
-    <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 'var(--pad)', background: 'var(--bg)' }}>
-      <div className="serif" style={{ fontSize: 24 }}>Review: {job.title || job.source_label || job.id}</div>
-      <button className="btn btn-primary" style={{ marginLeft: 20 }} onClick={onContinued}>Continue</button>
+    <div style={{ flex: 1, minHeight: 0, overflowY: 'auto', padding: 'var(--pad)', background: 'var(--bg)' }}>
+      <div style={{ maxWidth: 680, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
+        {reviewJobs.length > 1 && (
+          <Field label="Waiting on you">
+            <Select value={job.id} onChange={onPickJob}>
+              {reviewJobs.map(j => (
+                <option key={j.id} value={j.id}>
+                  {(j.title || j.source_label || j.id).slice(0, 70)}
+                  {' — '}{(STATUS_META[j.status] || {}).label || j.status}
+                </option>
+              ))}
+            </Select>
+          </Field>
+        )}
+
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 12, flexWrap: 'wrap' }}>
+          <div className="serif wrap-any" style={{ fontSize: 24, letterSpacing: '-0.01em' }}>
+            {job.title || job.source_label || job.id}
+          </div>
+          <StatusBadge status={job.status}/>
+        </div>
+        {job.step_detail && (
+          <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{job.step_detail}</div>
+        )}
+
+        {casting && (
+          <div>
+            <SectionHeader title="Cast the voices"
+                           subtitle="one per speaker, before the long stage"/>
+            <VoiceCastingPanel jobId={job.id} onCastChange={onCastChange}/>
+          </div>
+        )}
+
+        {err && <div style={{ fontSize: 12, color: 'var(--err)' }}>{err}</div>}
+
+        <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+          <button className="btn btn-primary" onClick={proceed}
+                  disabled={busy || (casting && cast && !cast.valid)}
+                  style={{ padding: '10px 16px' }}>
+            {busy ? 'Resuming…' : 'Continue'} {!busy && I.arrow}
+          </button>
+          <button className="btn btn-ghost" onClick={onCancel}>Later</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -6248,7 +6552,7 @@ function App() {
   }, [jobs.some(j => ACTIVE_STATUSES.has(j.status))]);
 
   const runningJob = jobs.find(j => ACTIVE_STATUSES.has(j.status));
-  const awaitingReviewCount = jobs.filter(j => j.status === 'awaiting_translation_review').length;
+  const awaitingReviewCount = jobs.filter(j => REVIEW_STATUSES.has(j.status)).length;
 
   const onJobSubmitted = (jobId) => {
     setJobsTab('live');

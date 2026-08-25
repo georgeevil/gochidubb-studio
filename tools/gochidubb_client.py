@@ -338,6 +338,43 @@ class GoChiDUBBClient:
         Same engine as `python tools/audit_job.py <id>`."""
         return await self._request("GET", f"/api/dub/{job_id}/audit")
 
+    # ── voice casting ────────────────────────────────────────────────
+    async def get_voice_casting(self, job_id: str) -> dict:
+        """Who speaks in this job, how they are cast, and what else they
+        could be cast as. Available once the job has been translated."""
+        return await self._request("GET", f"/api/dub/{job_id}/voice_casting")
+
+    async def set_voice_casting(self, job_id: str, cast: dict) -> dict:
+        """Assign voices to speakers: {"SPEAKER_00": "male_deep"}.
+
+        A voice is a built-in preset id, a library voice ("file:name"), a
+        free-text design ("design:gravelly old sailor"), or "source" to keep
+        the voice cloned from the video. Any speaker left out keeps theirs.
+        """
+        return await self._request(
+            "POST", f"/api/dub/{job_id}/voice_casting", json={"map": cast})
+
+    async def preview_voice_casting(self, job_id: str,
+                                    cast: Optional[dict] = None,
+                                    per_speaker: int = 1) -> dict:
+        """Synthesize a real line per speaker in the proposed cast.
+
+        Writes nothing to the dub. Slow — it drives the TTS engine — but a
+        rounding error next to the synthesis stage it lets you avoid
+        re-running.
+        """
+        body: dict = {"per_speaker": per_speaker}
+        if cast is not None:
+            body["map"] = cast
+        return await self._request(
+            "POST", f"/api/dub/{job_id}/voice_preview", json=body)
+
+    async def continue_job(self, job_id: str) -> dict:
+        """Resume a job parked at a wizard review gate."""
+        # No body: every field on the route has a default, so an empty POST
+        # means "resume as configured", which is what a review gate wants.
+        return await self._request("POST", f"/api/dub/{job_id}/continue")
+
     # ── publish (VK etc.) ────────────────────────────────────────────
     async def publish_stage(self, job_id: str, *, platform: str = "vk",
                             export_preset: Optional[str] = None) -> dict:
