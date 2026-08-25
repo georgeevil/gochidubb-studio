@@ -4337,6 +4337,17 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
                 {openId === j.id ? 'Hide stages' : 'Stages'}
               </button>
               {j.status === 'complete' && <button className="btn" onClick={() => onJumpResult(j.id)}>View</button>}
+              {/* A job at a review gate has stopped and will not move until
+                  somebody acts on it, so the row has to offer the action. The
+                  handler was already being passed in and was never called:
+                  the only route to the review screen was the header chip,
+                  which hides itself on this very screen. */}
+              {REVIEW_STATUSES.has(j.status) && (
+                <button className="btn btn-primary" style={{ padding: '4px 10px', fontSize: 11.5 }}
+                        onClick={() => onJumpReview(j.id)}>
+                  {j.status === 'awaiting_voice_review' ? 'Cast voices' : 'Review'}
+                </button>
+              )}
               {/* Selects just this row and opens the shared confirm, so there
                   is one delete path rather than two that can disagree. */}
               <button className="btn btn-ghost" title="Delete this job and its files"

@@ -1117,6 +1117,7 @@ function reviewHTML() {
     <a class="btn" href="#/">← Back to your videos</a></div>`;
 
   if (!reviewable(r.job)) return notReviewableHTML(r.job);
+  if (r.job.status === "awaiting_voice_review") return voiceReviewHTML(r.job);
 
   const open = r.flags.filter(f => !r.decided[f.idx]);
   const lang = langName(r.job.target_lang);
@@ -1178,6 +1179,29 @@ function reviewHTML() {
 /** #/review/<id> for a job that is not waiting on anyone. Reachable with the
  *  Back button after any review, so it has to say what the job really is —
  *  and offer to watch it, never to record over it. */
+function voiceReviewHTML(job) {
+  // This job paused to pick a voice per speaker, not to check the
+  // translation — and the translation review below would happily tell the
+  // creator "nothing to check" about a question nobody asked. Casting is a
+  // Pro-mode screen, so say what the job is waiting for and point at it,
+  // rather than answering the wrong question confidently.
+  const lang = langName(job.target_lang);
+  return `<div class="shell">
+    <div class="card" style="max-width:560px;margin:0 auto;text-align:center">
+      <h1 style="font-size:20px;margin:0 0 8px">Waiting on the voices</h1>
+      <p class="muted" style="font-size:13.5px;line-height:1.6;margin:0 0 16px">
+        ${esc(lang)} is paused so you can choose who speaks each part. Picking
+        voices per speaker lives in Pro mode — or record it now and everyone
+        keeps the voice from the original video.
+      </p>
+      <div class="stack-sm" style="align-items:center">
+        <a class="btn btn--primary btn--lg" href="/pro">Choose voices in Pro mode →</a>
+        <button type="button" class="btn" data-act="record">Record it with the original voices</button>
+      </div>
+    </div>
+  </div>`;
+}
+
 function notReviewableHTML(job) {
   const k = jobState(job);
   const lang = langName(job.target_lang);
