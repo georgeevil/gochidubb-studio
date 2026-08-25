@@ -2874,7 +2874,18 @@ async def _stage_tts(job, work, ctx, update, perf):
     t0 = time.time()
     if todo:
         if isinstance(tts_used, VoxCPMSynthesizer):
-            todo = tts_used.synthesize_segments(
+            # Off the event loop — see _blocking's docstring, which describes
+            # this exact failure and was written for the stages around it.
+            # This call was the one that never got moved, and it is the
+            # longest: while it ran, the server answered no HTTP at all.
+            # Measured mid-dub: /api/system did not respond in 90 seconds, so
+            # the UI, the CLI and the MCP server were all dead for the hours
+            # synthesis takes. The progress callback writes through
+            # save_job_sync, which opens its own connection per call, and it
+            # never passes `status`, so nothing on that path schedules a task
+            # or fires a webhook from the worker thread.
+            todo = await _blocking(
+                tts_used.synthesize_segments,
                 todo, tts_dir,
                 speaker_refs=speaker_refs,
                 speaker_transcripts=speaker_transcripts,
@@ -7319,7 +7330,10 @@ async def _run_tts_and_merge_stage(
             # since that's the common dubbing use-case)
             src_lang = state.get("effective_src") or state.get("source_lang", "en")
             tgt_lang = state.get("target_lang", "ru")
-            synth_input = tts_used.synthesize_segments(
+            # Off the event loop, as in _stage_tts — retry_tts, redub and
+            # per-segment regen all come through here.
+            synth_input = await _blocking(
+                tts_used.synthesize_segments,
                 synth_input, tts_dir,
                 speaker_refs=speaker_refs,
                 speaker_transcripts=speaker_transcripts,
