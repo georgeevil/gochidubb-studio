@@ -100,6 +100,23 @@ def test_test_environment_uses_its_own_prefix():
     assert token.startswith(apikeys.PREFIX_TEST)
 
 
+def test_legacy_records_without_environment_list_as_live():
+    """Keys minted before the environment split must render as live."""
+    import json
+
+    rec, _ = apikeys.create("old-timer", ["dub:write"])
+    raw = json.loads(apikeys.KEYS_FILE.read_text(encoding="utf-8"))
+    for r in raw:
+        r.pop("environment", None)
+    apikeys.KEYS_FILE.write_text(json.dumps(raw), encoding="utf-8")
+
+    (listed,) = apikeys.list_keys()
+    assert listed["environment"] == "live"
+    # The stored record itself stays untouched — only the projection defaults.
+    on_disk = json.loads(apikeys.KEYS_FILE.read_text(encoding="utf-8"))
+    assert "environment" not in on_disk[0]
+
+
 def test_last_used_is_recorded_on_verify():
     rec, token = apikeys.create("ci", ["dub:write"])
     assert rec["last_used"] is None
