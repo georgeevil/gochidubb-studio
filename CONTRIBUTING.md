@@ -25,7 +25,7 @@ pipeline/
 ## Setup
 
 ```bash
-git clone https://github.com/georgeevil/gochidubb
+git clone https://github.com/georgeevil/gochidubb-studio
 cd gochidubb
 ./install.sh           # or install.bat on Windows
 source venv/bin/activate

@@ -16,7 +16,7 @@ ask things like *"dub this YouTube short into French and German"* or
 *"build a 5-language showcase reel of this clip"* — Claude picks the
 right tool and waits for it.
 
-Repo: https://github.com/georgeevil/gochidubb
+Repo: https://github.com/georgeevil/gochidubb-studio
 By [George Chigrichenko](https://x.com/GChigrichenko) ([@georgeevil](https://github.com/georgeevil)), built with Claude.
 
 ## When this skill applies

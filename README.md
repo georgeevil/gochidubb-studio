@@ -11,7 +11,7 @@ YouTube link in → voice-cloned dub in 65 languages out. No cloud, no per-minut
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 optional [![CUDA 12.0+](https://img.shields.io/badge/CUDA-12.0+-76B900.svg)](https://developer.nvidia.com/cuda-downloads)
 [![MCP enabled](https://img.shields.io/badge/MCP-enabled-7B61FF.svg)](https://modelcontextprotocol.io)
-[![GitHub stars](https://img.shields.io/github/stars/georgeevil/gochidubb?style=social)](https://github.com/georgeevil/gochidubb/stargazers)
+[![GitHub stars](https://img.shields.io/github/stars/georgeevil/gochidubb-studio?style=social)](https://github.com/georgeevil/gochidubb-studio/stargazers)
 
 [**Quickstart**](#-30-second-quickstart) ·
 [**Demo**](#-demo) ·
@@ -61,7 +61,7 @@ If you're dubbing a 10-minute video weekly across 5 languages, this saves you ab
 ### Linux / macOS
 
 ```bash
-git clone https://github.com/georgeevil/gochidubb && cd gochidubb
+git clone https://github.com/georgeevil/gochidubb-studio && cd gochidubb-studio
 chmod +x install.sh
 ./install.sh    # installs everything + creates start.sh
 ./start.sh
@@ -808,7 +808,7 @@ Each MCP tool call requires user confirmation by default (per the MCP spec). Goc
 - [ ] Hardware-accelerated diarization (NVIDIA NeMo)
 - [ ] Apple Silicon MLX backend
 
-Vote / suggest features in [Discussions](https://github.com/georgeevil/gochidubb/discussions).
+Vote / suggest features in [Discussions](https://github.com/georgeevil/gochidubb-studio/discussions).
 
 ---
 

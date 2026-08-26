@@ -5,7 +5,7 @@
 If you find a security issue (code execution, path traversal, SSRF, auth bypass, exfiltration of local files via the API, etc.), please **do not open a public issue**.
 
 Open a private security advisory on GitHub:
-https://github.com/georgeevil/gochidubb/security/advisories/new
+https://github.com/georgeevil/gochidubb-studio/security/advisories/new
 
 Or DM on X: [@GChigrichenko](https://x.com/GChigrichenko).
 
