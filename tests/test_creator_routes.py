@@ -660,6 +660,31 @@ def test_the_creator_page_does_not_pull_a_cdn(client):
     assert "cdn.jsdelivr" not in body
 
 
+@pytest.mark.parametrize("content", PREFS_THAT_MUST_SERVE_PRO
+                         + [pytest.param('{"ui_mode":"creator"}', id="creator")])
+def test_go_is_unconditional_and_never_touches_ui_mode(prefs, content):
+    """/go is the phone surface: always served, and visiting it must not
+    flip which desktop front door GET / serves (unlike /pro and /creator,
+    which persist the preference on purpose)."""
+    if content is not None:
+        prefs.path.write_text(content, encoding="utf-8")
+    before = prefs.path.read_text(encoding="utf-8") if prefs.path.exists() else None
+    r = prefs.get("/go")
+    assert r.status_code == 200
+    assert b"go.css" in r.content
+    after = prefs.path.read_text(encoding="utf-8") if prefs.path.exists() else None
+    assert after == before
+
+
+def test_the_go_page_does_not_pull_a_cdn(client):
+    """Same offline rule as Creator: /go must paint with nothing but the
+    server that serves it — no CDN scripts, no web fonts."""
+    body = client.get("/go").content.decode("utf-8", "replace")
+    assert "unpkg.com" not in body
+    assert "cdn.jsdelivr" not in body
+    assert "fonts.googleapis.com" not in body
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  POST /api/quick_test?background=1 — the preparing status must terminate
 # ═══════════════════════════════════════════════════════════════════════

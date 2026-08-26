@@ -1,0 +1,1315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>GoChiDUBB Go</title>
+<!-- Phone-first front door ("GoChiDUBB Go"). Same server, same jobs table
+     as Pro/Creator — this page is what you open on a phone pointed at the
+     Studio box. No CDN, same rule as creator.html: it must paint with
+     nothing but the server that serves it. -->
+<link rel="stylesheet" href="/static/go.css">
+</head>
+<body>
+<div id="app"></div>
+<div id="toast" hidden></div>
+<input id="clipFile" type="file" accept="video/*" hidden>
+<audio id="flagAudio" hidden></audio>
+<script>
+"use strict";
+
+// ═══════════════════════════════════════════════════════════════════
+// Helpers
+// ═══════════════════════════════════════════════════════════════════
+
+const $ = (s, root) => (root || document).querySelector(s);
+const esc = (s) => String(s == null ? "" : s)
+  .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+const abs = (p) => new URL(p, location.origin).href;
+const fmtDur = (secs) => {
+  secs = Math.max(0, Math.round(+secs || 0));
+  return Math.floor(secs / 60) + ":" + String(secs % 60).padStart(2, "0");
+};
+const timeAgo = (ts) => {
+  if (!ts) return "";
+  const d = Date.now() / 1000 - ts;
+  if (d < 90) return "just now";
+  if (d < 3600) return Math.round(d / 60) + " min ago";
+  if (d < 86400) return Math.round(d / 3600) + " h ago";
+  return Math.round(d / 86400) + " d ago";
+};
+const lsGet = (k, dflt) => {
+  try { const v = localStorage.getItem(k); return v == null ? dflt : JSON.parse(v); }
+  catch (e) { return dflt; }
+};
+const lsSet = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { /* private mode */ } };
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  let body = null;
+  try { body = await r.json(); } catch (e) { /* non-JSON */ }
+  if (!r.ok) throw new Error((body && body.error) || (r.status + " " + r.statusText));
+  return body;
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const t = $("#toast");
+  t.textContent = msg;
+  t.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.hidden = true; }, 2400);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// State
+// ═══════════════════════════════════════════════════════════════════
+
+// The phone's own feed is the set of runs *started from this phone* —
+// stored locally, matching the promise on the Activity screen: dubs made
+// here always show up; the server's full jobs table is the Activity tab.
+const S = {
+  screen: "home",           // home | activity | voices | record | langs |
+                            // progress | review | done | preview | share | pair
+  // catalog
+  langNames: {},            // code -> display name (from /api/languages)
+  allCodes: [],
+  presets: [],              // /api/voice_presets (file presets first)
+  system: null,
+  // record
+  recording: false, recSecs: 0, orient: "916", scriptOpen: false,
+  script: lsGet("go_script", ""),
+  camError: "",
+  clipBlob: null, clipName: "", clipSecs: 0,
+  // langs / options
+  sel: new Set(lsGet("go_langsel", ["es", "de", "hi", "ru"])),
+  langsExpanded: false,
+  voice: "video",           // video | saved | pro
+  proPreset: null,          // preset id when voice === 'pro'
+  myVoice: lsGet("go_myvoice", null),   // {id, name} once a sample is saved
+  gate: lsGet("go_gate", true),
+  captions: lsGet("go_captions", false),
+  redubOf: null, redubTitle: "",
+  // current run + feed
+  runs: lsGet("go_batches", []),        // [{batch, ids, title, langs, captions, created, secs}]
+  run: null,                            // the entry being watched on /progress
+  jobsById: {},                         // id -> compact job (poll cache)
+  starting: false,
+  // review
+  reviewJob: null, flags: [], flagsAudio: "", decisions: {}, editingFlag: null,
+  // preview / share
+  pvEntry: null, pvLang: null, pvMode: "dub", pvSubsOk: {},
+  // voices tab
+  sampleRec: false, sampleSecs: 0, savingSample: false,
+  playingPreset: null,
+  burned: {},               // job id -> burn_subs already requested
+};
+
+const FEATURED = ["es", "de", "hi", "ru", "fr", "ja", "pt", "ko", "ar"];
+const REVIEW_GATES_ON = JSON.stringify({
+  transcript: "off", translation: "flagged_only",
+  voice_cast: "off", subtitles: "off", final_qc: "off",
+});
+const REVIEW_GATES_OFF = JSON.stringify({
+  transcript: "off", translation: "off",
+  voice_cast: "off", subtitles: "off", final_qc: "off",
+});
+
+function langName(code) { return S.langNames[code] || (code || "").toUpperCase(); }
+
+function saveRuns() { lsSet("go_batches", S.runs.slice(0, 60)); }
+
+// ═══════════════════════════════════════════════════════════════════
+// Rendering
+// ═══════════════════════════════════════════════════════════════════
+
+const app = $("#app");
+
+function render() {
+  stopPrompterScroll();
+  const views = {
+    home: vHome, activity: vActivity, voices: vVoices, record: vRecord,
+    langs: vLangs, progress: vProgress, review: vReview, done: vDone,
+    preview: vPreview, share: vShare, pair: vPair,
+  };
+  app.innerHTML = (views[S.screen] || vHome)();
+  afterRender();
+}
+
+function tabBar() {
+  const tab = (key, glyph, label, act) => `
+    <button class="${S.screen === key ? "on" : ""}" onclick="${act}">
+      <span class="pill">${glyph}</span><span class="lbl">${label}</span>
+    </button>`;
+  return `<nav class="tabbar">
+    ${tab("home", "▣", "Dubs", "A.nav('home')")}
+    ${tab("activity", "◔", "Activity", "A.nav('activity')")}
+    ${tab("voices", "◉", "Voices", "A.nav('voices')")}
+  </nav>`;
+}
+
+function appBar() {
+  return `<header class="appbar">
+    <div class="logo">gd</div><div class="name">GoChiDUBB</div>
+    <div class="spend">${esc(location.hostname)} · free</div>
+  </header>`;
+}
+
+// ── Home ─────────────────────────────────────────────────────────
+function vHome() {
+  const cards = S.runs.map((r, i) => feedCard(r, i)).join("");
+  const empty = !S.runs.length;
+  return `
+  ${appBar()}
+  <div class="scroll">
+    ${empty ? `
+      <div class="empty-hero">
+        <div style="width:52px;height:52px;border-radius:50%;background:var(--lime);display:grid;place-items:center">
+          <div style="width:16px;height:16px;border-radius:50%;background:var(--ink)"></div>
+        </div>
+        <div style="font-size:17px;font-weight:600;letter-spacing:-0.01em">Record your first video</div>
+        <div style="font-size:12.5px;color:var(--muted);max-width:26ch;line-height:1.5">30 seconds in English → your voice in Spanish, German, Hindi &amp; Russian.</div>
+        <button class="btn" style="margin-top:6px" onclick="A.goRecord()">● Record</button>
+      </div>
+      <div class="kicker">Your dubs will land here</div>
+      ${[0, 1].map(() => `
+      <div class="card feed-card ghost-card">
+        <div class="ghost-thumb">9:16</div>
+        <div style="display:flex;flex-direction:column;gap:7px;justify-content:center">
+          <div class="ghost-line" style="width:130px;height:10px"></div>
+          <div class="ghost-line" style="width:88px;height:8px"></div>
+          <div style="display:flex;gap:5px">
+            ${["ES", "DE", "HI", "RU"].map(c => `<span class="chip dim">${c}</span>`).join("")}
+          </div>
+        </div>
+      </div>`).join("")}
+    ` : cards}
+  </div>
+  <button class="fab" onclick="A.goRecord()" aria-label="Record"><i></i></button>
+  ${tabBar()}`;
+}
+
+function runJobs(entry) {
+  return (entry.ids || []).map(id => S.jobsById[id]).filter(Boolean);
+}
+function runDoneJobs(entry) {
+  return runJobs(entry).filter(j => j.status === "complete");
+}
+
+function feedCard(entry, i) {
+  const jobs = runJobs(entry);
+  const done = jobs.filter(j => j.status === "complete");
+  const errs = jobs.filter(j => j.status === "error");
+  const running = jobs.length ? jobs.length - done.length - errs.length : 0;
+  const avg = jobs.length
+    ? jobs.reduce((a, j) => a + (j.status === "complete" ? 100 : (+j.progress || 0)), 0) / jobs.length
+    : 0;
+  const chips = (entry.langs || []).map(code => {
+    const j = jobs.find(x => (x.target_lang || "") === code);
+    const st = j ? j.status : "";
+    const cls = st === "complete" ? "ok" : (st === "error" ? "warn" : "dim");
+    const mk = st === "complete" ? " ✓" : (st === "error" ? " ✕" : "");
+    return `<span class="chip ${cls}">${esc(code.toUpperCase())}${mk}</span>`;
+  }).join("");
+  const meta = `${fmtDur(entry.secs)} · ${(entry.langs || []).length} languages · ${timeAgo(entry.created)}`;
+  const actions = done.length
+    ? `<button class="btn sm" onclick="A.openShare(${i})">Share</button>
+       <button class="btn sm ghost" onclick="A.openPreview(${i})">Watch</button>`
+    : (errs.length && !running
+      ? `<span class="chip warn">failed — see Activity</span>`
+      : `<button class="btn sm ghost" onclick="A.openProgress(${i})">⏳ ${Math.round(avg)}%</button>`);
+  return `
+  <div class="card feed-card">
+    <div class="thumb"><div style="font-size:16px">▶</div>
+      <div class="dur">${fmtDur(entry.secs)}</div>
+      <div class="bar" style="width:${done.length ? 100 : Math.round(avg)}%"></div>
+    </div>
+    <div style="flex:1;display:flex;flex-direction:column;gap:6px;min-width:0">
+      <div style="font-size:13.5px;font-weight:600;line-height:1.3">${esc(entry.title)}</div>
+      <div style="font-size:11.5px;color:var(--muted)">${esc(meta)}</div>
+      <div style="display:flex;gap:5px;flex-wrap:wrap">${chips}</div>
+      <div style="display:flex;gap:6px;margin-top:auto">${actions}</div>
+    </div>
+  </div>`;
+}
+
+// ── Activity ─────────────────────────────────────────────────────
+function vActivity() {
+  const mine = new Set(S.runs.flatMap(r => r.ids || []));
+  const others = Object.values(S.jobsById)
+    .filter(j => !mine.has(j.id))
+    .sort((a, b) => (b.created || 0) - (a.created || 0));
+  const busy = others.filter(j => !["complete", "error", "scheduled"].includes(j.status)).slice(0, 8);
+  const doneJobs = others.filter(j => j.status === "complete").slice(0, 6);
+  const row = (j) => {
+    const running = !["complete", "error"].includes(j.status);
+    const sub = j.status === "complete"
+      ? `${langName(j.target_lang)} · ready ${timeAgo(j.completed_at || j.created)}`
+      : `${langName(j.target_lang)} · ${esc(j.step_detail || j.status)}`;
+    return `
+    <div class="card" style="display:flex;gap:12px;align-items:center">
+      <div style="width:76px;height:44px;flex:none;border-radius:7px;background:linear-gradient(180deg,#26262e,#101014);display:grid;place-items:center;color:rgba(255,255,255,.6);font-size:12px">▶</div>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(j.title || j.source_label || j.id)}</div>
+        <div style="font-size:11.5px;color:var(--muted);margin-top:1px">${sub}</div>
+        ${running ? `<div class="progress-track" style="height:4px;margin-top:7px"><i style="width:${Math.round(+j.progress || 0)}%"></i></div>` : ""}
+      </div>
+      ${running
+        ? `<span class="chip warn">⏳ ${Math.round(+j.progress || 0)}%</span>`
+        : `<button class="btn sm" onclick="A.shareJob('${esc(j.id)}')">Share</button>
+           <button class="btn sm ghost" onclick="A.redub('${esc(j.id)}')">Redub</button>`}
+    </div>`;
+  };
+  return `
+  ${appBar()}
+  <div class="scroll">
+    <div style="font-size:19px;font-weight:700;letter-spacing:-0.02em">Activity</div>
+    <button style="display:flex;align-items:center;gap:8px;background:var(--lime-soft);border:none;border-radius:9px;padding:8px 12px;text-align:left;width:100%"
+            onclick="A.nav('pair')">
+      <span class="stage-dot" style="background:var(--lime-ink)"></span>
+      <span style="font-size:12px;font-weight:600;color:var(--lime-ink)">Connected to ${esc(location.hostname)}</span>
+      <span class="mono" style="margin-left:auto;font-size:10.5px;color:var(--lime-ink)">${esc(location.host)}</span>
+    </button>
+    <div class="kicker">On your desktop</div>
+    ${busy.length || doneJobs.length
+      ? busy.map(row).join("") + doneJobs.map(row).join("")
+      : `<div class="hint" style="padding:16px 0">No desktop jobs yet — anything queued in Studio shows up here.</div>`}
+    <div style="background:var(--sand-2);border:1px solid var(--line);border-radius:11px;padding:12px 14px;display:flex;align-items:center;gap:10px">
+      <div style="flex:1;font-size:12px;color:var(--muted)">Redub any desktop job into a new language — it skips re-upload and reuses the transcript.</div>
+    </div>
+  </div>
+  ${tabBar()}`;
+}
+
+// ── Voices ───────────────────────────────────────────────────────
+function vVoices() {
+  const my = S.myVoice;
+  const filePresets = S.presets.filter(p => p.type === "file" && (!my || p.id !== my.id));
+  const stylePresets = S.presets.filter(p => p.type === "style");
+  const presetRow = (p) => `
+    <div class="card" style="display:flex;align-items:center;gap:12px;padding:12px 14px">
+      <button style="width:38px;height:38px;flex:none;border-radius:50%;border:1px solid var(--line-soft);background:var(--paper);font-size:12px;color:var(--ink)"
+              onclick="A.playPreset('${esc(p.id)}')">${S.playingPreset === p.id ? "■" : "▶"}</button>
+      <div style="flex:1;min-width:0">
+        <div style="font-size:13.5px;font-weight:600">${esc(p.name)}</div>
+        <div style="font-size:11.5px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(p.description || p.style || "")}</div>
+      </div>
+      <span class="mono" style="font-size:10.5px;color:var(--faint)">${esc(p.language || "")}</span>
+    </div>`;
+  return `
+  ${appBar()}
+  <div class="scroll">
+    <div style="font-size:19px;font-weight:700;letter-spacing:-0.02em">Voices</div>
+    <div class="card" style="padding:14px;display:flex;flex-direction:column;gap:8px">
+      <div style="display:flex;align-items:center;gap:8px">
+        <div style="font-size:14px;font-weight:600">My voice</div>
+        <span class="chip ${my ? "ok" : "warn"}">${my ? "ready" : "not set up"}</span>
+      </div>
+      <div style="font-size:12.5px;color:var(--muted);line-height:1.5">Record a 30-second sample once and every dub can use your cloned voice — or we clone straight from each video you record.</div>
+      ${S.sampleRec ? `
+        <div style="display:flex;align-items:center;gap:8px;justify-content:center;padding:6px 0">
+          <span class="stage-dot" style="background:var(--red)"></span>
+          <span class="mono" style="font-size:13px;font-weight:600">${fmtDur(S.sampleSecs)}</span>
+          <span style="font-size:12px;color:var(--muted)">— read anything out loud, then stop</span>
+        </div>
+        <button class="btn" onclick="A.stopSample()">■ Stop &amp; save</button>
+      ` : `
+        <button class="btn ghost" style="font-weight:600" onclick="A.startSample()" ${S.savingSample ? "disabled" : ""}>
+          ${S.savingSample ? "Saving…" : (my ? "● Re-record my sample" : "● Record my sample")}
+        </button>
+        <div class="hint">Saved on your desktop as a voice preset — it's your own voice, recorded by you.</div>
+      `}
+    </div>
+    <div class="kicker">Professional voices</div>
+    ${(filePresets.concat(stylePresets)).map(presetRow).join("") ||
+      `<div class="hint" style="padding:12px 0">No presets yet — add some in Studio.</div>`}
+  </div>
+  ${tabBar()}`;
+}
+
+// ── Record ───────────────────────────────────────────────────────
+function vRecord() {
+  const showPrompter = !!S.script && !S.scriptOpen;
+  return `
+  <div class="rec-root">
+    <video class="cam" id="cam" autoplay muted playsinline></video>
+    <div class="rec-top">
+      <button class="rec-x" onclick="A.closeRecord()">✕</button>
+      <div style="margin:0 auto;display:flex;gap:6px">
+        <button class="pillbtn ${S.orient === "916" ? "on" : ""}" onclick="A.setOrient('916')">9:16</button>
+        <button class="pillbtn ${S.orient === "169" ? "on" : ""}" onclick="A.setOrient('169')">16:9</button>
+      </div>
+      <button class="pillbtn" onclick="A.openScript()">≡ Script</button>
+    </div>
+    ${S.recording ? `
+    <div class="rec-timer">
+      <span class="stage-dot" style="background:var(--red)"></span>
+      <span class="mono" style="font-size:13px;font-weight:600">${fmtDur(S.recSecs)}</span>
+    </div>` : ""}
+    <div class="rec-mid">
+      ${showPrompter ? `
+      <div class="prompter"><div class="k">Teleprompter</div><div class="t" id="prompterText">${esc(S.script)}</div></div>
+      ` : `
+      <div>
+        <div class="mono" style="font-size:13px;color:rgba(255,255,255,.55)">${esc(S.camError || "camera preview")}</div>
+        <div style="margin-top:6px;font-size:12px;color:rgba(255,255,255,.45)">Speak English — the dub keeps your voice.</div>
+      </div>`}
+    </div>
+    <div class="rec-ctl">
+      <button class="rec-side" onclick="A.pickClip()" title="Import a clip">▤</button>
+      <button class="rec-main" onclick="A.toggleRec()">
+        ${S.recording ? `<span class="stop"></span>` : `<span class="idle"></span>`}
+      </button>
+      <button class="rec-side round" onclick="A.flipCam()" title="Flip camera">⟲</button>
+    </div>
+    ${S.scriptOpen ? `
+    <button class="sheet-dim" onclick="A.closeScript()" aria-label="Close"></button>
+    <div class="sheet">
+      <div style="display:flex;align-items:center">
+        <div style="font-size:15px;font-weight:700">Teleprompter script</div>
+        <button onclick="A.closeScript()" style="margin-left:auto;border:none;background:none;font-size:15px;color:var(--faint)">✕</button>
+      </div>
+      <textarea id="scriptBox" placeholder="Type or paste what you'll say…">${esc(S.script)}</textarea>
+      <div style="display:flex;gap:8px">
+        <button class="btn ghost" style="flex:1;font-weight:600" onclick="A.draftScript()">✦ Draft it for me</button>
+        <button class="btn" style="flex:1;border:none" onclick="A.closeScript()">Use script</button>
+      </div>
+      <div class="hint">It scrolls on screen while you record — your eyes stay near the lens.</div>
+    </div>` : ""}
+  </div>`;
+}
+
+// ── Languages / options ──────────────────────────────────────────
+function vLangs() {
+  const secs = S.clipSecs || 34;
+  const codes = S.langsExpanded
+    ? FEATURED.concat(S.allCodes.filter(c => !FEATURED.includes(c)))
+    : FEATURED;
+  const chips = codes.map(code => {
+    const on = S.sel.has(code);
+    return `<button class="lang-chip ${on ? "on" : ""}" onclick="A.toggleLang('${code}')">${on ? "✓ " : ""}${esc(langName(code))}</button>`;
+  }).join("");
+  const moreN = S.allCodes.filter(c => !FEATURED.includes(c)).length;
+  const my = S.myVoice;
+  const voiceCards = [
+    { id: "video", name: "This video", chip: "zero setup", chipCls: "ok",
+      desc: "Clone your voice straight from the clip you just recorded." },
+    { id: "saved", name: "My saved voice", chip: my ? "ready" : "not set up", chipCls: my ? "ok" : "warn",
+      desc: "A 30-second sample you record once — more reliable across languages." },
+    { id: "pro", name: "A professional voice", chip: S.presets.length + " voices", chipCls: "dim",
+      desc: "Native-speaker presets. Tap one below to hear it." },
+  ].map(v => `
+    <button class="voice-card ${S.voice === v.id ? "on" : ""}" onclick="A.pickVoice('${v.id}')">
+      <span class="dot">${S.voice === v.id ? "✓" : ""}</span>
+      <span style="flex:1">
+        <span style="display:flex;align-items:center;gap:7px">
+          <span style="font-size:13.5px;font-weight:600">${v.name}</span>
+          <span class="chip ${v.chipCls}" style="font-size:10px;padding:1px 7px">${v.chip}</span>
+        </span>
+        <span style="display:block;font-size:12px;color:var(--muted);margin-top:2px;line-height:1.45">${v.desc}</span>
+      </span>
+    </button>`).join("");
+  const proRow = S.voice === "pro" ? `
+    <div style="display:flex;gap:7px;margin-top:9px;overflow-x:auto;padding-bottom:2px">
+      ${S.presets.map(p => `
+        <button onclick="A.pickPro('${esc(p.id)}')"
+          style="flex:none;display:flex;align-items:center;gap:7px;padding:8px 12px;border-radius:9px;font-size:12px;font-weight:500;color:var(--ink);
+                 border:1px solid ${S.proPreset === p.id ? "var(--lime)" : "var(--line-soft)"};
+                 background:${S.proPreset === p.id ? "var(--lime)" : "var(--card)"}">
+          <span onclick="event.stopPropagation();A.playPreset('${esc(p.id)}')">${S.playingPreset === p.id ? "■" : "▶"}</span> ${esc(p.name)}
+        </button>`).join("")}
+    </div>` : "";
+  const n = S.sel.size;
+  const redub = !!S.redubOf;
+  return `
+  <header class="subbar">
+    <button class="back" onclick="${redub ? "A.nav('activity')" : "A.goRecord()"}">←</button>
+    <div class="ttl">${redub ? "Redub · " + esc(S.redubTitle) : "Your video"}</div>
+    <span class="mono" style="font-size:11.5px;color:var(--muted)">${redub ? "" : fmtDur(secs)}</span>
+    <span style="margin-left:auto;font-size:11.5px;color:var(--faint)">${redub ? "reuses the transcript" : "saved automatically"}</span>
+  </header>
+  <div class="scroll" style="padding:18px 16px 150px;gap:18px">
+    <div>
+      <div style="font-size:22px;font-weight:700;letter-spacing:-0.02em">Which languages?</div>
+      <div style="font-size:12.5px;color:var(--muted);margin-top:4px;line-height:1.5">Your voice, speaking each one. Pick as many as you like.</div>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:7px">
+      ${chips}
+      ${!S.langsExpanded && moreN > 0 ? `<button class="lang-chip more" onclick="A.expandLangs()">＋ ${moreN} more</button>` : ""}
+    </div>
+    <div>
+      <div style="font-size:15px;font-weight:700;letter-spacing:-0.01em">Whose voice?</div>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-top:10px">${voiceCards}</div>
+      ${proRow}
+    </div>
+    <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="toggle-card" onclick="A.toggleGate()">
+        <span class="switch ${S.gate ? "on" : ""}"><i></i></span>
+        <span style="flex:1">
+          <span style="display:block;font-size:13px;font-weight:600">Let me check the translation first</span>
+          <span style="display:block;font-size:11.5px;color:var(--muted);margin-top:1px">We pause and show you names, brands and jokes before recording.</span>
+        </span>
+      </button>
+      <button class="toggle-card" onclick="A.toggleCaptions()">
+        <span class="switch ${S.captions ? "on" : ""}"><i></i></span>
+        <span style="flex:1">
+          <span style="display:block;font-size:13px;font-weight:600">Burn in captions</span>
+          <span style="display:block;font-size:11.5px;color:var(--muted);margin-top:1px">Translated subtitles on the video — great for status &amp; Shorts.</span>
+        </span>
+      </button>
+    </div>
+  </div>
+  <div class="footbar">
+    <div style="display:flex;align-items:baseline">
+      <span style="font-size:12.5px;color:var(--muted)">${n} language${n === 1 ? "" : "s"}${redub ? "" : " × " + fmtDur(secs)}</span>
+      <span class="mono" style="margin-left:auto;font-size:19px;font-weight:700">Free</span>
+    </div>
+    <div style="font-size:11px;color:var(--lime-mid);font-weight:500">Runs on your own GPU — nothing leaves your machines.</div>
+    <button class="btn big" onclick="A.startDub()" ${S.starting ? "disabled" : ""}>${S.starting ? "Uploading…" : "Start dubbing →"}</button>
+  </div>`;
+}
+
+// ── Progress ─────────────────────────────────────────────────────
+function stageFor(prog) {
+  // Friendly labels keyed to the pipeline's real progress bands
+  // (download 2-8, extract 10-16, transcribe 18-35, diarize 38-43,
+  //  translate 45-62, tts/assemble/merge above).
+  const n = S.run ? (S.run.langs || []).length : 0;
+  if (prog < 10) return ["Getting your video ready…", "Uploading and reading the file"];
+  if (prog < 18) return ["Getting your video ready…", "Extracting the audio"];
+  if (prog < 38) return ["Listening to your speech…", "Transcribing with word timings"];
+  if (prog < 45) return ["Sorting out who speaks…", "Finding the voices in the clip"];
+  if (prog < 64) return [`Translating into ${n} language${n === 1 ? "" : "s"}…`, "Length-matched so lips stay close"];
+  if (prog < 92) return ["Recording your voice…", (S.run.langs || []).map(langName).join(", ")];
+  return ["Mixing your videos…", "Original music kept underneath"];
+}
+
+function vProgress() {
+  const jobs = S.run ? runJobs(S.run) : [];
+  const total = jobs.length || (S.run ? S.run.ids.length : 1);
+  const avg = jobs.length
+    ? jobs.reduce((a, j) => a + (j.status === "complete" ? 100 : (+j.progress || 0)), 0) / total
+    : 0;
+  const awaitingTr = jobs.filter(j => j.status === "awaiting_translation_review");
+  const awaitingOther = jobs.filter(j => (j.status || "").startsWith("awaiting_") && j.status !== "awaiting_translation_review");
+  const errs = jobs.filter(j => j.status === "error");
+  const allFailed = jobs.length > 0 && errs.length === jobs.length;
+  const eta = jobs.reduce((a, j) => Math.max(a, +j.eta_seconds || 0), 0);
+  const [big, sub] = awaitingTr.length
+    ? ["Waiting for your OK", "Nothing has been recorded yet"]
+    : stageFor(avg);
+  return `
+  <div class="scroll" style="padding:18px 20px;gap:16px">
+    <button onclick="A.nav('home')" style="align-self:flex-start;border:none;background:none;font-size:12.5px;color:var(--muted);padding:4px 0">← Your dubs</button>
+    <div style="flex:1;display:flex;flex-direction:column;justify-content:center;gap:16px;text-align:center;align-items:center;min-height:60vh">
+      <div class="thumb" style="width:96px;height:132px;border-radius:12px">
+        <span style="font-size:18px">▶</span>
+        <div class="bar" style="width:${Math.round(avg)}%"></div>
+      </div>
+      ${allFailed ? `
+        <div>
+          <div style="font-size:16px;font-weight:700">Something went wrong</div>
+          <div style="font-size:12px;color:var(--muted);margin-top:5px;max-width:32ch">${esc(errs[0].error || "The pipeline hit an error.")}</div>
+        </div>
+        <button class="btn ghost" onclick="A.nav('home')">Back to your dubs</button>
+      ` : `
+        <div>
+          <div style="display:flex;align-items:center;justify-content:center;gap:8px">
+            <span class="stage-dot"></span>
+            <span style="font-size:16px;font-weight:700;letter-spacing:-0.01em">${esc(big)}</span>
+          </div>
+          <div style="font-size:12px;color:var(--muted);margin-top:5px">${esc(sub)}${eta ? ` · ~${fmtDur(eta)} left` : ""}</div>
+        </div>
+        <div class="progress-track" style="width:100%;max-width:280px"><i style="width:${Math.round(avg)}%"></i></div>
+        ${errs.length ? `<div class="chip warn">${errs.length} of ${total} failed — the rest keep going</div>` : ""}
+        ${awaitingTr.length ? `
+        <div style="width:100%;background:var(--amber-bg);border-radius:11px;padding:14px;display:flex;flex-direction:column;gap:9px;text-align:left">
+          <div style="font-size:13px;font-weight:700;color:var(--amber-ink)">Paused — a few words need your OK</div>
+          <div style="font-size:12px;color:var(--amber-ink);line-height:1.45">We flagged the bits we're least sure about. Everything else already reads fine.</div>
+          <button class="btn" style="border:none;font-weight:700" onclick="A.goReview()">Check them →</button>
+        </div>` : ""}
+        ${awaitingOther.length ? `
+        <div style="width:100%;background:var(--amber-bg);border-radius:11px;padding:14px;display:flex;flex-direction:column;gap:9px;text-align:left">
+          <div style="font-size:13px;font-weight:700;color:var(--amber-ink)">Paused for a review this phone can't show</div>
+          <div style="font-size:12px;color:var(--amber-ink);line-height:1.45">Open Studio on your desktop to review, or continue without it.</div>
+          <button class="btn ghost" onclick="A.continueOther()">Continue anyway</button>
+        </div>` : ""}
+        ${!awaitingTr.length && !awaitingOther.length ? `
+        <div class="hint" style="max-width:26ch;line-height:1.5">You can close the app — the dub keeps running on the desktop.</div>` : ""}
+      `}
+    </div>
+    ${allFailed ? "" : `<button onclick="A.cancelRun()" style="border:none;background:none;font-size:12.5px;color:var(--faint);padding:8px">Cancel this dub</button>`}
+  </div>`;
+}
+
+// ── Review ───────────────────────────────────────────────────────
+const FLAG_KIND_LABELS = {
+  name: "a name", glossary: "a glossary term", term: "a term",
+  number: "a number", joke: "a joke",
+};
+function vReview() {
+  const job = S.jobsById[S.reviewJob] || {};
+  const lang = langName(job.target_lang);
+  const flags = S.flags;
+  const allDecided = flags.every((f, i) => S.decisions[i]);
+  const card = (f, i) => {
+    const d = S.decisions[i];
+    const editing = S.editingFlag === i;
+    const hl = (text, span, cls) => {
+      const t = esc(text);
+      if (!span) return t;
+      const sp = esc(span);
+      const at = t.indexOf(sp);
+      if (at < 0) return t;
+      return t.slice(0, at) + `<mark class="${cls}">` + sp + "</mark>" + t.slice(at + sp.length);
+    };
+    return `
+    <div class="card" style="padding:14px;display:flex;flex-direction:column;gap:10px;border-color:${d ? "var(--lime-ink)" : "var(--line)"}">
+      <div style="display:flex;align-items:center;gap:8px">
+        <span class="chip dim">${esc(FLAG_KIND_LABELS[f.kind] || f.kind || "check this")}</span>
+        <span class="mono" style="font-size:10.5px;color:var(--faint)">${fmtDur(f.start)}</span>
+        <button onclick="A.hearFlag(${i})" style="margin-left:auto;border:none;background:none;font-size:11.5px;font-weight:600;color:var(--lime-mid)">▶ Hear this bit</button>
+      </div>
+      <div style="font-size:13.5px;line-height:1.55">
+        <span style="display:block;font-size:11px;color:var(--faint);font-weight:600;margin-bottom:1px">You said</span>
+        ${hl(f.source_text, f.source_span, "src")}
+      </div>
+      <div style="font-size:13.5px;line-height:1.55">
+        <span style="display:block;font-size:11px;color:var(--faint);font-weight:600;margin-bottom:1px">In ${esc(lang)}</span>
+        ${hl(d && d.mode === "edit" ? d.text : f.translated_text, d ? "" : f.target_span, "tgt")}
+        ${f.reason ? `<span style="color:var(--faint);font-size:12px"> — ${esc(String(f.reason).replace(/_/g, " "))}</span>` : ""}
+      </div>
+      ${d ? `
+      <div class="decided">
+        <span style="font-size:12px;font-weight:700;color:var(--lime-ink)">✓ ${d.mode === "edit" ? "Edited" : "Keeping it as translated"}</span>
+        <button onclick="A.undoFlag(${i})" style="margin-left:auto;border:none;background:none;font-size:11.5px;color:var(--lime-mid);font-weight:600">change</button>
+      </div>` : editing ? `
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <textarea id="flagEdit${i}" style="min-height:70px;border:1px solid var(--line-soft);border-radius:9px;padding:10px 11px;font:inherit;font-size:13.5px;resize:none">${esc(f.translated_text)}</textarea>
+        <div style="display:flex;gap:6px">
+          <button class="btn sm" style="flex:1" onclick="A.saveFlagEdit(${i})">Save this line</button>
+          <button class="btn sm ghost" style="flex:1" onclick="A.cancelFlagEdit()">Cancel</button>
+        </div>
+      </div>` : `
+      <div style="display:flex;flex-direction:column;gap:6px">
+        <button class="btn" style="border:none;font-weight:700" onclick="A.keepFlag(${i})">Keep it — reads fine</button>
+        <button class="btn ghost" style="min-height:40px;font-size:12.5px" onclick="A.editFlag(${i})">Fix the wording myself</button>
+        <div class="hint">only this line changes — nothing has been recorded yet</div>
+      </div>`}
+    </div>`;
+  };
+  return `
+  <header class="subbar">
+    <button class="back" onclick="A.nav('progress')">←</button>
+    <div class="ttl">Quick check</div>
+    <span class="chip warn" style="margin-left:auto">paused for your OK</span>
+  </header>
+  <div class="scroll" style="padding:16px 16px 130px">
+    <div style="font-size:12.5px;color:var(--muted);line-height:1.5">
+      ${flags.length
+        ? `${flags.length === 1 ? "One thing" : flags.length + " things"} we'd like you to confirm in <b style="color:var(--ink)">${esc(lang)}</b>. Nothing has been recorded yet.`
+        : `Nothing stood out in <b style="color:var(--ink)">${esc(lang)}</b> — the translation reads clean.`}
+    </div>
+    ${flags.map(card).join("")}
+  </div>
+  <div class="footbar" style="gap:8px">
+    <button class="btn big" onclick="A.approveReview()" ${allDecided ? "" : "disabled"}>Looks good — record it →</button>
+    <div class="hint">${allDecided ? "Recording starts the moment you approve." : "Decide each item above to continue."}</div>
+  </div>`;
+}
+
+// ── Done ─────────────────────────────────────────────────────────
+function vDone() {
+  const entry = S.run || S.runs[0] || { langs: [] };
+  const names = (entry.langs || []).map(langName);
+  const colors = ["#c8f542", "#1a1a1f", "#e9f5c0", "#5c7a0f", "#e0a34e"];
+  const conf = Array.from({ length: 26 }, (_, i) =>
+    `<span style="left:${3 + (i * 37) % 94}%;width:${i % 3 ? 7 : 10}px;height:${i % 2 ? 12 : 8}px;background:${colors[i % colors.length]};animation-duration:${1.6 + (i % 5) * 0.25}s;animation-delay:${(i % 7) * 0.12}s"></span>`).join("");
+  return `
+  <div class="scroll" style="position:relative;align-items:center;justify-content:center;text-align:center;padding:0 28px;gap:14px">
+    <div class="confetti">${conf}</div>
+    <div class="done-badge">✓</div>
+    <div class="done-title">Your video speaks<br><span class="hl">${names.length} language${names.length === 1 ? "" : "s"}</span></div>
+    <div style="font-size:13px;color:var(--muted);line-height:1.5">${esc(names.join(", "))} — in your voice, with subtitles.</div>
+    <div style="display:flex;flex-direction:column;gap:8px;width:100%;max-width:280px;margin-top:6px">
+      <button class="btn big" onclick="A.openShare(${S.runs.indexOf(entry)})">Share it →</button>
+      <button class="btn ghost" style="min-height:44px;border-radius:11px;font-weight:600" onclick="A.openPreview(${S.runs.indexOf(entry)})">Watch first</button>
+    </div>
+  </div>`;
+}
+
+// ── Preview ──────────────────────────────────────────────────────
+function pvJob() {
+  if (!S.pvEntry) return null;
+  return runDoneJobs(S.pvEntry).find(j => j.target_lang === S.pvLang) || runDoneJobs(S.pvEntry)[0];
+}
+function dubSrc(j) {
+  if (!j) return "";
+  if (S.pvEntry && S.pvEntry.captions && S.pvSubsOk[j.id]) {
+    return `/outputs/${j.id}/dubbed_video_subs.mp4`;
+  }
+  return j.output_url || `/outputs/${j.id}/dubbed_video.mp4`;
+}
+function vPreview() {
+  const done = S.pvEntry ? runDoneJobs(S.pvEntry) : [];
+  const j = pvJob();
+  const isDub = S.pvMode === "dub";
+  const src = j ? (isDub ? dubSrc(j) : `/outputs/${j.id}/source_video.mp4`) : "";
+  const lang = j ? langName(j.target_lang) : "";
+  return `
+  <header class="subbar">
+    <button class="back" onclick="A.nav('home')">←</button>
+    <div class="ttl">Preview</div>
+  </header>
+  <div class="scroll" style="padding:14px 16px 100px;gap:12px">
+    <div class="seg">
+      <button class="${!isDub ? "on" : ""}" onclick="A.pvMode('orig')">You · Original</button>
+      <button class="${isDub ? "on" : ""}" onclick="A.pvMode('dub')">Dubbed · ${esc(lang)}</button>
+    </div>
+    <div class="player">
+      <span class="badge">${isDub ? esc((j ? j.target_lang : "").toUpperCase()) + " · your voice" : "original"}</span>
+      <video id="pvVideo" controls playsinline preload="metadata" src="${esc(src)}"></video>
+    </div>
+    ${isDub && done.length > 1 ? `
+    <div style="display:flex;gap:6px">
+      ${done.map(x => `
+        <button onclick="A.pvLang('${esc(x.target_lang)}')" class="lang-chip ${x.target_lang === (j && j.target_lang) ? "on" : ""}"
+                style="flex:1;min-height:38px;text-align:center;font-weight:600">${esc((x.target_lang || "").toUpperCase())}</button>`).join("")}
+    </div>` : ""}
+    <div class="hint">Same length, same you — flip between the two to compare.</div>
+  </div>
+  <div class="footbar">
+    <button class="btn big" onclick="A.openShare(${S.runs.indexOf(S.pvEntry)})">Share →</button>
+  </div>`;
+}
+
+// ── Share ────────────────────────────────────────────────────────
+function vShare() {
+  const done = S.pvEntry ? runDoneJobs(S.pvEntry) : [];
+  const j = pvJob();
+  const lang = j ? langName(j.target_lang) : "";
+  const tiles = [
+    { id: "system", glyph: "⇪", name: "Share…", desc: "Any app on this phone", gbg: "var(--sand)", gc: "var(--ink)" },
+    { id: "wa", glyph: "WA", name: "WhatsApp", desc: "Send as message", gbg: "var(--lime-soft)", gc: "var(--lime-ink)" },
+    { id: "tg", glyph: "TG", name: "Telegram", desc: "Send to a chat", gbg: "#e3f2f8", gc: "#2a6f85" },
+    { id: "vk", glyph: "VK", name: "VK Video", desc: "Stage for publishing", gbg: "#e3ecf8", gc: "#2a5285" },
+    { id: "save", glyph: "↓", name: "Save video", desc: "Download the MP4", gbg: "var(--sand)", gc: "var(--ink)" },
+    { id: "link", glyph: "⧉", name: "Copy link", desc: "Anyone on your network", gbg: "var(--sand)", gc: "var(--ink)" },
+  ].map(t => `
+    <button class="share-tile" onclick="A.shareTo('${t.id}')">
+      <span class="g" style="background:${t.gbg};color:${t.gc}">${t.glyph}</span>
+      <span>
+        <span style="display:block;font-size:12.5px;font-weight:600">${t.name}</span>
+        <span style="display:block;font-size:10.5px;color:var(--muted)">${t.desc}</span>
+      </span>
+    </button>`).join("");
+  return `
+  <header class="subbar">
+    <button class="back" onclick="A.nav('home')">←</button>
+    <div class="ttl">Share</div>
+    <span style="margin-left:auto;font-size:11.5px;color:var(--muted)">Sharing the <b style="color:var(--ink)">${esc(lang)}</b> dub</span>
+  </header>
+  <div class="scroll" style="padding:16px;gap:14px">
+    ${done.length > 1 ? `
+    <div style="display:flex;gap:6px">
+      ${done.map(x => `
+        <button onclick="A.pvLang('${esc(x.target_lang)}')" class="lang-chip ${x.target_lang === (j && j.target_lang) ? "on" : ""}"
+                style="flex:1;min-height:36px;text-align:center;font-weight:600;font-size:12px">${esc((x.target_lang || "").toUpperCase())}</button>`).join("")}
+    </div>` : ""}
+    <div class="share-grid">${tiles}</div>
+    <div style="background:var(--sand-2);border:1px solid var(--line);border-radius:11px;padding:12px 14px;font-size:11.5px;color:var(--muted);line-height:1.5">
+      Rendered as H.264 + AAC, so it plays everywhere — WhatsApp, VK, QuickTime.
+      The link works for anyone who can reach <span class="mono">${esc(location.host)}</span>.
+    </div>
+  </div>`;
+}
+
+// ── Connection ("pair") ──────────────────────────────────────────
+function vPair() {
+  const sysline = S.system && S.system.gpu_name ? S.system.gpu_name : "";
+  return `
+  <div class="rec-root" style="background:#0e0e11;padding:16px;gap:14px">
+    <div style="display:flex;align-items:center;position:relative;z-index:2">
+      <button class="rec-x" onclick="A.nav('activity')">✕</button>
+      <div style="margin:0 auto;font-size:14px;font-weight:600">Your desktop</div>
+      <div style="width:34px"></div>
+    </div>
+    <div style="flex:1;display:grid;place-items:center;position:relative;z-index:2">
+      <div style="display:flex;flex-direction:column;gap:14px;align-items:center;text-align:center;max-width:280px">
+        <div style="width:44px;height:44px;border-radius:11px;border:2px solid var(--lime);display:grid;place-items:center">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:3px">
+            <i style="width:7px;height:7px;background:var(--lime);display:block"></i><i style="width:7px;height:7px;background:var(--lime);display:block;opacity:.4"></i>
+            <i style="width:7px;height:7px;background:var(--lime);display:block;opacity:.4"></i><i style="width:7px;height:7px;background:var(--lime);display:block"></i>
+          </div>
+        </div>
+        <div style="font-size:16px;font-weight:600">Connected to ${esc(location.hostname)}</div>
+        <div style="font-size:12.5px;color:rgba(255,255,255,.65);line-height:1.5">
+          This page is served by your GoChiDUBB Studio at
+          <span class="mono" style="color:var(--lime);font-size:11.5px">${esc(location.host)}</span>${sysline ? ` (${esc(sysline)})` : ""}.
+          Jobs, previews and sharing all run there — nothing leaves your machines.
+        </div>
+        <div style="font-size:11.5px;color:rgba(255,255,255,.45);line-height:1.5">
+          Works on your Wi-Fi or over Tailscale. Open this same address on any phone to pair it.
+        </div>
+      </div>
+    </div>
+  </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Post-render wiring (things innerHTML can't do)
+// ═══════════════════════════════════════════════════════════════════
+
+let mediaStream = null;
+let mediaRecorder = null;
+let recChunks = [];
+let recTimer = null;
+let camFacing = "user";
+let prompterTimer = null;
+let sampleRecorder = null;
+let sampleChunks = [];
+let sampleStream = null;
+let sampleTimer = null;
+let presetAudio = null;
+
+function afterRender() {
+  if (S.screen === "record") {
+    ensureCam();
+    const box = $("#scriptBox");
+    if (box) {
+      box.addEventListener("input", () => { S.script = box.value; lsSet("go_script", box.value); });
+      box.focus();
+    }
+    if (S.recording && S.script && !S.scriptOpen) startPrompterScroll();
+  } else {
+    stopCam();
+  }
+  if (S.screen !== "voices" && S.sampleRec) stopSampleTracks();
+}
+
+function ensureCam() {
+  const el = $("#cam");
+  if (!el) return;
+  if (mediaStream) { el.srcObject = mediaStream; return; }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    S.camError = "no camera in this browser — import a clip instead";
+    return;
+  }
+  navigator.mediaDevices.getUserMedia({
+    audio: true,
+    video: { facingMode: camFacing, aspectRatio: S.orient === "916" ? 9 / 16 : 16 / 9 },
+  }).then(stream => {
+    mediaStream = stream;
+    const cam = $("#cam");
+    if (cam) { cam.srcObject = stream; cam.style.transform = camFacing === "user" ? "scaleX(-1)" : "none"; }
+  }).catch(err => {
+    S.camError = "camera unavailable — import a clip instead";
+    render();
+  });
+}
+
+function stopCam() {
+  if (mediaRecorder && mediaRecorder.state !== "inactive") { try { mediaRecorder.stop(); } catch (e) {} }
+  mediaRecorder = null;
+  clearInterval(recTimer);
+  if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+}
+
+function startPrompterScroll() {
+  const t = $("#prompterText");
+  if (!t) return;
+  const box = t.parentElement;
+  const words = (S.script.trim().split(/\s+/).length || 1);
+  const readSecs = Math.max(8, words / 2.4);           // ~145 wpm
+  const step = Math.max(0, box.scrollHeight - box.clientHeight) / (readSecs * 10);
+  prompterTimer = setInterval(() => { box.scrollTop += step; }, 100);
+}
+function stopPrompterScroll() { clearInterval(prompterTimer); prompterTimer = null; }
+
+// WAV encoder for the mic sample — MediaRecorder gives webm/mp4, but the
+// voice-preset endpoint only accepts wav/mp3/flac/ogg/m4a. Decode and
+// re-pack as 16-bit mono WAV client-side; a 30 s sample is ~1 MB.
+async function blobToWav(blob) {
+  const ac = new (window.AudioContext || window.webkitAudioContext)();
+  const buf = await ac.decodeAudioData(await blob.arrayBuffer());
+  const rate = buf.sampleRate;
+  const ch = buf.getChannelData(0);
+  const n = ch.length;
+  const out = new DataView(new ArrayBuffer(44 + n * 2));
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) out.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, "RIFF"); out.setUint32(4, 36 + n * 2, true); ws(8, "WAVE");
+  ws(12, "fmt "); out.setUint32(16, 16, true); out.setUint16(20, 1, true);
+  out.setUint16(22, 1, true); out.setUint32(24, rate, true);
+  out.setUint32(28, rate * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true);
+  ws(36, "data"); out.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, ch[i]));
+    out.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  try { ac.close(); } catch (e) {}
+  return new Blob([out], { type: "audio/wav" });
+}
+
+function stopSampleTracks() {
+  clearInterval(sampleTimer);
+  if (sampleStream) { sampleStream.getTracks().forEach(t => t.stop()); sampleStream = null; }
+  sampleRecorder = null;
+  S.sampleRec = false;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Polling
+// ═══════════════════════════════════════════════════════════════════
+
+let pollTimer = null;
+async function poll() {
+  try {
+    const r = await api("/api/jobs?compact=true&limit=120");
+    const map = {};
+    for (const j of r.jobs || []) map[j.id] = j;
+    S.jobsById = map;
+    if (S.screen === "progress" && S.run) checkRunTransitions();
+    if (["home", "activity", "progress"].includes(S.screen)) render();
+  } catch (e) { /* server briefly away — keep the last snapshot */ }
+}
+function startPolling() {
+  clearInterval(pollTimer);
+  pollTimer = setInterval(poll, 2500);
+  poll();
+}
+
+function checkRunTransitions() {
+  const jobs = runJobs(S.run);
+  if (!jobs.length) return;
+  const terminal = jobs.every(j => ["complete", "error"].includes(j.status));
+  const anyDone = jobs.some(j => j.status === "complete");
+  if (terminal && anyDone) {
+    // Burn captions once per job, after the dub exists.
+    if (S.run.captions) {
+      for (const j of jobs) {
+        if (j.status === "complete" && !S.burned[j.id]) {
+          S.burned[j.id] = true;
+          api(`/api/dub/${j.id}/burn_subs`, { method: "POST", body: new FormData() })
+            .then(() => { S.pvSubsOk[j.id] = true; })
+            .catch(() => {});
+        }
+      }
+    }
+    S.screen = "done";
+    render();
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Actions
+// ═══════════════════════════════════════════════════════════════════
+
+const A = {
+  nav(screen) { S.screen = screen; render(); },
+
+  // ── record ──
+  goRecord() {
+    S.redubOf = null; S.redubTitle = "";
+    S.recording = false; S.recSecs = 0; S.camError = "";
+    S.screen = "record"; render();
+  },
+  closeRecord() { S.recording = false; S.screen = "home"; render(); },
+  setOrient(o) {
+    S.orient = o;
+    stopCam();          // re-open with the new aspect hint
+    render();
+  },
+  flipCam() {
+    camFacing = camFacing === "user" ? "environment" : "user";
+    stopCam(); render();
+  },
+  openScript() { S.scriptOpen = true; render(); },
+  closeScript() {
+    const box = $("#scriptBox");
+    if (box) { S.script = box.value; lsSet("go_script", box.value); }
+    S.scriptOpen = false; render();
+  },
+  draftScript() {
+    const box = $("#scriptBox");
+    const draft = "Hey friends! Quick one today — I want to show you the one trick that changed my mornings. Thirty seconds, no extra gear. Try it tomorrow and tell me if you notice the difference… and subscribe for more!";
+    if (box) { box.value = draft; }
+    S.script = draft; lsSet("go_script", draft);
+    toast("Starter script — edit it to match your video");
+  },
+  toggleRec() {
+    if (!S.recording) {
+      if (!mediaStream) { toast("No camera — import a clip instead"); return; }
+      recChunks = [];
+      const mime = window.MediaRecorder && MediaRecorder.isTypeSupported("video/mp4")
+        ? "video/mp4" : "video/webm";
+      try { mediaRecorder = new MediaRecorder(mediaStream, { mimeType: mime }); }
+      catch (e) { mediaRecorder = new MediaRecorder(mediaStream); }
+      mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size) recChunks.push(e.data); };
+      mediaRecorder.onstop = () => {
+        const type = (mediaRecorder && mediaRecorder.mimeType) || "video/webm";
+        S.clipBlob = new Blob(recChunks, { type });
+        S.clipName = "go_" + Date.now() + (type.includes("mp4") ? ".mp4" : ".webm");
+        S.clipSecs = S.recSecs;
+        S.screen = "langs"; render();
+      };
+      mediaRecorder.start();
+      S.recording = true; S.recSecs = 0;
+      recTimer = setInterval(() => {
+        S.recSecs += 1;
+        if (S.recSecs >= 120) { A.toggleRec(); return; }   // matches the server's clip ceiling
+        const t = $(".rec-timer .mono");
+        if (t) t.textContent = fmtDur(S.recSecs);
+      }, 1000);
+      render();
+    } else {
+      S.recording = false;
+      clearInterval(recTimer);
+      if (mediaRecorder && mediaRecorder.state !== "inactive") mediaRecorder.stop();
+    }
+  },
+  pickClip() { $("#clipFile").click(); },
+
+  // ── langs / options ──
+  toggleLang(code) {
+    if (S.sel.has(code)) S.sel.delete(code); else S.sel.add(code);
+    lsSet("go_langsel", [...S.sel]);
+    render();
+  },
+  expandLangs() { S.langsExpanded = true; render(); },
+  pickVoice(id) {
+    if (id === "saved" && !S.myVoice) {
+      toast("Record your sample in the Voices tab first");
+      return;
+    }
+    S.voice = id;
+    if (id === "pro" && !S.proPreset && S.presets.length) S.proPreset = S.presets[0].id;
+    render();
+  },
+  pickPro(id) { S.proPreset = id; render(); },
+  playPreset(id) {
+    const p = S.presets.find(x => x.id === id);
+    if (!p) return;
+    if (S.playingPreset === id) {
+      if (presetAudio) presetAudio.pause();
+      S.playingPreset = null; render(); return;
+    }
+    if (p.type !== "file") { toast("Style presets have no sample — they're a description"); return; }
+    if (presetAudio) presetAudio.pause();
+    presetAudio = new Audio("/api/voice_presets/" + encodeURIComponent(id) + "/audio");
+    S.playingPreset = id;
+    presetAudio.onended = () => { S.playingPreset = null; render(); };
+    presetAudio.play().catch(() => { S.playingPreset = null; toast("Couldn't play the sample"); render(); });
+    render();
+  },
+  toggleGate() { S.gate = !S.gate; lsSet("go_gate", S.gate); render(); },
+  toggleCaptions() { S.captions = !S.captions; lsSet("go_captions", S.captions); render(); },
+
+  async startDub() {
+    const langs = [...S.sel];
+    if (!langs.length) { toast("Pick at least one language"); return; }
+    if (!S.redubOf && !S.clipBlob) { toast("Record or import a clip first"); return; }
+    S.starting = true; render();
+    try {
+      let entry;
+      const voicePreset = S.voice === "saved" ? S.myVoice.id
+        : S.voice === "pro" ? (S.proPreset || "auto") : "auto";
+      if (S.redubOf) {
+        const fd = new FormData();
+        fd.set("target_langs", langs.join(","));
+        fd.set("mode", langs.length > 1 ? "compare" : "single");
+        if (voicePreset !== "auto") fd.set("voice_preset", voicePreset);
+        const r = await api(`/api/job/${S.redubOf}/redub`, { method: "POST", body: fd });
+        entry = {
+          batch: r.batch_id || null,
+          ids: r.job_ids || [r.job_id],
+          title: "Redub · " + (S.redubTitle || S.redubOf),
+          langs, captions: false, created: Date.now() / 1000,
+          secs: (S.jobsById[S.redubOf] || {}).duration || 0,
+        };
+      } else {
+        const fd = new FormData();
+        fd.set("video", new File([S.clipBlob], S.clipName, { type: S.clipBlob.type }));
+        fd.set("target_langs", langs.join(","));
+        fd.set("review_gates", S.gate ? REVIEW_GATES_ON : REVIEW_GATES_OFF);
+        fd.set("batch_label", "GoChiDUBB Go");
+        fd.set("voice_preset", voicePreset);
+        if (S.script.trim()) fd.set("context_hint", S.script.trim().slice(0, 500));
+        const r = await api("/api/quick_test", { method: "POST", body: fd });
+        entry = {
+          batch: r.batch_id, ids: r.job_ids,
+          title: clipTitle(), langs, captions: S.captions,
+          created: Date.now() / 1000, secs: S.clipSecs || 0,
+        };
+      }
+      S.runs.unshift(entry); saveRuns();
+      S.run = entry;
+      S.clipBlob = null; S.redubOf = null;
+      S.screen = "progress"; render();
+      poll();
+    } catch (e) {
+      toast("Couldn't start: " + e.message);
+    } finally {
+      S.starting = false;
+      if (S.screen === "langs") render();
+    }
+  },
+
+  // ── progress / review ──
+  openProgress(i) { S.run = S.runs[i]; S.screen = "progress"; render(); },
+  async cancelRun() {
+    if (!S.run) { S.screen = "home"; render(); return; }
+    try {
+      await Promise.all(S.run.ids.map(id =>
+        api(`/api/dub/${id}/cancel`, { method: "POST" }).catch(() => {})));
+      toast("Dub cancelled");
+    } finally {
+      S.runs = S.runs.filter(r => r !== S.run); saveRuns();
+      S.run = null; S.screen = "home"; render();
+    }
+  },
+  async goReview() {
+    const jobs = runJobs(S.run);
+    const j = jobs.find(x => x.status === "awaiting_translation_review");
+    if (!j) { S.screen = "progress"; render(); return; }
+    S.reviewJob = j.id; S.decisions = {}; S.editingFlag = null; S.flags = [];
+    S.screen = "review"; render();
+    try {
+      const r = await api(`/api/dub/${j.id}/flags`);
+      S.flags = r.flags || [];
+      S.flagsAudio = r.audio_url || "";
+    } catch (e) {
+      S.flags = [];
+      toast("Couldn't load the flagged bits: " + e.message);
+    }
+    render();
+  },
+  hearFlag(i) {
+    const f = S.flags[i];
+    if (!f || !S.flagsAudio) return;
+    const a = $("#flagAudio");
+    a.src = S.flagsAudio + "#t=" + (f.start || 0) + "," + (f.end || (f.start || 0) + 4);
+    a.currentTime = f.start || 0;
+    a.play().catch(() => toast("Couldn't play the clip"));
+    const stopAt = f.end || (f.start || 0) + 4;
+    const watch = setInterval(() => {
+      if (a.paused || a.currentTime >= stopAt) { a.pause(); clearInterval(watch); }
+    }, 200);
+  },
+  keepFlag(i) { S.decisions[i] = { mode: "keep" }; render(); },
+  editFlag(i) { S.editingFlag = i; render(); },
+  cancelFlagEdit() { S.editingFlag = null; render(); },
+  saveFlagEdit(i) {
+    const box = $("#flagEdit" + i);
+    const text = box ? box.value.trim() : "";
+    if (!text) { toast("The line can't be empty"); return; }
+    S.decisions[i] = { mode: "edit", text };
+    S.editingFlag = null; render();
+  },
+  undoFlag(i) { delete S.decisions[i]; render(); },
+  async approveReview() {
+    if (!S.flags.every((f, i) => S.decisions[i]) && S.flags.length) return;
+    const edits = {};
+    S.flags.forEach((f, i) => {
+      const d = S.decisions[i];
+      if (d && d.mode === "edit" && f.idx != null) edits[String(f.idx)] = d.text;
+    });
+    try {
+      if (Object.keys(edits).length) {
+        const fd = new FormData();
+        fd.set("edits", JSON.stringify(edits));
+        await api(`/api/dub/${S.reviewJob}/edit_translations`, { method: "POST", body: fd });
+      }
+      await api(`/api/dub/${S.reviewJob}/continue`, { method: "POST" });
+      toast("Recording your voice now");
+    } catch (e) {
+      toast("Couldn't continue: " + e.message);
+      return;
+    }
+    await poll();
+    const next = runJobs(S.run).find(x => x.status === "awaiting_translation_review" && x.id !== S.reviewJob);
+    if (next) { A.goReview(); } else { S.screen = "progress"; render(); }
+  },
+  async continueOther() {
+    const jobs = runJobs(S.run).filter(j => (j.status || "").startsWith("awaiting_"));
+    for (const j of jobs) {
+      try { await api(`/api/dub/${j.id}/continue`, { method: "POST" }); } catch (e) {}
+    }
+    toast("Continuing without the desktop review");
+    poll();
+  },
+
+  // ── preview / share ──
+  openPreview(i) {
+    S.pvEntry = S.runs[i] || S.run;
+    const done = runDoneJobs(S.pvEntry);
+    S.pvLang = done.length ? done[0].target_lang : null;
+    S.pvMode = "dub";
+    S.screen = "preview"; render();
+  },
+  openShare(i) {
+    S.pvEntry = (i >= 0 && S.runs[i]) || S.pvEntry || S.run;
+    const done = S.pvEntry ? runDoneJobs(S.pvEntry) : [];
+    if (!done.length) { toast("Nothing finished yet"); return; }
+    if (!S.pvLang || !done.some(j => j.target_lang === S.pvLang)) S.pvLang = done[0].target_lang;
+    S.screen = "share"; render();
+  },
+  shareJob(id) {
+    // Share a desktop job that wasn't started from this phone: wrap it in a
+    // one-job entry so the preview/share screens can treat it like any run.
+    const j = S.jobsById[id];
+    if (!j) return;
+    S.pvEntry = {
+      ids: [id], langs: [j.target_lang || ""],
+      title: j.title || j.source_label || id,
+      captions: false, created: j.created, secs: j.duration || 0,
+    };
+    S.pvLang = j.target_lang; S.pvMode = "dub";
+    S.screen = "share"; render();
+  },
+  pvMode(m) { S.pvMode = m; render(); },
+  pvLang(code) { S.pvLang = code; S.pvMode = "dub"; render(); },
+  async shareTo(kind) {
+    const j = pvJob();
+    if (!j) { toast("Nothing to share yet"); return; }
+    const url = abs(dubSrc(j));
+    if (kind === "system") {
+      if (navigator.share) {
+        navigator.share({ title: "My dub · " + langName(j.target_lang), url }).catch(() => {});
+      } else { toast("System share isn't available in this browser"); }
+    } else if (kind === "wa") {
+      window.open("https://wa.me/?text=" + encodeURIComponent(url), "_blank");
+    } else if (kind === "tg") {
+      window.open("https://t.me/share/url?url=" + encodeURIComponent(url), "_blank");
+    } else if (kind === "vk") {
+      try {
+        await api(`/api/dub/${j.id}/publish/stage`, {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ platform: "vk" }),
+        });
+        toast("Staged for VK — approve it in Studio");
+      } catch (e) { toast("Couldn't stage: " + e.message); }
+    } else if (kind === "save") {
+      const a = document.createElement("a");
+      a.href = "/api/download/" + j.id; a.download = "";
+      document.body.appendChild(a); a.click(); a.remove();
+    } else if (kind === "link") {
+      try { await navigator.clipboard.writeText(url); toast("Link copied"); }
+      catch (e) { toast(url); }
+    }
+  },
+
+  // ── activity ──
+  redub(id) {
+    const j = S.jobsById[id];
+    S.redubOf = id;
+    S.redubTitle = j ? (j.title || j.source_label || id) : id;
+    S.clipBlob = null;
+    S.screen = "langs"; render();
+  },
+
+  // ── voices ──
+  async startSample() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      toast("No microphone in this browser"); return;
+    }
+    try {
+      sampleStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    } catch (e) { toast("Microphone permission denied"); return; }
+    sampleChunks = [];
+    sampleRecorder = new MediaRecorder(sampleStream);
+    sampleRecorder.ondataavailable = (e) => { if (e.data && e.data.size) sampleChunks.push(e.data); };
+    sampleRecorder.onstop = async () => {
+      const raw = new Blob(sampleChunks, { type: sampleRecorder.mimeType || "audio/webm" });
+      stopSampleTracks();
+      S.savingSample = true; render();
+      try {
+        const wav = await blobToWav(raw);
+        const fd = new FormData();
+        fd.set("audio", new File([wav], "my-voice.wav", { type: "audio/wav" }));
+        fd.set("name", "My voice (Go)");
+        fd.set("description", "Recorded on the phone in GoChiDUBB Go");
+        fd.set("consent_attested", "true");     // it's the speaker's own voice
+        const r = await api("/api/voice_presets", { method: "POST", body: fd });
+        S.myVoice = { id: r.id, name: "My voice (Go)" };
+        lsSet("go_myvoice", S.myVoice);
+        toast("Voice saved — every dub can use it now");
+        loadPresets();
+      } catch (e) {
+        toast("Couldn't save the sample: " + e.message);
+      }
+      S.savingSample = false; render();
+    };
+    sampleRecorder.start();
+    S.sampleRec = true; S.sampleSecs = 0;
+    sampleTimer = setInterval(() => {
+      S.sampleSecs += 1;
+      if (S.sampleSecs >= 60) { A.stopSample(); return; }
+      const t = $(".scroll .mono");
+      if (t) t.textContent = fmtDur(S.sampleSecs);
+    }, 1000);
+    render();
+  },
+  stopSample() {
+    clearInterval(sampleTimer);
+    S.sampleRec = false;
+    if (sampleRecorder && sampleRecorder.state !== "inactive") sampleRecorder.stop();
+    else { stopSampleTracks(); render(); }
+  },
+};
+window.A = A;
+
+function clipTitle() {
+  const firstWords = S.script.trim().split(/\s+/).slice(0, 5).join(" ");
+  if (firstWords.length > 8) return firstWords + "…";
+  const d = new Date();
+  return "Clip · " + d.toLocaleDateString(undefined, { month: "short", day: "numeric" }) +
+    " " + d.toTimeString().slice(0, 5);
+}
+
+// Imported clip → straight to the language screen, like ending a recording.
+$("#clipFile").addEventListener("change", () => {
+  const f = $("#clipFile").files[0];
+  if (!f) return;
+  S.clipBlob = f; S.clipName = f.name; S.clipSecs = 0;
+  const v = document.createElement("video");
+  v.preload = "metadata";
+  v.onloadedmetadata = () => {
+    S.clipSecs = Math.round(v.duration || 0);
+    URL.revokeObjectURL(v.src);
+    if (S.screen === "langs") render();
+  };
+  v.src = URL.createObjectURL(f);
+  S.screen = "langs"; render();
+  toast("Imported " + f.name);
+  $("#clipFile").value = "";
+});
+
+// ═══════════════════════════════════════════════════════════════════
+// Boot
+// ═══════════════════════════════════════════════════════════════════
+
+async function loadPresets() {
+  try {
+    const r = await api("/api/voice_presets");
+    S.presets = (r.presets || []).filter(p => p.type === "file")
+      .concat((r.presets || []).filter(p => p.type === "style"));
+  } catch (e) { /* fine — cards just show no presets */ }
+}
+
+(async function boot() {
+  render();
+  startPolling();
+  loadPresets();
+  try {
+    const langs = await api("/api/languages");
+    S.langNames = langs.names || {};
+    S.allCodes = langs.languages || [];
+  } catch (e) { /* names fall back to upper-cased codes */ }
+  try { S.system = await api("/api/system"); } catch (e) {}
+  render();
+})();
+</script>
+</body>
+</html>

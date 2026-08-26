@@ -11535,6 +11535,18 @@ async def creator_index():
     return FileResponse(str(STATIC_DIR / "creator.html"))
 
 
+@app.get("/go")
+async def go_index():
+    """GoChiDUBB Go — the phone surface.
+
+    Unconditional like /pro and /creator, but it does NOT persist ui_mode:
+    ui_mode chooses which desktop front door GET / serves, and a phone
+    visiting /go must never flip what the desktop browser gets. Same
+    account, same jobs table, same meter — just a screen that fits a hand.
+    """
+    return FileResponse(str(STATIC_DIR / "go.html"))
+
+
 @app.get("/admin")
 async def admin_index():
     """The vendor admin console — the design's `3a` screens.
