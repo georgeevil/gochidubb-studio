@@ -891,3 +891,21 @@ respellings are read out as letters ("GOH-chee" → "G-O-H-G"), a partially
 capitalized foreign respelling was half-honored, and the IPA probe came out
 as letter salad. Ship shape: the `say` field stays; the editor copy steers
 users to lowercase sound-alikes and states IPA is unsupported.
+
+### Follow-up branch (feat/workbench-followups, 2026-08-25 evening)
+
+- **Background bed re-measured and re-defaulted.** No hidden attenuation
+  exists; the bed at unity is simply ~10 dB under the loudnorm-hot dub
+  voice. `background_volume` now spans 0–10 (default 10, config v3
+  migrates 0.5/1.0 stored values), `bg_ducking` defaults off, an alimiter
+  (−1 dBTP) closes both mix graphs, the resume path threads per-job bed
+  values, the retry override is validated against the real spec, and /qc
+  gained a "Background bed" row measuring the dub-vs-source delta over the
+  longest speech-free window (live: +9.5 LU on job 59e389e2, peak −0.8).
+- **URL scheme**: /pro and /creator persist ui_mode on visit; Pro gained
+  the #/route/param hash router (deep link `#/review/<id>/<tab>` verified
+  live); admin's dead `#job-` links now point at /pro#/review/<id>.
+- **E2E harness**: docs/runbooks/ (7 workflow walkthroughs) + the
+  .claude/skills/e2e-walkthrough executor skill. First flagship run
+  surfaced two runbook imprecisions (fixed) and an unexplained mid-run
+  server SIGTERM (drafted as a spike; crash-resume recovered the job).
