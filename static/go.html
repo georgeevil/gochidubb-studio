@@ -15,6 +15,11 @@
 <div id="app"></div>
 <div id="toast" hidden></div>
 <input id="clipFile" type="file" accept="video/*" hidden>
+<!-- The in-page camera (getUserMedia) does not exist on insecure origins —
+     a phone on http://<lan-ip> has no navigator.mediaDevices at all. A
+     capture input still works there: tapping it opens the phone's native
+     camera app, and the recording comes back as a file. -->
+<input id="camCapture" type="file" accept="video/*" capture="user" hidden>
 <audio id="flagAudio" hidden></audio>
 <script>
 "use strict";
@@ -820,7 +825,9 @@ function ensureCam() {
   if (!el) return;
   if (mediaStream) { el.srcObject = mediaStream; return; }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    S.camError = "no camera in this browser — import a clip instead";
+    // Insecure origin (plain http on the LAN) — the API is simply absent.
+    // The ● button opens the native camera app via #camCapture instead.
+    S.camError = "● opens your camera app (in-page camera needs HTTPS)";
     return;
   }
   navigator.mediaDevices.getUserMedia({
@@ -966,7 +973,7 @@ const A = {
   },
   toggleRec() {
     if (!S.recording) {
-      if (!mediaStream) { toast("No camera — import a clip instead"); return; }
+      if (!mediaStream) { $("#camCapture").click(); return; }
       recChunks = [];
       const mime = window.MediaRecorder && MediaRecorder.isTypeSupported("video/mp4")
         ? "video/mp4" : "video/webm";
@@ -1317,11 +1324,12 @@ function clipTitle() {
     " " + d.toTimeString().slice(0, 5);
 }
 
-// Imported clip → straight to the language screen, like ending a recording.
-$("#clipFile").addEventListener("change", () => {
-  const f = $("#clipFile").files[0];
+// Imported or natively-captured clip → straight to the language screen,
+// like ending an in-page recording.
+function takeClipFile(input, label) {
+  const f = input.files[0];
   if (!f) return;
-  S.clipBlob = f; S.clipName = f.name; S.clipSecs = 0;
+  S.clipBlob = f; S.clipName = f.name || ("go_" + Date.now() + ".mp4"); S.clipSecs = 0;
   const v = document.createElement("video");
   v.preload = "metadata";
   v.onloadedmetadata = () => {
@@ -1331,9 +1339,11 @@ $("#clipFile").addEventListener("change", () => {
   };
   v.src = URL.createObjectURL(f);
   S.screen = "langs"; render();
-  toast("Imported " + f.name);
-  $("#clipFile").value = "";
-});
+  toast(label + (f.name ? " " + f.name : ""));
+  input.value = "";
+}
+$("#clipFile").addEventListener("change", () => takeClipFile($("#clipFile"), "Imported"));
+$("#camCapture").addEventListener("change", () => takeClipFile($("#camCapture"), "Got your recording"));
 
 // ═══════════════════════════════════════════════════════════════════
 // Boot
