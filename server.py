@@ -10625,15 +10625,21 @@ async def get_bug_report(job_id: str):
         return JSONResponse({"error": "Job not found"}, 404)
     payload = _bug_report_payload(job_id)
     return {"report": payload, "signature": payload["signature"],
-            "linear_configured": bugreport.sink_configured()}
+            "linear_configured": bugreport.sink_configured(),
+            "email_configured": bugreport.email_configured(),
+            "support_email": bugreport.support_email()}
 
 
 @app.post("/api/bugreport/{job_id}")
 async def send_bug_report(job_id: str, request: Request):
-    """Deliver the report to the configured sink (Linear).
+    """Deliver the report: Linear first, the support mailbox if that fails.
 
     Optional JSON body {"note": "..."} — a missing or malformed body is
     tolerated, and the note is redacted before it leaves the machine.
+
+    The chain lives in bugreport.deliver_report; this route only reports
+    which link answered, so "filed" and "emailed because Linear refused it"
+    are never confused for each other.
     """
     job = jobs.get(job_id)
     if job is None:
@@ -10647,22 +10653,29 @@ async def send_bug_report(job_id: str, request: Request):
             note = bugreport.redact(str(body.get("note") or ""))[:2000]
     except Exception:
         pass
-    sink = bugreport.get_sink()
-    if sink is None:
-        return JSONResponse({"error": "Linear is not configured. Set "
-                             "linear_api_key and linear_team_id via "
-                             "/api/secrets."}, 400)
     report = _bug_report_payload(job_id)
-    result = await sink.deliver(report, note=note)
+    result = await bugreport.deliver_report(report, note=note)
+    if result.get("action") == "unconfigured":
+        return JSONResponse(
+            {"error": "No delivery sink is configured. Set linear_api_key + "
+                      "linear_team_id for the issue tracker, or smtp_host "
+                      f"to mail reports to {bugreport.support_email()} — "
+                      "both via /api/secrets. Copy report and mail it → "
+                      "work without either.",
+             "support_email": bugreport.support_email()}, 400)
     log.info(f"[bugreport] {job_id} -> {result.get('action')} "
-             f"{result.get('issue') or ''}")
+             f"{result.get('issue') or result.get('recipient') or ''}"
+             f"{' (fell back)' if result.get('fell_back') else ''}")
     if not result.get("ok"):
-        return JSONResponse({"ok": False,
+        return JSONResponse({"ok": False, "attempts": result.get("attempts") or [],
                              "error": result.get("error") or "Delivery failed"},
                             502)
     return {"ok": True, "action": result.get("action"),
             "url": result.get("url"), "issue": result.get("issue"),
-            "signature": result.get("signature")}
+            "signature": result.get("signature"),
+            "recipient": result.get("recipient") or "",
+            "fell_back": bool(result.get("fell_back")),
+            "attempts": result.get("attempts") or []}
 
 
 # ═══════════════════════════════════════════════════════════════════════

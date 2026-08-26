@@ -3544,10 +3544,12 @@ function JobErrorPanel({ job, compact }) {
 
 // ── Bug report flow ─────────────────────────────────────────────────
 // Rendered inside JobErrorPanel by "report this →". GET /api/bugreport/{id}
-// previews the redacted report; "Send to Linear" POSTs it (server-side the
-// signature dedupes: create issue or comment on the existing one). The
-// Linear key is write-only — saved via /api/secrets like the VK token, only
-// a presence boolean ever comes back.
+// previews the redacted report; the send button POSTs it. Server-side the
+// signature dedupes into Linear (create issue, or comment on the existing
+// one) and, if Linear refuses the write, the same report is emailed to the
+// support address instead — sent.fell_back says which happened, and it is
+// shown rather than glossed. The Linear key is write-only — saved via
+// /api/secrets like the VK token, only a presence boolean ever comes back.
 function BugReportFlow({ jobId }) {
   const [data, setData] = useState(null);
   const [err, setErr] = useState('');
@@ -3617,7 +3619,8 @@ function BugReportFlow({ jobId }) {
       `job: ${jobId}`, '',
       logLines,
     ].join('\n').slice(0, 1500);
-    return `mailto:?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+    const to = data.support_email || 'support@gochidubb.com';
+    return `mailto:${to}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
   })();
 
   return (
@@ -3638,27 +3641,42 @@ function BugReportFlow({ jobId }) {
         </div>
       )}
       {sent ? (
-        <a className="mono" href={sent.url || '#'} target="_blank" rel="noreferrer"
-           style={{ fontSize: 11.5, color: 'var(--accent)' }}>
-          {sent.action === 'commented'
-            ? '✓ added to existing issue →'
-            : `✓ created ${sent.issue || 'issue'} →`}
-        </a>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          {sent.action === 'emailed' ? (
+            <div className="mono" style={{ fontSize: 11.5, color: 'var(--accent)' }}>
+              ✓ emailed to {sent.recipient || 'support'}
+            </div>
+          ) : (
+            <a className="mono" href={sent.url || '#'} target="_blank" rel="noreferrer"
+               style={{ fontSize: 11.5, color: 'var(--accent)' }}>
+              {sent.action === 'commented'
+                ? '✓ added to existing issue →'
+                : `✓ created ${sent.issue || 'issue'} →`}
+            </a>
+          )}
+          {sent.fell_back && (
+            <div className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)', lineHeight: 1.5 }}>
+              Linear would not take it — {(sent.attempts || [])
+                .filter(a => !a.ok && a.error).map(a => a.error).join('; ') || 'delivery failed'}
+            </div>
+          )}
+        </div>
       ) : report && (
         <>
           <input className="field" placeholder="What were you doing? (optional)"
                  value={note} onChange={e => setNote(e.target.value)}
                  style={{ fontSize: 11.5, maxWidth: 420 }}/>
           <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-            {data.linear_configured && (
+            {(data.linear_configured || data.email_configured) && (
               <button className="btn btn-primary" onClick={send} disabled={sending}
                       style={{ fontSize: 11, padding: '5px 12px' }}>
-                {sending ? 'Sending…' : 'Send to Linear'}
+                {sending ? 'Sending…'
+                  : data.linear_configured ? 'Send to Linear' : 'Email support'}
               </button>
             )}
             <CopyButton text={JSON.stringify(report, null, 2)} label="Copy report"/>
             <a className="mono" href={mailtoHref}
-               style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>mail it →</a>
+               style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>mail support →</a>
           </div>
           {!data.linear_configured && (
             <div style={{ padding: 10, background: 'var(--bg-2)',
@@ -3667,6 +3685,9 @@ function BugReportFlow({ jobId }) {
               <div style={{ fontSize: 11, color: 'var(--ink-3)', lineHeight: 1.55, marginBottom: 8 }}>
                 Reports go straight to your Linear workspace (create a personal API key at
                 linear.app → Settings → Security &amp; access). Stored locally, never shown again.
+                {' '}If Linear ever refuses a report — over quota, revoked key, no network — it is
+                emailed to {data.support_email || 'support@gochidubb.com'} instead
+                {data.email_configured ? '.' : ' once smtp_host is set; until then, mail support → does it by hand.'}
               </div>
               <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                 <input className="field" type="password" placeholder="lin_api_…"

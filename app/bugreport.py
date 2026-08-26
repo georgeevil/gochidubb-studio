@@ -20,8 +20,12 @@ Deliberate choices:
 * **Delivery never raises and never logs the API key.** A bug report is a
   courtesy on top of a failure; it must not become a second failure. Sinks
   return a result dict either way.
-* **Sinks are a protocol.** Linear is the one sink today; a future Slack
-  sink is another class here plus a branch in :func:`get_sink`.
+* **Sinks are a protocol, and they chain.** Linear is tried first because
+  it dedupes; when it refuses the write — an over-quota workspace, a
+  revoked key, an outage — :func:`deliver_report` sends the same report to
+  the support mailbox instead, carrying the tracker's own reason with it.
+  A failure that cannot be filed must still reach a person. A future Slack
+  sink is another class here plus a link in that chain.
 """
 from __future__ import annotations
 
@@ -36,6 +40,12 @@ from pipeline.notices import redact
 log = logging.getLogger("gochidubb.bugreport")
 
 LINEAR_API_URL = "https://api.linear.app/graphql"
+
+# Where reports go when the issue tracker will not take them. Not a user
+# preference — this is GoChiDUBB's own support mailbox, and the whole point
+# of the fallback is that it needs no setup to be the right address. The
+# ``bugreport_email`` secret overrides it for anyone self-hosting.
+SUPPORT_EMAIL = "support@gochidubb.com"
 
 # The dedupe marker embedded verbatim in issue bodies and searched for on the
 # next occurrence. Changing this prefix (or the hash) orphans existing issues.
@@ -109,11 +119,21 @@ def build_bug_report(job: Dict[str, Any], *, system: Dict[str, Any],
     le = job.get("last_error") or {}
     stage = le.get("stage") or job.get("failed_stage") or ""
     message = le.get("message") or job.get("error") or ""
+    # A job that failed before structured errors existed — or that was
+    # interrupted, which writes only the legacy top-level `error` — has an
+    # empty last_error. The signature was always computed from the resolved
+    # values; carry them into the report too, or the title and body read
+    # "unknown error" for a failure whose text is right here.
+    resolved = _redacted_copy(le)
+    if message and not resolved.get("message"):
+        resolved["message"] = redact(message)
+    if stage and not resolved.get("stage"):
+        resolved["stage"] = stage
     return {
         "report_version": 1,
         "generated_at": time.time(),
         "job": _redacted_copy({k: job[k] for k in _JOB_FIELDS if k in job}),
-        "last_error": _redacted_copy(le),
+        "last_error": resolved,
         "error_history": [_redacted_copy(h) for h in job.get("error_history") or []
                           if isinstance(h, dict)],
         "signature": error_signature(stage, message) if message else "",
@@ -153,8 +173,39 @@ class Sink(Protocol):
 
     name: str
 
-    async def deliver(self, report: Dict[str, Any], note: str = "") -> Dict[str, Any]:
+    async def deliver(self, report: Dict[str, Any], note: str = "", *,
+                      context: str = "") -> Dict[str, Any]:
         ...
+
+
+def summary_rows(report: Dict[str, Any]) -> tuple:
+    """The (label, value) pairs every sink puts at the top of a report.
+
+    One definition so an emailed report and a filed issue describe the same
+    failure in the same terms — a maintainer reading both should not have to
+    work out whether they are looking at one incident or two.
+    """
+    le = report.get("last_error") or {}
+    job = report.get("job") or {}
+    system = report.get("system") or {}
+    return (
+        ("Job id", job.get("id", "")),
+        ("Stage", le.get("stage", "")),
+        ("Error type", le.get("type", "")),
+        ("Target language", job.get("target_lang", "")),
+        ("Signature", report.get("signature") or ""),
+        ("Platform", system.get("platform", "")),
+        ("Python", system.get("python", "")),
+        ("GPU", f"{system.get('gpu_backend', '')} {system.get('gpu') or ''}".strip()),
+    )
+
+
+def report_title(report: Dict[str, Any]) -> str:
+    """One-line headline — an issue title, and an email subject."""
+    le = report.get("last_error") or {}
+    stage_label = le.get("stage_label") or le.get("stage") or "unknown stage"
+    message = le.get("message") or "unknown error"
+    return f"[gochidubb] {stage_label}: {message[:90]}"
 
 
 def _fmt_log_lines(logs: List[Dict[str, Any]]) -> str:
@@ -215,26 +266,15 @@ class LinearSink:
 
     # ── Body rendering ───────────────────────────────────────────────
     @staticmethod
-    def _issue_content(report: Dict[str, Any], note: str) -> tuple:
+    def _issue_content(report: Dict[str, Any], note: str, context: str = "") -> tuple:
         le = report.get("last_error") or {}
-        job = report.get("job") or {}
-        system = report.get("system") or {}
         sig = report.get("signature") or ""
-        stage_label = le.get("stage_label") or le.get("stage") or "unknown stage"
-        message = le.get("message") or "unknown error"
-        title = f"[gochidubb] {stage_label}: {message[:90]}"
-        rows = (
-            ("Job id", job.get("id", "")),
-            ("Stage", le.get("stage", "")),
-            ("Error type", le.get("type", "")),
-            ("Target language", job.get("target_lang", "")),
-            ("Signature", sig),
-            ("Platform", system.get("platform", "")),
-            ("Python", system.get("python", "")),
-            ("GPU", f"{system.get('gpu_backend', '')} {system.get('gpu') or ''}".strip()),
-        )
-        parts = ["| field | value |", "| --- | --- |"]
-        parts += [f"| {k} | {v} |" for k, v in rows if v != ""]
+        title = report_title(report)
+        parts = []
+        if context:
+            parts += [f"> {context}", ""]
+        parts += ["| field | value |", "| --- | --- |"]
+        parts += [f"| {k} | {v} |" for k, v in summary_rows(report) if v != ""]
         parts += ["",
                   f"`{SIG_PREFIX}{sig}` — dedupe key, do not remove: later "
                   "occurrences of this error are matched to this issue by "
@@ -250,12 +290,13 @@ class LinearSink:
         return title, "\n".join(parts)
 
     @staticmethod
-    def _comment_body(report: Dict[str, Any], note: str) -> str:
+    def _comment_body(report: Dict[str, Any], note: str, context: str = "") -> str:
         le = report.get("last_error") or {}
         job = report.get("job") or {}
         system = report.get("system") or {}
         ts = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(le.get("ts") or time.time()))
-        parts = [f"New occurrence — job `{job.get('id', '?')}`, "
+        parts = ([f"> {context}", ""] if context else [])
+        parts += [f"New occurrence — job `{job.get('id', '?')}`, "
                  f"target `{job.get('target_lang', '?')}`, {ts} UTC",
                  f"{system.get('platform', '')} · python {system.get('python', '')} · "
                  f"{system.get('gpu_backend', '')}"]
@@ -270,7 +311,8 @@ class LinearSink:
         return "\n".join(parts)
 
     # ── Delivery ─────────────────────────────────────────────────────
-    async def deliver(self, report: Dict[str, Any], note: str = "") -> Dict[str, Any]:
+    async def deliver(self, report: Dict[str, Any], note: str = "", *,
+                      context: str = "") -> Dict[str, Any]:
         """Create or comment. Never raises; the key never reaches a log."""
         import httpx
         sig = report.get("signature") or ""
@@ -289,7 +331,7 @@ class LinearSink:
                     data = await self._gql(
                         client, self._COMMENT_MUTATION,
                         {"issueId": found.get("id"),
-                         "body": self._comment_body(report, note)})
+                         "body": self._comment_body(report, note, context)})
                     cc = data.get("commentCreate") or {}
                     if not cc.get("success"):
                         raise RuntimeError("commentCreate reported success=false")
@@ -298,7 +340,7 @@ class LinearSink:
                     result.update(ok=True, action="commented", url=url,
                                   issue=found.get("identifier") or "")
                 else:
-                    title, body = self._issue_content(report, note)
+                    title, body = self._issue_content(report, note, context)
                     inp = {"teamId": self._team_id, "title": title,
                            "description": body}
                     if self._project_id:
@@ -321,12 +363,160 @@ class LinearSink:
         return result
 
 
+def render_report_text(report: Dict[str, Any], note: str = "",
+                       context: str = "") -> str:
+    """The report as plain text, for a mailbox rather than an issue tracker.
+
+    Same facts as the Linear body, without the markdown — a mail client
+    shows a table as pipes and a ``<details>`` as literal tags.
+    """
+    le = report.get("last_error") or {}
+    sig = report.get("signature") or ""
+    parts = []
+    if context:
+        parts += [context, ""]
+    parts += [le.get("message") or "unknown error", ""]
+    parts += [f"{k}: {v}" for k, v in summary_rows(report) if v != ""]
+    if sig:
+        parts += ["", f"{SIG_PREFIX}{sig} — dedupe key. Recurrences of this "
+                  "bug arrive under an identical subject line."]
+    if note:
+        parts += ["", f"User note: {note}"]
+    if le.get("traceback_tail"):
+        parts += ["", "--- traceback ---", le["traceback_tail"]]
+    logs = report.get("logs") or []
+    if logs:
+        parts += ["", f"--- last {len(logs)} log lines ---",
+                  _fmt_log_lines(logs)]
+    parts += ["", "The full machine-readable report is attached as JSON."]
+    return "\n".join(parts)
+
+
+class EmailSink:
+    """Deliver reports to a mailbox over SMTP.
+
+    This is the fallback for when the issue tracker will not take the write.
+    It exists because the tracker is not always available to be written to:
+    an over-quota workspace answers 400, a revoked key answers 401, an
+    outage answers nothing at all — and in every one of those cases the
+    failure the user is reporting is still real and still unreported.
+
+    There is no dedupe here; a mailbox is not an issue tracker. The
+    signature goes in the subject line and in an ``X-GoChiDUBB-Signature``
+    header instead, so recurrences of one bug thread together and can be
+    filtered without being silently merged.
+
+    ``smtp_factory`` is a test seam: a zero-argument callable returning
+    something with ``starttls`` / ``login`` / ``send_message`` / ``quit``.
+    """
+
+    name = "email"
+
+    def __init__(self, host: str, port: int = 587, username: str = "",
+                 password: str = "", sender: str = "",
+                 recipient: str = SUPPORT_EMAIL, security: str = "starttls",
+                 timeout: float = 20.0, smtp_factory=None):
+        self._host = host
+        self._security = security if security in ("starttls", "ssl", "none") else "starttls"
+        self._port = int(port or (465 if self._security == "ssl" else 587))
+        self._username = username
+        self._password = password
+        self._sender = sender or username or f"gochidubb@{host}"
+        self._recipient = recipient or SUPPORT_EMAIL
+        self._timeout = timeout
+        self._smtp_factory = smtp_factory
+
+    # ── Message ──────────────────────────────────────────────────────
+    def build_message(self, report: Dict[str, Any], note: str = "",
+                      context: str = ""):
+        """The full report as an :class:`email.message.EmailMessage`.
+
+        The subject carries the signature so a mail client threads
+        recurrences; the body is readable on its own, and the JSON
+        attachment is what a maintainer actually pastes into a debugger.
+        """
+        import json as _json
+        from email.message import EmailMessage
+
+        sig = report.get("signature") or ""
+        msg = EmailMessage()
+        subject = report_title(report)
+        if sig:
+            subject = f"{subject} [{SIG_PREFIX}{sig}]"
+        msg["Subject"] = subject
+        msg["From"] = self._sender
+        msg["To"] = self._recipient
+        if sig:
+            msg["X-GoChiDUBB-Signature"] = sig
+        msg.set_content(render_report_text(report, note, context))
+        msg.add_attachment(
+            _json.dumps(report, indent=2, ensure_ascii=False, default=str).encode("utf-8"),
+            maintype="application", subtype="json",
+            filename=f"gochidubb-report-{sig or 'unknown'}.json")
+        return msg
+
+    # ── Delivery ─────────────────────────────────────────────────────
+    def _scrub(self, text: str) -> str:
+        """redact(), plus the SMTP password by exact match.
+
+        redact() catches credential-*shaped* strings; an SMTP password is
+        whatever the user chose, so remove the one value we actually hold
+        before anything reaches a result dict or a log line.
+        """
+        s = str(text)
+        if self._password:
+            s = s.replace(self._password, "***")
+        return redact(s)
+
+    def _send(self, msg) -> None:
+        """Blocking SMTP conversation. Runs on a worker thread, never the loop."""
+        import smtplib
+        if self._smtp_factory is not None:
+            client = self._smtp_factory()
+        elif self._security == "ssl":
+            client = smtplib.SMTP_SSL(self._host, self._port, timeout=self._timeout)
+        else:
+            client = smtplib.SMTP(self._host, self._port, timeout=self._timeout)
+        try:
+            if self._security == "starttls":
+                client.starttls()
+            if self._username:
+                client.login(self._username, self._password)
+            client.send_message(msg)
+        finally:
+            try:
+                client.quit()
+            except Exception:
+                pass
+
+    async def deliver(self, report: Dict[str, Any], note: str = "", *,
+                      context: str = "") -> Dict[str, Any]:
+        """Send the report. Never raises; the password never reaches a log."""
+        import asyncio
+        sig = report.get("signature") or ""
+        result = {"ok": False, "sink": self.name, "action": "failed",
+                  "url": "", "issue": "", "signature": sig, "error": "",
+                  "recipient": self._recipient}
+        try:
+            msg = self.build_message(report, note, context)
+            # smtplib is blocking, and a hung SMTP host would freeze every
+            # other request for the connect timeout — the same defect that
+            # took the server out for the whole synthesis stage.
+            await asyncio.to_thread(self._send, msg)
+            result.update(ok=True, action="emailed")
+        except Exception as e:
+            err = self._scrub(f"{type(e).__name__}: {e}")
+            result["error"] = err
+            log.warning(f"[bugreport] email delivery failed: {err}")
+        return result
+
+
 # ── Sink selection ───────────────────────────────────────────────────
 def get_sink() -> Optional[Sink]:
-    """The configured delivery sink, or None.
+    """The configured issue-tracker sink, or None.
 
-    Linear is the only sink today. A future Slack sink is another class in
-    this module plus a branch here on its own secrets.
+    Linear is the only tracker today. A future Slack sink is another class
+    in this module plus a branch here on its own secrets.
     """
     from app.secrets import get_secret
     api_key = get_secret("linear_api_key")
@@ -337,6 +527,85 @@ def get_sink() -> Optional[Sink]:
                       project_id=get_secret("linear_project_id"))
 
 
+def support_email() -> str:
+    """Where the fallback mail goes. Configurable, but never unset."""
+    from app.secrets import get_secret
+    return get_secret("bugreport_email") or SUPPORT_EMAIL
+
+
+def get_email_sink() -> Optional[Sink]:
+    """The SMTP fallback sink, or None if no mail host is configured.
+
+    Only ``smtp_host`` is required: a relay on localhost needs no
+    credentials, and demanding them would turn the fallback off for the
+    setup least likely to fail.
+    """
+    from app.secrets import get_secret
+    host = get_secret("smtp_host")
+    if not host:
+        return None
+    raw_port = (get_secret("smtp_port") or "").strip()
+    security = (get_secret("smtp_security") or "").strip().lower()
+    if security not in ("starttls", "ssl", "none"):
+        # Port 465 is implicit TLS by convention; everything else negotiates.
+        security = "ssl" if raw_port == "465" else "starttls"
+    username = get_secret("smtp_username")
+    port = int(raw_port) if raw_port.isdigit() else (465 if security == "ssl" else 587)
+    return EmailSink(host, port=port, username=username,
+                     password=get_secret("smtp_password"),
+                     sender=get_secret("smtp_from") or username,
+                     recipient=support_email(), security=security)
+
+
 def sink_configured() -> bool:
-    """Presence check only — never touches the network."""
+    """Presence check on the issue tracker only — never touches the network."""
     return get_sink() is not None
+
+
+def email_configured() -> bool:
+    """Presence check on the SMTP fallback — never touches the network."""
+    return get_email_sink() is not None
+
+
+async def deliver_report(report: Dict[str, Any], note: str = "", *,
+                         sinks: Optional[List[Sink]] = None) -> Dict[str, Any]:
+    """Deliver to the issue tracker, falling back to the support mailbox.
+
+    Linear goes first because it dedupes: the signature finds the existing
+    issue and a recurrence lands as a comment. When it refuses the write the
+    same report is emailed instead, carrying the tracker's own reason in the
+    body so the failure to file is visible rather than inferred.
+
+    **Falling back on any tracker failure, not only on HTTP 400,** is
+    deliberate. Linear reports some refusals as a 200 with a GraphQL error
+    body and others as a status code, so the code alone is not a reliable
+    test for "it did not land" — and every refusal has the same consequence
+    for the person who clicked report this.
+
+    Returns the first successful result, annotated with ``attempts`` (one
+    entry per sink tried) and ``fell_back``. When every sink fails, returns
+    the last result with the same annotations; when none is configured,
+    ``action`` is ``"unconfigured"``.
+    """
+    chain = sinks if sinks is not None else [
+        s for s in (get_sink(), get_email_sink()) if s is not None]
+    attempts: List[Dict[str, Any]] = []
+    if not chain:
+        return {"ok": False, "action": "unconfigured", "attempts": attempts,
+                "fell_back": False, "signature": report.get("signature") or "",
+                "error": "No delivery sink is configured."}
+    context = ""
+    result: Dict[str, Any] = {}
+    for sink in chain:
+        result = await sink.deliver(report, note, context=context)
+        attempts.append({"sink": result.get("sink") or getattr(sink, "name", "?"),
+                         "ok": bool(result.get("ok")),
+                         "action": result.get("action") or "",
+                         "error": result.get("error") or ""})
+        if result.get("ok"):
+            break
+        context = ("Filed here because the issue tracker refused this report: "
+                   f"{result.get('error') or 'delivery failed'}")
+    result["attempts"] = attempts
+    result["fell_back"] = bool(result.get("ok")) and len(attempts) > 1
+    return result
