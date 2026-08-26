@@ -993,3 +993,85 @@ def test_discard_download_never_touches_a_user_upload(tmp_path, monkeypatch):
     server._discard_download(keeper / "v.mp4")
     # A directory with anything else still in it is left alone.
     assert keeper.exists() and (keeper / "other.mp4").exists()
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Voice presets: the library's server half (CLD-295 review fixes)
+# ─────────────────────────────────────────────────────────────────────
+
+@pytest.fixture()
+def voices_dir(monkeypatch, tmp_path):
+    d = tmp_path / "voices"
+    d.mkdir()
+    monkeypatch.setattr(server, "VOICE_PRESETS_DIR", d)
+    return d
+
+
+def _mk_voice(d, name, ext=".wav", meta=None):
+    (d / f"{name}{ext}").write_bytes(b"RIFF0000WAVE")
+    if meta is not None:
+        (d / f"{name}.json").write_text(json.dumps(meta), encoding="utf-8")
+
+
+def test_rename_collides_across_extensions(client, voices_dir):
+    """The preset id is the stem, so renaming Bob.wav to 'Anna' while
+    Anna.mp3 exists would merge two voices under one id — and the .wav
+    would win the extension probe, silently swapping Anna's voice for
+    Bob's on every job that cloned her."""
+    _mk_voice(voices_dir, "Anna", ".mp3")
+    _mk_voice(voices_dir, "Bob", ".wav")
+    r = client.put("/api/voice_presets/file:Bob", data={"name": "Anna"})
+    assert r.status_code == 409
+    assert (voices_dir / "Anna.mp3").exists()
+    assert (voices_dir / "Bob.wav").exists()
+
+
+def test_rename_to_its_own_name_still_works(client, voices_dir):
+    _mk_voice(voices_dir, "Anna", ".wav", {"display_name": "Anna"})
+    r = client.put("/api/voice_presets/file:Anna", data={"name": "Anna"})
+    assert r.status_code == 200
+    assert (voices_dir / "Anna.wav").exists()
+
+
+def test_metadata_edit_does_not_restamp_consent(client, voices_dir):
+    """The attestation timestamp is the audit trail: fixing a typo in the
+    description a month later must not rewrite attested_at."""
+    original = {"attested_by": "local", "attested_at": 123.0, "scope": "dubbing"}
+    _mk_voice(voices_dir, "Anna", ".wav",
+              {"display_name": "Anna", "consent": dict(original)})
+    r = client.put("/api/voice_presets/file:Anna",
+                   data={"description": "fixed a typo",
+                         "consent_attested": "true"})
+    assert r.status_code == 200
+    meta = json.loads((voices_dir / "Anna.json").read_text(encoding="utf-8"))
+    assert meta["consent"] == original
+    assert meta["description"] == "fixed a typo"
+    # Explicitly revoking still works.
+    r = client.put("/api/voice_presets/file:Anna",
+                   data={"consent_attested": "false"})
+    assert r.status_code == 200
+    meta = json.loads((voices_dir / "Anna.json").read_text(encoding="utf-8"))
+    assert "consent" not in meta
+
+
+def test_preset_responses_hide_the_record_and_the_server_path(client, voices_dir):
+    """POST/PUT responses go through the same public serializer as the
+    list: consent is a bool (the record carries host details no client
+    needs) and reference_file is a basename, never an absolute path."""
+    r = client.post("/api/voice_presets",
+                    files={"audio": ("v.wav", b"RIFF0000WAVE", "audio/wav")},
+                    data={"name": "Public Shape", "consent_attested": "true"})
+    assert r.status_code == 200
+    p = r.json()["preset"]
+    assert p["consent"] is True
+    assert p["reference_file"] == "Public Shape.wav"
+    r = client.put("/api/voice_presets/file:Public Shape",
+                   data={"description": "still public"})
+    assert r.status_code == 200
+    p = r.json()["preset"]
+    assert p["consent"] is True                  # None field left it alone
+    assert p["reference_file"] == "Public Shape.wav"
+    listed = client.get("/api/voice_presets").json()["presets"]
+    me = next(v for v in listed if v["id"] == "file:Public Shape")
+    assert me["consent"] is True
+    assert me["reference_file"] == "Public Shape.wav"

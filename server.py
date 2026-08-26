@@ -10250,25 +10250,32 @@ def _voice_preset_payload() -> dict:
         {"id": k, "name": v["name"], "style": v["style"], "type": "style"}
         for k, v in VOICE_PRESETS.items()
     ]
-    file_presets = []
-    for k, v in scan_file_presets().items():
-        file_presets.append({
-            "id": k, "name": v["name"], "style": v.get("style", ""),
-            "type": "file",
-            "description": v.get("description", ""),
-            "reference_file": os.path.basename(v["reference_file"]),
-            "gender": v.get("gender", ""),
-            "language": v.get("language", ""),
-            "tags": v.get("tags", []),
-            "created_at": v.get("created_at"),
-            "file_size": v.get("file_size", 0),
-            "file_ext": v.get("file_ext", ""),
-            "audio_url": v.get("audio_url"),
-            # A bool, not the record — the record carries host/user details
-            # that no browser needs. Enforcement stays in _resolve_casting.
-            "consent": bool(v.get("consent")),
-        })
+    file_presets = [_public_file_preset(v) for v in scan_file_presets().values()]
     return {"presets": file_presets + style_presets}
+
+
+def _public_file_preset(v: dict) -> dict:
+    """What a browser gets to see of a file preset. The one serializer for
+    every route that returns one (list, create, update): consent as a bool
+    — the record carries host/user details no client needs — and the audio
+    file as a basename, never the absolute server path. Enforcement of the
+    consent policy stays in _resolve_casting."""
+    if not v:
+        return {}
+    return {
+        "id": v.get("id"), "name": v.get("name"), "style": v.get("style", ""),
+        "type": "file",
+        "description": v.get("description", ""),
+        "reference_file": os.path.basename(v.get("reference_file", "")),
+        "gender": v.get("gender", ""),
+        "language": v.get("language", ""),
+        "tags": v.get("tags", []),
+        "created_at": v.get("created_at"),
+        "file_size": v.get("file_size", 0),
+        "file_ext": v.get("file_ext", ""),
+        "audio_url": v.get("audio_url"),
+        "consent": bool(v.get("consent")),
+    }
 
 
 @app.get("/api/voices")
@@ -10404,7 +10411,8 @@ async def create_voice_preset(
 
     log.info(f"[voice_presets] created '{clean}' ({audio_path.stat().st_size} bytes)")
     pid = f"file:{clean}"
-    return {"ok": True, "id": pid, "preset": scan_file_presets().get(pid, {})}
+    return {"ok": True, "id": pid,
+            "preset": _public_file_preset(scan_file_presets().get(pid, {}))}
 
 
 @app.put("/api/voice_presets/{preset_id}")
@@ -10438,7 +10446,9 @@ async def update_voice_preset(
         meta["style"] = style.strip()[:300]
     if consent_attested is not None:
         if consent_attested:
-            meta["consent"] = _consent_record()
+            # Keep an existing record — the attestation timestamp is the
+            # audit trail, and a metadata edit must not rewrite it.
+            meta.setdefault("consent", _consent_record())
         else:
             meta.pop("consent", None)
 
@@ -10450,8 +10460,13 @@ async def update_voice_preset(
         if not clean:
             return JSONResponse({"error": "Invalid name"}, 400)
         new_audio = VOICE_PRESETS_DIR / f"{clean}{src_audio.suffix}"
-        if new_audio.exists() and new_audio != src_audio:
-            return JSONResponse({"error": f"A preset named '{clean}' already exists"}, 409)
+        # The preset id is the stem, so a collision with ANY extension merges
+        # two voices under one id (and .wav wins the _file_preset_path probe
+        # — jobs cloning the old voice would silently get the new one).
+        for ext in _VOICE_AUDIO_EXTS:
+            other = VOICE_PRESETS_DIR / f"{clean}{ext}"
+            if other.exists() and other != src_audio:
+                return JSONResponse({"error": f"A preset named '{clean}' already exists"}, 409)
         if new_audio != src_audio:
             old_meta_path = _voice_metadata_path(src_audio)
             old_txt_path = src_audio.with_suffix(".txt")
@@ -10471,7 +10486,8 @@ async def update_voice_preset(
         return JSONResponse({"error": f"Couldn't save metadata: {e}"}, 500)
 
     log.info(f"[voice_presets] updated '{final_audio.stem}'")
-    return {"ok": True, "id": new_id, "preset": scan_file_presets().get(new_id, {})}
+    return {"ok": True, "id": new_id,
+            "preset": _public_file_preset(scan_file_presets().get(new_id, {}))}
 
 
 @app.delete("/api/voice_presets/{preset_id}")

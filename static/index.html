@@ -1524,9 +1524,9 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
           <Field label="Design a voice (optional)"
                  hint="Describe a voice and VoxCPM designs it once for the whole
                        job — e.g. 'deep calm male narrator, slow pace'. It replaces
-                       source-voice cloning for every speaker; a style preset's own
-                       description is overridden, and an uploaded reference file
-                       wins over both.">
+                       source-voice cloning for every speaker and overrides a style
+                       preset's description — but any voice reference wins over it:
+                       a saved voice picked above, or an uploaded reference file.">
             <input
               className="field"
               value={voiceStyle}
@@ -4022,12 +4022,22 @@ function wbForm(fields) {
   return fd;
 }
 
-// One shared player so two ▶ buttons never talk over each other.
-const _wbAudio = { el: null };
-function wbPlay(url) {
+// One shared player so two ▶ buttons never talk over each other. onDone
+// fires when playback ends, fails, or another wbPlay steals the player —
+// enough for a stateful button to know it is no longer the one playing.
+const _wbAudio = { el: null, onDone: null };
+function wbStop() {
   if (_wbAudio.el) { _wbAudio.el.pause(); }
-  _wbAudio.el = new Audio(url);
-  _wbAudio.el.play().catch(() => {});
+  const done = _wbAudio.onDone;
+  _wbAudio.el = null; _wbAudio.onDone = null;
+  if (done) done();
+}
+function wbPlay(url, onDone) {
+  wbStop();
+  const el = new Audio(url);
+  _wbAudio.el = el; _wbAudio.onDone = onDone || null;
+  el.onended = el.onerror = () => { if (_wbAudio.el === el) wbStop(); };
+  el.play().catch(() => { if (_wbAudio.el === el) wbStop(); });
 }
 
 const WB_GATE_ORDER = ['transcript', 'translation', 'voice_cast', 'subtitles', 'final_qc'];
@@ -6418,24 +6428,29 @@ const VOICE_EXTS = ['.wav', '.mp3', '.flac', '.ogg', '.m4a'];
 // design (VoxCPM reads the file straight off disk). Re-encode to 16-bit
 // mono WAV in the page — same approach the Go phone page uses.
 async function recordingToWav(blob) {
+  // The context must close on the error path too — Safari caps live
+  // AudioContexts at ~4, so leaking one per failed decode bricks recording.
   const ac = new (window.AudioContext || window.webkitAudioContext)();
-  const buf = await ac.decodeAudioData(await blob.arrayBuffer());
-  const rate = buf.sampleRate;
-  const ch = buf.getChannelData(0);
-  const n = ch.length;
-  const out = new DataView(new ArrayBuffer(44 + n * 2));
-  const ws = (o, s) => { for (let i = 0; i < s.length; i++) out.setUint8(o + i, s.charCodeAt(i)); };
-  ws(0, 'RIFF'); out.setUint32(4, 36 + n * 2, true); ws(8, 'WAVE');
-  ws(12, 'fmt '); out.setUint32(16, 16, true); out.setUint16(20, 1, true);
-  out.setUint16(22, 1, true); out.setUint32(24, rate, true);
-  out.setUint32(28, rate * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true);
-  ws(36, 'data'); out.setUint32(40, n * 2, true);
-  for (let i = 0; i < n; i++) {
-    const s = Math.max(-1, Math.min(1, ch[i]));
-    out.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  try {
+    const buf = await ac.decodeAudioData(await blob.arrayBuffer());
+    const rate = buf.sampleRate;
+    const ch = buf.getChannelData(0);
+    const n = ch.length;
+    const out = new DataView(new ArrayBuffer(44 + n * 2));
+    const ws = (o, s) => { for (let i = 0; i < s.length; i++) out.setUint8(o + i, s.charCodeAt(i)); };
+    ws(0, 'RIFF'); out.setUint32(4, 36 + n * 2, true); ws(8, 'WAVE');
+    ws(12, 'fmt '); out.setUint32(16, 16, true); out.setUint16(20, 1, true);
+    out.setUint16(22, 1, true); out.setUint32(24, rate, true);
+    out.setUint32(28, rate * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true);
+    ws(36, 'data'); out.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) {
+      const s = Math.max(-1, Math.min(1, ch[i]));
+      out.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+    }
+    return new Blob([out], { type: 'audio/wav' });
+  } finally {
+    try { ac.close(); } catch (_) {}
   }
-  try { ac.close(); } catch (_) {}
-  return new Blob([out], { type: 'audio/wav' });
 }
 
 function presetAudioUrl(p) {
@@ -6444,21 +6459,17 @@ function presetAudioUrl(p) {
   return encodeURI(p.audio_url || `/api/voice_presets/${p.id}/audio`);
 }
 
-// One player per row, stopped on unmount so switching tabs never leaves a
-// disembodied voice talking.
+// Rides the shared wbPlay player, so two rows can never talk over each
+// other and a same-name re-upload is fetched fresh instead of replayed
+// from a cached Audio object. wbStop on unmount keeps a switched-away tab
+// from leaving a disembodied voice talking.
 function VoicePlayButton({ url }) {
   const [playing, setPlaying] = useState(false);
-  const audioRef = useRef(null);
-  useEffect(() => () => { audioRef.current?.pause(); }, []);
+  useEffect(() => () => { if (playing) wbStop(); }, [playing]);
   const toggle = () => {
-    if (playing) { audioRef.current?.pause(); setPlaying(false); return; }
-    if (!audioRef.current) {
-      audioRef.current = new Audio(url);
-      audioRef.current.onended = () => setPlaying(false);
-      audioRef.current.onerror = () => setPlaying(false);
-    }
-    audioRef.current.currentTime = 0;
-    audioRef.current.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+    if (playing) { wbStop(); return; }        // onDone flips the state back
+    setPlaying(true);
+    wbPlay(url, () => setPlaying(false));
   };
   return (
     <button className="btn" onClick={toggle} style={{ minWidth: 72, justifyContent: 'center' }}>
@@ -6515,7 +6526,11 @@ function VoicePresetRow({ p, onChanged }) {
     fd.append('language', form.language);
     fd.append('gender', form.gender);
     fd.append('tags', form.tags);
-    fd.append('consent_attested', form.consent ? 'true' : 'false');
+    // Only when the toggle actually changed — an omitted field leaves the
+    // consent record alone, preserving the original attestation timestamp.
+    if (form.consent !== !!p.consent) {
+      fd.append('consent_attested', form.consent ? 'true' : 'false');
+    }
     try {
       const r = await fetch(`/api/voice_presets/${encodeURIComponent(p.id)}`, { method: 'PUT', body: fd });
       const d = await r.json();
@@ -6602,7 +6617,7 @@ function VoicePresetRow({ p, onChanged }) {
   );
 }
 
-function AddVoiceCard({ onSaved }) {
+function AddVoiceCard({ presets, onSaved }) {
   const [name, setName] = useState('');
   const [desc, setDesc] = useState('');
   const [language, setLanguage] = useState('');
@@ -6615,8 +6630,10 @@ function AddVoiceCard({ onSaved }) {
   const [recording, setRecording] = useState(false);
   const [recSecs, setRecSecs] = useState(0);
   const [saving, setSaving] = useState(false);
+  const [confirmReplace, setConfirmReplace] = useState(false);
   const [err, setErr] = useState(null);
   const recRef = useRef(null);   // { recorder, stream, timer }
+  const deadRef = useRef(false); // unmounted while getUserMedia was pending
 
   const micOk = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
 
@@ -6627,12 +6644,18 @@ function AddVoiceCard({ onSaved }) {
     try { r.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
     recRef.current = null;
   };
-  useEffect(() => () => stopTracks(), []);
+  useEffect(() => () => { deadRef.current = true; stopTracks(); }, []);
 
   const startRec = async () => {
     setErr(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (deadRef.current) {
+        // Unmounted while the permission prompt was up — nothing left to
+        // stop this stream later, so kill it right here.
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
       const recorder = new MediaRecorder(stream);
       const chunks = [];
       recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
@@ -6671,6 +6694,13 @@ function AddVoiceCard({ onSaved }) {
         return;
       }
     }
+    // The endpoint overwrites a same-named preset by design (re-upload is a
+    // feature) — but destroying someone's reference audio deserves the same
+    // second click a delete gets.
+    const existing = (presets || []).find(
+      v => v.type === 'file' && (v.name || '').toLowerCase() === clean.toLowerCase());
+    if (existing && !confirmReplace) { setConfirmReplace(true); return; }
+    setConfirmReplace(false);
     setSaving(true);
     const fd = new FormData();
     fd.append('audio', file || new File([recBlob], clean + '.wav', { type: 'audio/wav' }));
@@ -6729,7 +6759,8 @@ function AddVoiceCard({ onSaved }) {
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
         <Field label="Name">
-          <input className="field" value={name} onChange={e => setName(e.target.value)}
+          <input className="field" value={name}
+                 onChange={e => { setName(e.target.value); setConfirmReplace(false); }}
                  placeholder="e.g. My voice"/>
         </Field>
         <Field label="Language" hint="Optional — ISO code">
@@ -6757,23 +6788,26 @@ function AddVoiceCard({ onSaved }) {
               hint="Your own voice counts — tick it. Stored with the preset; the
                     voice-consent policy in Settings decides if it is required."/>
       {err && <div style={{ color: 'var(--err)', fontSize: 12 }}>{err}</div>}
+      {confirmReplace && (
+        <div style={{ color: 'var(--warn)', fontSize: 12, lineHeight: 1.5 }}>
+          A voice named "{name.trim()}" already exists — saving replaces its
+          audio permanently.
+        </div>
+      )}
       <div>
-        <button className="btn btn-primary" onClick={save} disabled={saving || recording}>
-          {saving ? 'Saving…' : 'Save voice'}
+        <button className="btn btn-primary" onClick={save} disabled={saving || recording}
+                style={confirmReplace ? { borderColor: 'var(--warn)' } : undefined}>
+          {saving ? 'Saving…' : confirmReplace ? `Replace "${name.trim()}"?` : 'Save voice'}
         </button>
       </div>
     </div>
   );
 }
 
-function VoicesView() {
-  const [presets, setPresets] = useState(null);
-  const [loadErr, setLoadErr] = useState(null);
-  const reload = () => fetch('/api/voice_presets').then(r => r.json())
-    .then(d => { setPresets(d.presets || []); setLoadErr(null); })
-    .catch(e => setLoadErr(String(e)));
-  useEffect(() => { reload(); }, []);
-
+// The list is the App-level voicePresets state, not a private copy — a
+// save or delete here must also update the dub form's preset picker and
+// the retry pickers, which read the same state.
+function VoicesView({ presets, onRefresh }) {
   const files = (presets || []).filter(p => p.type === 'file');
   // 'auto' is the dub form's default, not a voice — it has nothing to show here.
   const styles = (presets || []).filter(p => p.type === 'style' && p.id !== 'auto');
@@ -6791,21 +6825,17 @@ function VoicesView() {
           )}
         </div>
 
-        <AddVoiceCard onSaved={reload}/>
+        <AddVoiceCard presets={presets} onSaved={onRefresh}/>
 
         <div className="caps" style={{ marginTop: 6 }}>Your voices</div>
-        {presets === null && !loadErr && (
-          <div style={{ color: 'var(--ink-3)', fontSize: 12 }}>Loading…</div>
-        )}
-        {loadErr && <div style={{ color: 'var(--err)', fontSize: 12 }}>{loadErr}</div>}
-        {presets !== null && files.length === 0 && (
+        {files.length === 0 && (
           <div style={{ color: 'var(--ink-3)', fontSize: 12, lineHeight: 1.5 }}>
             No saved voices yet. Upload or record one above — it shows up in the
             dub form's Voice preset picker, in per-speaker casting, and on the
             Go phone page.
           </div>
         )}
-        {files.map(p => <VoicePresetRow key={p.id} p={p} onChanged={reload}/>)}
+        {files.map(p => <VoicePresetRow key={p.id} p={p} onChanged={onRefresh}/>)}
 
         {styles.length > 0 && (
           <>
@@ -7158,7 +7188,8 @@ function JobsView({ tab, setTab, jobs, system, voicePresets, publishPending, run
 }
 
 function LibraryView({ tab, setTab, jobs, system, voicePresets, selectedResultJobId,
-                       onPickResultJob, onJumpHome, onJumpJobs, onRefresh }) {
+                       onPickResultJob, onJumpHome, onJumpJobs, onRefresh,
+                       onRefreshVoices }) {
   const tabs = [
     { id: 'results',  label: 'Results' },
     { id: 'voices',   label: 'Voices' },
@@ -7172,7 +7203,7 @@ function LibraryView({ tab, setTab, jobs, system, voicePresets, selectedResultJo
           system={system} onRefresh={onRefresh} onPickJob={onPickResultJob}
           onSwitchToHome={onJumpHome} onSwitchToHistory={onJumpJobs}/>
       )}
-      {tab === 'voices' && <VoicesView/>}
+      {tab === 'voices' && <VoicesView presets={voicePresets} onRefresh={onRefreshVoices}/>}
       {tab === 'glossary' && <GlossaryEditor/>}
     </div>
   );
@@ -8285,10 +8316,12 @@ function App() {
     return () => clearInterval(t);
   }, []);
 
-  // Voice presets
-  useEffect(() => {
+  // Voice presets. refreshVoices is also handed to the Voices library so a
+  // save/delete there updates every picker reading this state, not a copy.
+  const refreshVoices = useCallback(() => {
     fetch('/api/voices').then(r => r.json()).then(d => setVoicePresets(d.presets || [])).catch(() => {});
-  }, [view]);
+  }, []);
+  useEffect(() => { refreshVoices(); }, [view, refreshVoices]);
 
   // Jobs polling. The publish inbox rides the same cadence — staged uploads
   // only change when a human or the uploader acts, so it needs no faster loop.
@@ -8417,6 +8450,7 @@ function App() {
             onJumpHome={() => setView('home')}
             onJumpJobs={() => { setJobsTab('all'); setView('jobs'); }}
             onRefresh={refreshJobs}
+            onRefreshVoices={refreshVoices}
           />
         )}
 
