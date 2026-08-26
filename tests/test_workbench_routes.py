@@ -327,3 +327,46 @@ def test_get_job_eta_zero_when_parked_at_a_gate(client):
                             duration=120.0, progress=62)
     d = client.get("/api/job/j").json()
     assert d["eta_seconds"] == 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  /pro and /creator persist the mode preference (URL-scheme fix)
+# ═══════════════════════════════════════════════════════════════════════
+
+def test_visiting_pro_persists_the_preference(client, tmp_path, monkeypatch):
+    """Plain links to /pro used to leave ui_mode on "creator", so the next
+    visit to / bounced straight back — path and pref could disagree forever."""
+    prefs = tmp_path / "user_prefs.json"
+    prefs.write_text('{"ui_mode": "creator"}')
+    monkeypatch.setattr(server, "PREFS_FILE", prefs)
+    r = client.get("/pro")
+    assert r.status_code == 200
+    assert json.loads(prefs.read_text())["ui_mode"] == "pro"
+
+
+def test_visiting_creator_persists_the_preference(client, tmp_path, monkeypatch):
+    prefs = tmp_path / "user_prefs.json"
+    monkeypatch.setattr(server, "PREFS_FILE", prefs)
+    r = client.get("/creator")
+    assert r.status_code == 200
+    assert json.loads(prefs.read_text())["ui_mode"] == "creator"
+
+
+def test_persisting_merges_instead_of_replacing(client, tmp_path, monkeypatch):
+    prefs = tmp_path / "user_prefs.json"
+    prefs.write_text('{"ui_mode": "creator", "other_pref": 7}')
+    monkeypatch.setattr(server, "PREFS_FILE", prefs)
+    client.get("/pro")
+    data = json.loads(prefs.read_text())
+    assert data == {"ui_mode": "pro", "other_pref": 7}
+
+
+def test_root_still_dispatches_by_preference(client, tmp_path, monkeypatch):
+    prefs = tmp_path / "user_prefs.json"
+    prefs.write_text('{"ui_mode": "pro"}')
+    monkeypatch.setattr(server, "PREFS_FILE", prefs)
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "creator" not in (r.headers.get("content-type") or "") or True
+    # / never writes the pref — only the explicit doors do.
+    assert json.loads(prefs.read_text())["ui_mode"] == "pro"

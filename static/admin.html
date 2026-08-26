@@ -633,7 +633,7 @@ function queueItem(q) {
     <div class="queue-body">${esc(q.detail)}</div>
     ${q.job_ids && q.job_ids.length
       ? `<div class="queue-body">jobs: ${q.job_ids.map(j =>
-          `<a href="/#job-${esc(j)}">${esc(j)}</a>`).join(" · ")}</div>` : ""}
+          `<a href="/pro#/review/${esc(j)}">${esc(j)}</a>`).join(" · ")}</div>` : ""}
     ${actions ? `<div class="queue-actions">${actions}</div>` : ""}
   </div>`;
 }

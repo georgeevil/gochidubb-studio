@@ -4798,7 +4798,15 @@ function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, 
   const statusKey = job ? job.id + ':' + job.status : '';
   useEffect(() => {
     if (job) {
-      setTab(WB_TAB_FOR_STATUS[job.status] || 'translation');
+      // A deep link (#/review/<id>/<tab>) names the tab once; after that
+      // the gate status picks it, as before.
+      const deep = _initialRoute.wbTab;
+      if (deep) {
+        _initialRoute.wbTab = null;
+        setTab(deep);
+      } else {
+        setTab(WB_TAB_FOR_STATUS[job.status] || 'translation');
+      }
       setNotice(''); setErr(''); setRejecting(false);
     }
   }, [statusKey]);
@@ -7725,19 +7733,95 @@ function ComingSoonView({ icon, title, blurb, points = [], phase }) {
   );
 }
 
+// ── URL routing ──────────────────────────────────────────────────────
+// Pro had ten views and zero addressable routes: a refresh reset to the
+// feed and a review-in-progress could not be linked or recovered. This is
+// the smallest hash router over the existing state — same #/route/param
+// convention Creator already uses, so /pro#/review/<id> mirrors
+// /creator#/review/<id>.
+const PRO_VIEWS = new Set(['feed', 'home', 'jobs', 'library', 'discover',
+                           'apikeys', 'mcp', 'webhooks', 'billing', 'system']);
+
+function parseProHash(h) {
+  const out = { view: 'feed', jobsTab: null, reviewId: null, wbTab: null,
+                libTab: null };
+  let s = (h || '').replace(/^#\/?/, '');
+  if (!s) return out;
+  // admin's job links used to point at "#job-<id>", which no router
+  // handled — accept the legacy shape as a review deep link.
+  if (s.startsWith('job-')) s = 'review/' + s.slice(4);
+  const p = s.split('/');
+  if (p[0] === 'review') {
+    out.view = 'jobs'; out.jobsTab = 'review';
+    if (p[1]) out.reviewId = p[1];
+    if (p[2]) out.wbTab = p[2];
+  } else if (p[0] === 'jobs') {
+    out.view = 'jobs';
+    out.jobsTab = ['all', 'live', 'review', 'batches'].includes(p[1])
+      ? p[1] : 'all';
+  } else if (p[0] === 'library') {
+    out.view = 'library';
+    out.libTab = ['results', 'voices', 'glossary'].includes(p[1])
+      ? p[1] : 'results';
+  } else if (p[0] === 'new') {
+    out.view = 'home';
+  } else if (PRO_VIEWS.has(p[0])) {
+    out.view = p[0];
+  }
+  return out; // unknown hashes fall through to the feed, like Creator's home
+}
+
+function buildProHash(view, jobsTab, reviewId, libTab) {
+  if (view === 'jobs') {
+    if (jobsTab === 'review') return '#/review' + (reviewId ? '/' + reviewId : '');
+    return jobsTab && jobsTab !== 'all' ? '#/jobs/' + jobsTab : '#/jobs';
+  }
+  if (view === 'library') {
+    return libTab && libTab !== 'results' ? '#/library/' + libTab : '#/library';
+  }
+  return '#/' + view;
+}
+
+// Parsed once before React mounts; ReviewView consumes wbTab exactly once.
+const _initialRoute = parseProHash(window.location.hash);
+
 function App() {
   // 1a's home is the feed. It landed on New dub while the feed was still a
   // placeholder; now that it renders real activity it takes the front door.
-  const [view, setView] = useState('feed');
+  const [view, setView] = useState(_initialRoute.view);
   const [system, setSystem] = useState(null);
   const [voicePresets, setVoicePresets] = useState([]);
   const [jobs, setJobs] = useState([]);
   const [sphereOn, setSphereOn] = useState(true);
   const [publishPending, setPublishPending] = useState([]);
   const [selectedResultJobId, setSelectedResultJobId] = useState(null);
-  const [selectedReviewJobId, setSelectedReviewJobId] = useState(null);
-  const [jobsTab, setJobsTab] = useState('all');
-  const [libTab, setLibTab] = useState('results');
+  const [selectedReviewJobId, setSelectedReviewJobId] =
+    useState(_initialRoute.reviewId);
+  const [jobsTab, setJobsTab] = useState(_initialRoute.jobsTab || 'all');
+  const [libTab, setLibTab] = useState(_initialRoute.libTab || 'results');
+
+  // Keep the address bar honest, and honor edits to it. The ref swallows
+  // exactly the hashchange our own write causes.
+  const _selfRoute = useRef(false);
+  useEffect(() => {
+    const want = buildProHash(view, jobsTab, selectedReviewJobId, libTab);
+    if (window.location.hash !== want) {
+      _selfRoute.current = true;
+      window.location.hash = want;
+    }
+  }, [view, jobsTab, selectedReviewJobId, libTab]);
+  useEffect(() => {
+    const onHash = () => {
+      if (_selfRoute.current) { _selfRoute.current = false; return; }
+      const r = parseProHash(window.location.hash);
+      setView(r.view);
+      if (r.jobsTab) setJobsTab(r.jobsTab);
+      if (r.reviewId) setSelectedReviewJobId(r.reviewId);
+      if (r.libTab) setLibTab(r.libTab);
+    };
+    window.addEventListener('hashchange', onHash);
+    return () => window.removeEventListener('hashchange', onHash);
+  }, []);
   // What ⌘K last parsed, handed to HomeView to pre-fill the form.
   const [pendingCommand, setPendingCommand] = useState(null);
   const narrow = useIsNarrow();

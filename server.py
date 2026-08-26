@@ -11475,14 +11475,42 @@ async def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
+def _persist_ui_mode(mode: str) -> None:
+    """Remember which front door was used, best-effort.
+
+    Visiting /pro or /creator now writes the preference: before this, only
+    the two JS switch buttons persisted it, so following a plain link to
+    /pro left the pref on "creator" and the next visit to / bounced you
+    straight back — path and preference could disagree forever. A write
+    failure never breaks serving the page.
+    """
+    try:
+        existing = {}
+        if PREFS_FILE.exists():
+            with open(PREFS_FILE, "r", encoding="utf-8") as f:
+                existing = json.load(f)
+        if not isinstance(existing, dict):
+            existing = {}
+        if existing.get("ui_mode") == mode:
+            return
+        existing["ui_mode"] = mode
+        with open(PREFS_FILE, "w", encoding="utf-8") as f:
+            json.dump(existing, f, indent=2)
+        log.info(f"[ui] ui_mode -> {mode} (visited /{mode})")
+    except Exception as e:
+        log.warning(f"[ui] could not persist ui_mode={mode}: {e}")
+
+
 @app.get("/pro")
 async def pro_index():
-    """Pro mode, unconditionally — the escape hatch.
+    """Pro mode, unconditionally — and it remembers you chose it.
 
     Never redirects and never reads the preference: if someone's preference
     is wrong, or the creator page is broken, this is how they get their tool
     back. /creator is unconditional in the same way, in the other direction.
+    Visiting persists ui_mode so a later visit to / lands here too.
     """
+    _persist_ui_mode("pro")
     return FileResponse(str(STATIC_DIR / "index.html"))
 
 
@@ -11501,7 +11529,9 @@ async def creator_index():
 
     Unconditional, like /pro: it serves creator.html whatever the stored
     preference says, so each mode always has a direct address that works.
+    Visiting persists ui_mode so a later visit to / lands here too.
     """
+    _persist_ui_mode("creator")
     return FileResponse(str(STATIC_DIR / "creator.html"))
 
 
