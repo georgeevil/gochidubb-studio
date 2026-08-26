@@ -2884,10 +2884,12 @@ function PublishPanel({ jobId, defaultOpen = false }) {
 //   · a job card    — a dub, with its stage chips and live progress
 //   · an event row  — a one-line system note
 //
-// Two things the design shows are absent on purpose rather than faked: the
-// natural-language prompt behind a run (agents send tool calls, not the
-// sentence that produced them) and per-job cost (the meter arrives with
-// billing). Inventing either would put numbers on screen that mean nothing.
+// The two design elements that shipped last (CLD-249), because faking them
+// was worse than omitting them: the natural-language prompt behind a run
+// (now real — agents that send one via the MCP tools' `prompt` argument get
+// it quoted on the run card; runs without one simply have no quote) and
+// per-job cost (now real — the server's tier math rides the /api/activity
+// payload as `spend`, and every figure keeps its "est." marker).
 
 // Consecutive calls by the same actor inside this window read as one run.
 const RUN_WINDOW_SEC = 300;
@@ -2904,10 +2906,13 @@ const groupFeed = (events, jobs, { groupRuns = true } = {}) => {
           && prev.lastTs - ev.ts < RUN_WINDOW_SEC) {
         prev.calls.push(ev);
         prev.lastTs = ev.ts;
+        // Newest-first stream, so an earlier call's prompt reaches us later —
+        // and the run keeps the prompt of the call that STARTED it.
+        if (ev.prompt) prev.prompt = ev.prompt;
         continue;
       }
       out.push({ type: 'run', key: 'run' + ev.id, actor: ev.actor,
-                 ts: ev.ts, lastTs: ev.ts, calls: [ev] });
+                 ts: ev.ts, lastTs: ev.ts, calls: [ev], prompt: ev.prompt });
       continue;
     }
     if (ev.kind === 'job') {
@@ -2988,7 +2993,7 @@ function FeedStageChips({ job, transitions }) {
   );
 }
 
-function FeedJobCard({ item, onOpen }) {
+function FeedJobCard({ item, onOpen, rate }) {
   const job = item.job;
   // A job deleted since its events were recorded still has a feed entry.
   if (!job) {
@@ -3008,6 +3013,16 @@ function FeedJobCard({ item, onOpen }) {
   const meta = STATUS_META[job.status] || { color: 'var(--ink-3)', label: job.status };
   const active = ACTIVE_STATUSES.has(job.status);
   const pct = Math.max(0, Math.min(100, job.progress ?? 0));
+  // Per-job cost estimate, mirroring app/billing.job_minutes: source length
+  // × target languages, nothing for jobs that failed or were cancelled (the
+  // meter bills those nothing). The rate is the server's — the tier math
+  // stays in app/billing.py; this is just the multiply.
+  const unbilled = job.status === 'error' || job.status === 'cancelled'
+    || job.status === 'failed';
+  const langsN = Array.isArray(job.target_langs) && job.target_langs.length
+    ? job.target_langs.length : 1;
+  const billMins = (!unbilled && job.duration > 0) ? job.duration / 60 * langsN : 0;
+  const cost = (rate && billMins > 0) ? billMins * rate : null;
   return (
     <div className="panel" style={{
       padding: '16px 18px', display: 'flex', flexDirection: 'column', gap: 12,
@@ -3045,6 +3060,13 @@ function FeedJobCard({ item, onOpen }) {
                                      fontSize: 10.5, color: 'var(--ink-3)' }}>
         {job.target_lang && <span style={{ color: 'var(--ink-2)' }}>{job.target_lang}</span>}
         {job.duration ? <span>{fmtSec(job.duration)} source</span> : null}
+        {cost != null && (
+          <span title={'Estimate at the current metered rate'
+                       + (langsN > 1 ? ` — ${billMins.toFixed(1)} min × ${langsN} langs` : '')
+                       + '. This server bills nobody.'}>
+            {active ? '≈' : ''} ${cost.toFixed(2)} est.
+          </span>
+        )}
         {active && <span>{pct}%</span>}
         {job.step_detail && (
           <span className="wrap-any" style={{ color: 'var(--ink-3)' }}>{job.step_detail}</span>
@@ -3081,6 +3103,13 @@ function FeedRunCard({ item }) {
         <span className="mono" style={{ marginLeft: 'auto', fontSize: 10.5,
                                         color: 'var(--ink-3)' }}>{fmtAge(item.lastTs)}</span>
       </div>
+      {item.prompt && (
+        <div className="wrap-any" style={{
+          borderLeft: '2px solid var(--line-2)', padding: '2px 0 2px 11px',
+          fontSize: 12, lineHeight: 1.5, color: 'var(--ink-2)',
+          fontStyle: 'italic',
+        }}>“{item.prompt}”</div>
+      )}
       <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
         {rolled.map(c => (
           <div key={c.id} className="mono" style={{ display: 'flex', gap: 8, fontSize: 11 }}>
@@ -3130,13 +3159,12 @@ function FeedEventRow({ ev }) {
   );
 }
 
-function FeedSideTiles({ jobs, system, events }) {
+function FeedSideTiles({ jobs, system, events, spend }) {
   const queued = jobs.filter(j => j.status === 'queued' || j.status === 'scheduled').length;
   const running = jobs.filter(j => ACTIVE_STATUSES.has(j.status)).length;
   const acc = system?.accelerator;
   const res = system?.resources || {};
-  // Minutes of source media dubbed today, from the jobs themselves. Real
-  // figure; the money it would cost arrives with billing.
+  // Minutes of source media dubbed today, from the jobs themselves.
   const dayAgo = Date.now() / 1000 - 86400;
   const minsToday = jobs
     .filter(j => (j.created || 0) > dayAgo && j.duration)
@@ -3183,6 +3211,29 @@ function FeedSideTiles({ jobs, system, events }) {
         <Row k="minutes · 24h" v={minsToday.toFixed(0)}/>
       </Tile>
 
+      {spend && (
+        <Tile label="Spend · MTD">
+          <div className="mono" style={{ fontSize: 20, fontWeight: 600,
+                                         color: 'var(--ink)' }}>
+            ${(spend.cost ?? 0).toFixed(2)}
+          </div>
+          <div style={{ height: 6 }}/>
+          <Row k="current rate" v={`$${(spend.rate ?? 0).toFixed(3)}/min`}
+               tint="var(--accent)"/>
+          <Row k="minutes" v={(spend.minutes ?? 0).toFixed(0)}/>
+          {spend.next_tier && (
+            <Row k="to next tier"
+                 v={`${Math.ceil(spend.next_tier.minutes)} min → $${spend.next_tier.next_rate.toFixed(3)}`}
+                 tint="var(--ink-3)"/>
+          )}
+          <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)',
+                                         marginTop: 6, lineHeight: 1.5 }}>
+            estimate · real minutes at the published hosted rates — this
+            server bills nobody
+          </div>
+        </Tile>
+      )}
+
       <Tile label="MCP">
         {clients.length === 0 ? (
           <div className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)',
@@ -3203,6 +3254,9 @@ function AgentFeedView({ jobs, system, narrow, onOpenJob, onSwitchToHome }) {
   const [filter, setFilter] = useState('all');
   const [events, setEvents] = useState([]);
   const [loaded, setLoaded] = useState(false);
+  // Month-to-date meter, riding the same /api/activity poll (see the route's
+  // docstring on why the feed does not poll /api/billing/usage instead).
+  const [spend, setSpend] = useState(null);
   // 'activity' | 'audit' — the audit log lives here as a tab (it used to be
   // its own rail destination). Same screen, deliberately separate stores.
   const [feedTab, setFeedTab] = useState('activity');
@@ -3219,7 +3273,11 @@ function AgentFeedView({ jobs, system, narrow, onOpenJob, onSwitchToHome }) {
                               + (kinds ? '&kinds=' + encodeURIComponent(kinds) : ''));
         if (!r.ok) return;
         const d = await r.json();
-        if (!stopped) { setEvents(d.events || []); setLoaded(true); }
+        if (!stopped) {
+          setEvents(d.events || []);
+          if (d.spend) setSpend(d.spend);
+          setLoaded(true);
+        }
       } catch (_) {}
     };
     pull();
@@ -3288,14 +3346,15 @@ function AgentFeedView({ jobs, system, narrow, onOpenJob, onSwitchToHome }) {
             </div>
           ) : items.map(it =>
             it.type === 'run' ? <FeedRunCard key={it.key} item={it}/>
-            : it.type === 'job' ? <FeedJobCard key={it.key} item={it} onOpen={onOpenJob}/>
+            : it.type === 'job' ? <FeedJobCard key={it.key} item={it} onOpen={onOpenJob}
+                                              rate={spend?.rate}/>
             : it.type === 'call' ? <FeedCallRow key={it.key} ev={it.ev}/>
             : <FeedEventRow key={it.key} ev={it.ev}/>
           )}
         </div>
 
         <div style={{ width: narrow ? '100%' : 300, flexShrink: 0 }}>
-          <FeedSideTiles jobs={jobs} system={system} events={events}/>
+          <FeedSideTiles jobs={jobs} system={system} events={events} spend={spend}/>
         </div>
       </div>
     </div>
@@ -5106,8 +5165,8 @@ function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, 
           ))}
         </div>
 
-        <div style={{ display: 'flex', gap: 18, alignItems: 'flex-start' }}>
-          <div style={{ flex: 1, minWidth: 0 }}>
+        <div className="wb-body">
+          <div className="wb-main">
             {effTab === 'transcript' && <WbTranscriptTab job={job}/>}
             {effTab === 'translation' && <WbTranslationTab job={job} onEdited={() => {}}/>}
             {effTab === 'voices' && <WbPronSpeakersTab job={job} siblings={siblings}/>}
@@ -5115,7 +5174,7 @@ function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, 
             {effTab === 'subtitles' && <WbSubtitlesTab job={job}/>}
             {effTab === 'qc' && <WbFinalQCTab job={job} setTab={setTab} onApprove={proceed} busy={busy}/>}
           </div>
-          <div style={{ width: 270, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div className="wb-rail">
             <GatesRail job={job}/>
             {casting && (
               <div>
@@ -5547,7 +5606,11 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
             border: '1px solid ' + (selected.has(j.id) ? 'var(--accent-dim)' : 'var(--line)'),
             borderRadius: 6,
           }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 16, padding: 10 }}>
+            {/* flexWrap: on a phone the action buttons flow to a second line
+                instead of pushing Delete past the right edge (the 390px pass
+                found it clipped and unreachable). */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 16, rowGap: 6,
+                          padding: 10, flexWrap: 'wrap' }}>
               <input type="checkbox" checked={selected.has(j.id)}
                      onClick={e => toggle(idx, j.id, e.shiftKey)}
                      onChange={() => {}}
@@ -5555,7 +5618,7 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
                      style={{ accentColor: 'var(--accent)', width: 14, height: 14,
                               flexShrink: 0, cursor: 'pointer' }}/>
               <StatusBadge status={j.status}/>
-              <div style={{ flex: 1 }}>{j.title || j.source_label || j.source || j.id}</div>
+              <div style={{ flex: 1, minWidth: 150 }}>{j.title || j.source_label || j.source || j.id}</div>
               {pendingIds.has(j.id) && (
                 <span className="chip" style={{ fontSize: 10, color: 'var(--warn)',
                                                 borderColor: 'oklch(0.78 0.15 60 / 0.3)' }}>
@@ -6589,7 +6652,9 @@ function SystemView({ system, onRefreshSystem }) {
         </span>
       </div>
 
-      <div style={{ display: 'flex', gap: 6, marginBottom: 22 }}>
+      {/* flexWrap: seven tabs are wider than a phone — the 390px pass found
+          Logs clipped off the right edge without it. */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 22, flexWrap: 'wrap' }}>
         {[['overview', 'Overview'], ['voice', 'Voice & TTS'], ['models', 'Models'], ['output', 'Output'], ['notify', 'Notifications'], ['setup', 'Setup'], ['logs', 'Logs']].map(([id, label]) => (
           <button key={id} className={'tab' + (tab === id ? ' active' : '')} onClick={() => pick(id)}>
             {label}{id === 'setup' && issues.length > 0 ? ` · ${issues.length}` : ''}
@@ -6604,7 +6669,8 @@ function SystemView({ system, onRefreshSystem }) {
       {tab === 'setup' && <SetupTab system={system} onRefreshSystem={onRefreshSystem}/>}
       {tab === 'logs' && <LogsTab/>}
       {tab === 'overview' && (
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 20 }}>
+      <div style={{ display: 'grid', gap: 20,
+                    gridTemplateColumns: 'repeat(auto-fit, minmax(260px, 1fr))' }}>
         <div style={{ padding: 16, background: 'var(--bg-1)', border: '1px solid var(--line)', borderRadius: 8 }}>
           <div className="caps">Translation Backend</div>
           <div style={{ fontSize: 18, marginTop: 8 }}>
@@ -7795,8 +7861,10 @@ function ApiKeysView({ mode }) {
             <div style={{ fontSize: 12.5, color: 'var(--ink-2)', lineHeight: 1.6 }}>
               This server runs in <span className="mono">local</span> mode, where
               every route is open and no key is required. Keys are still real —
-              hashed, scoped and revocable — so they are ready when you switch to
-              <span className="mono"> hosted</span>, but nothing is enforced yet.
+              hashed, scoped and revocable — and switching to
+              <span className="mono"> hosted</span> enforces them on the API
+              surface: bad or missing keys are rejected, scopes are checked.
+              Loopback callers stay exempt, so the box can never lock itself out.
             </div>
           </div>
         </DevCard>

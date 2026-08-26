@@ -277,18 +277,28 @@ Highlights beyond the phase notes above:
 * **Local mode is unchanged.** No auth, no billing surfaces, no Workspace
   group — re-verified after every phase.
 
-Still open, and deliberately so:
+The §10 leftovers closed on 2026-08-25 (CLD-249):
 
-* **Narrow-width layout is unverified.** This environment ignores window
-  resizes and page zoom does not move the media query, so the 860px drawer
-  path has not been seen. The drawer mechanics were not modified, but it wants
-  a look on a real phone viewport.
-* **Scope enforcement is written, not exercised.** `verify()` and the scope
-  checks are tested as units, but no route rejects a bad key yet, because
-  local mode does not authenticate. Turning it on is the first task of any
-  genuine hosted deployment — along with everything in §9.
-* **Two design elements remain unbuilt for want of data**: the natural-language
-  prompt behind an agent run, and per-job cost inside the feed.
-* **The alternative phase 1–3 shell** from the parallel session survives only
-  on the local branch `claude/saas-phase4-activity-feed`; delete it once you
-  are happy with the reconciliation.
+* **Scope enforcement is now exercised.** `_enforce_api_scopes` in server.py
+  rejects bad keys in hosted mode over a closed route→scope table
+  (`_scope_for`), with route-level tests for valid / wrong-scope / expired /
+  revoked keys in `tests/test_scope_enforcement.py`. Local mode short-circuits
+  before any check, and loopback callers are exempt even in hosted mode so the
+  operator (and the session-less browser UI) can never be locked out. A
+  genuinely hosted deployment still needs everything in §9 — this closes the
+  key surface, not the account story.
+* **The natural-language prompt behind a run is real.** The MCP submission
+  tools take an optional `prompt`, `GoChiDUBBClient` sends it percent-encoded
+  in `X-GoChiDUBB-Prompt`, the agent-attribution middleware records it
+  (truncated to 300 chars, redacted like everything else), and the feed's run
+  card quotes it. Runs without one simply have no quote — nothing is invented.
+* **Per-job cost is in the feed.** `/api/activity` carries a month-to-date
+  `spend` block (summarize over the jobs dict — pure arithmetic, safe on the
+  feed's 2s poll, unlike /api/billing/usage's storage walk); the right rail
+  shows the Spend·MTD tile and job cards price their minutes at the current
+  rate. Every figure keeps the "est. / bills nobody" honesty markers.
+* **Narrow width had its pass** on a real ~700px viewport via devtools-driven
+  resize; what broke was fixed in the same change.
+
+The alternative phase 1–3 shell's branch (`claude/saas-phase4-activity-feed`)
+is already deleted — nothing from this plan remains open.

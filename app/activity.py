@@ -126,15 +126,20 @@ def _append(kind: str, **fields: Any) -> Dict[str, Any]:
 
 def record_tool_call(tool: str, actor: str, *, job_id: Optional[str] = None,
                      status: Optional[int] = None, detail: Optional[str] = None,
-                     ms: Optional[float] = None) -> Dict[str, Any]:
+                     ms: Optional[float] = None,
+                     prompt: Optional[str] = None) -> Dict[str, Any]:
     """One agent/CLI call, named as the tool it corresponds to.
 
     `actor` is the raw client identity from the header (e.g. "mcp/claude-code"
-    or "cli"), so the feed can say who did it.
+    or "cli"), so the feed can say who did it. `prompt` is the natural-language
+    request that led to the call, when the caller chose to send one — the
+    sentence the design's run cards quote above the tool calls. Optional and
+    purely informational, like the actor header it travels next to.
     """
     return _append("tool_call", tool=tool, actor=actor, job_id=job_id,
                    status=status, detail=detail,
-                   ms=round(ms, 1) if ms is not None else None)
+                   ms=round(ms, 1) if ms is not None else None,
+                   prompt=prompt)
 
 
 def record_job(job_id: str, status: str, *, title: Optional[str] = None,

@@ -169,6 +169,14 @@ input, textarea, select { font-family: inherit; font-size: inherit; color: inher
 .dropzone:hover { border-color: var(--accent-dim); background: var(--bg-2); }
 .dropzone.dragging { border-color: var(--accent); background: var(--accent-dim); }
 
+/* Review workbench body: tab content beside a fixed 270px gates rail on
+   desktop; the rail drops below the content on narrow viewports (its width
+   would leave a phone's segment cards ~90px wide otherwise). */
+.wb-body { display: flex; gap: 18px; align-items: flex-start; }
+.wb-body > .wb-main { flex: 1; min-width: 0; }
+.wb-rail { width: 270px; flex-shrink: 0;
+           display: flex; flex-direction: column; gap: 12px; }
+
 /* ── Phones / narrow windows ──────────────────────────────────────
    The desktop shell is a fixed 232px rail beside a flex column. At 390px
    that leaves ~158px of content, which is why every label wrapped one word
@@ -186,6 +194,10 @@ input, textarea, select { font-family: inherit; font-size: inherit; color: inher
      tappable. Only pad the interactive ones. */
   .btn { padding: 9px 14px; }
   .tab { padding: 10px 4px; }
+
+  /* The workbench's gates rail stacks under the tab content. */
+  .wb-body { flex-direction: column; }
+  .wb-body > .wb-rail { width: 100%; }
 }
 
 /* Backdrop behind the mobile nav drawer. */

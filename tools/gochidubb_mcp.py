@@ -103,6 +103,7 @@ async def gochidubb_dub(
     voxcpm_cfg: float = 0.0,
     voxcpm_steps: int = 0,
     review_gates: Optional[dict] = None,
+    prompt: str = "",
     wait: bool = False,
     wait_timeout: float = 1800.0,
 ) -> dict:
@@ -137,6 +138,10 @@ async def gochidubb_dub(
             (modes off | on | flagged_only). Each armed gate parks the job
             at an awaiting_* status; act on it (gochidubb_get_flags,
             gochidubb_edit_translations) then gochidubb_continue_job.
+        prompt: The user's natural-language request that led to this call,
+            one sentence (e.g. "Dub this talk into French and stitch a
+            showcase"). Quoted on the server dashboard's activity feed so a
+            human can see WHY the run started. Optional, informational only.
         wait: If True, block until job finishes and return final status + url.
             Ignored for scheduled jobs (they start later).
         wait_timeout: Max seconds to wait when wait=True.
@@ -155,7 +160,7 @@ async def gochidubb_dub(
         context_hint=context_hint, wizard_mode=wizard_mode,
         mode=mode, scheduled_at=scheduled_at,
         voxcpm_cfg=voxcpm_cfg, voxcpm_steps=voxcpm_steps,
-        review_gates=review_gates,
+        review_gates=review_gates, prompt=prompt,
     )
     job_id = res.get("job_id")
     if wait and job_id and not res.get("scheduled_at"):
@@ -181,6 +186,7 @@ async def gochidubb_compare(
     keep_bg: bool = True,
     voxcpm_cfg: float = 0.0,
     voxcpm_steps: int = 0,
+    prompt: str = "",
     wait: bool = False,
     wait_timeout: float = 3600.0,
 ) -> dict:
@@ -191,13 +197,15 @@ async def gochidubb_compare(
     trim_seconds: 15-120, default 60.
     keep_bg: background music/SFX kept by default.
     voxcpm_cfg / voxcpm_steps: per-job VoxCPM overrides; 0 = global setting.
+    prompt: the user's natural-language request behind this call, quoted on
+    the server dashboard's activity feed. Optional, informational only.
     """
     c = await _get_client()
     res = await c.submit_compare(
         source, target_langs, trim_seconds=trim_seconds,
         source_lang=source_lang, model=model,
         voice_preset=voice_preset, tts_speed=tts_speed, keep_bg=keep_bg,
-        voxcpm_cfg=voxcpm_cfg, voxcpm_steps=voxcpm_steps,
+        voxcpm_cfg=voxcpm_cfg, voxcpm_steps=voxcpm_steps, prompt=prompt,
     )
     if wait and res.get("batch_id"):
         jobs = await c.wait_for_batch(res["batch_id"], timeout=wait_timeout)
@@ -222,6 +230,7 @@ async def gochidubb_showcase(
     keep_bg: bool = True,
     voxcpm_cfg: float = 0.0,
     voxcpm_steps: int = 0,
+    prompt: str = "",
     wait: bool = False,
     wait_timeout: float = 3600.0,
 ) -> dict:
@@ -234,13 +243,15 @@ async def gochidubb_showcase(
     target_langs: 2-6 codes. trim_seconds: 15-120.
     keep_bg: background music/SFX kept by default.
     voxcpm_cfg / voxcpm_steps: per-job VoxCPM overrides; 0 = global setting.
+    prompt: the user's natural-language request behind this call, quoted on
+    the server dashboard's activity feed. Optional, informational only.
     """
     c = await _get_client()
     res = await c.submit_showcase(
         source, target_langs, trim_seconds=trim_seconds,
         source_lang=source_lang, model=model,
         voice_preset=voice_preset, tts_speed=tts_speed, keep_bg=keep_bg,
-        voxcpm_cfg=voxcpm_cfg, voxcpm_steps=voxcpm_steps,
+        voxcpm_cfg=voxcpm_cfg, voxcpm_steps=voxcpm_steps, prompt=prompt,
     )
     if wait and res.get("batch_id"):
         bid = res["batch_id"]
@@ -262,6 +273,7 @@ async def gochidubb_redub(
     tts_speed: Optional[str] = None,
     voxcpm_cfg: Optional[float] = None,
     voxcpm_steps: Optional[int] = None,
+    prompt: str = "",
     wait: bool = False,
     wait_timeout: float = 3600.0,
 ) -> dict:
@@ -272,12 +284,14 @@ async def gochidubb_redub(
           'showcase' (2-6 stitched into one reel).
     voxcpm_cfg / voxcpm_steps: omit to inherit the original job's values;
           0 drops back to the server's global setting.
+    prompt: the user's natural-language request behind this call, quoted on
+          the server dashboard's activity feed. Optional, informational only.
     """
     c = await _get_client()
     res = await c.redub(
         job_id, target_langs, mode=mode,
         model=model, voice_preset=voice_preset, tts_speed=tts_speed,
-        voxcpm_cfg=voxcpm_cfg, voxcpm_steps=voxcpm_steps,
+        voxcpm_cfg=voxcpm_cfg, voxcpm_steps=voxcpm_steps, prompt=prompt,
     )
     if wait:
         if res.get("batch_id"):

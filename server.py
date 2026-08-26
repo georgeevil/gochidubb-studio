@@ -69,6 +69,7 @@ import shutil
 import signal
 import sys
 import time
+import urllib.parse
 import uuid
 import webbrowser
 from contextlib import asynccontextmanager
@@ -1860,6 +1861,78 @@ def _fire_webhooks(status: str, job: dict) -> None:
             asyncio.run_coroutine_threadsafe(_run(), _MAIN_LOOP)
 
 
+# ── API-key scope enforcement (hosted mode only) ─────────────────────
+# app/apikeys.py has carried the whole verify/scope machinery since the keys
+# screen shipped, but until CLD-249 no route ever rejected a bad key. This is
+# the enforcement point. Three deliberate boundaries:
+#
+#   * `cfg.mode != "hosted"` short-circuits everything — local mode, the
+#     default and the project's charter, stays exactly as unauthenticated as
+#     it always was. A bug here must never lock a self-hoster out.
+#   * Loopback callers are exempt even in hosted mode. The browser UI has no
+#     session story (accounts are §9 of docs/saas-redesign-plan.md, out of
+#     scope), and the operator on the box must always be able to curl their
+#     own server back into local mode. Anyone who can talk to loopback owns
+#     the process anyway.
+#   * `_scope_for` is a closed table over the agent/API surface — the route
+#     families the scope vocabulary in app/apikeys.py names. A path it does
+#     not claim stays open, which keeps "enforced" honest and reviewable
+#     rather than guessing a scope for all ~60 routes.
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+_WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+
+# Route families that submit, mutate or re-run jobs — the dub:write surface.
+_DUB_WRITE_PREFIXES = ("/api/dub", "/api/showcase", "/api/quick_test",
+                       "/api/job/", "/api/scout/dub")
+# Read routes over jobs and their artifacts — the jobs:read surface.
+_JOBS_READ_PREFIXES = ("/api/jobs", "/api/job/", "/api/dub", "/api/showcase")
+
+
+def _scope_for(method: str, path: str) -> Optional[str]:
+    """The scope a request needs in hosted mode, or None for an open route."""
+    if path.startswith("/outputs/"):
+        return "outputs:read"
+    if not path.startswith("/api/"):
+        return None
+    if path.startswith("/api/webhooks"):
+        return "webhooks:manage"
+    if path.startswith(("/api/voice_presets", "/api/voices")):
+        return "voices:write" if method in _WRITE_METHODS else None
+    if method in _WRITE_METHODS:
+        return "dub:write" if path.startswith(_DUB_WRITE_PREFIXES) else None
+    if method == "GET" and path.startswith(_JOBS_READ_PREFIXES):
+        return "jobs:read"
+    return None
+
+
+@app.middleware("http")
+async def _enforce_api_scopes(request, call_next):
+    if cfg.mode != "hosted":
+        return await call_next(request)
+    scope = _scope_for(request.method, request.url.path)
+    if scope is None:
+        return await call_next(request)
+    if (request.client.host if request.client else "") in _LOOPBACK_HOSTS:
+        return await call_next(request)
+    auth = request.headers.get("Authorization") or ""
+    token = auth[7:].strip() if auth.startswith("Bearer ") else ""
+    rec = app_apikeys.verify(token)
+    if rec is None:
+        # Missing, unknown, expired and revoked all read the same from
+        # outside — deliberately, so a probe learns nothing about which.
+        return JSONResponse(
+            {"error": "hosted mode requires a valid API key: "
+                      "Authorization: Bearer <key>"},
+            status_code=401, headers={"WWW-Authenticate": "Bearer"})
+    if not app_apikeys.has_scope(rec, scope):
+        return JSONResponse(
+            {"error": f"API key '{rec.get('name')}' lacks scope {scope}"},
+            status_code=403)
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def _record_agent_calls(request, call_next):
     client_id = request.headers.get("X-GoChiDUBB-Client")
@@ -1868,11 +1941,23 @@ async def _record_agent_calls(request, call_next):
     started = time.time()
     response = await call_next(request)
     try:
+        # The natural-language request behind the call, when the caller sent
+        # one (percent-encoded UTF-8 — HTTP headers are latin-1 territory).
+        # Informational like the client header itself; capped so a rambling
+        # agent cannot bloat the feed.
+        prompt = request.headers.get("X-GoChiDUBB-Prompt")
+        if prompt:
+            try:
+                prompt = urllib.parse.unquote(prompt)
+            except Exception:
+                pass
+            prompt = prompt.strip()[:300] or None
         activity.record_tool_call(
             _tool_for_path(request.url.path),
             client_id[:64],
             status=response.status_code,
             ms=(time.time() - started) * 1000.0,
+            prompt=prompt,
         )
     except Exception:
         # A feed line is never worth failing a request over.
@@ -4012,6 +4097,12 @@ async def get_activity(kinds: str = "", limit: int = 80, since_id: int = 0):
 
     In-memory and bounded — this is "what is happening now", not an audit
     trail. The persisted audit log is a separate concern.
+
+    `spend` rides along for the feed's Spend·MTD tile and per-job cost
+    figures (CLD-249). It is billing.summarize over the calendar month —
+    pure arithmetic over the in-memory jobs dict, safe on a 2s poll, which
+    is exactly why the feed does not hit /api/billing/usage instead: that
+    route walks every job's output directory for storage totals.
     """
     want = [k.strip() for k in kinds.split(",") if k.strip()] if kinds else None
     if want:
@@ -4020,6 +4111,9 @@ async def get_activity(kinds: str = "", limit: int = 80, since_id: int = 0):
             return JSONResponse(
                 {"error": f"unknown kind(s): {', '.join(bad)}",
                  "valid": list(activity.KINDS)}, 400)
+    lt = time.localtime()
+    month_start = time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 0, -1))
+    mtd = app_billing.summarize(list(jobs.values()), since=month_start)
     return {
         "events": activity.recent(
             limit=max(1, min(int(limit or 80), 400)),
@@ -4027,13 +4121,23 @@ async def get_activity(kinds: str = "", limit: int = 80, since_id: int = 0):
             since_id=int(since_id or 0),
         ),
         "last_id": activity.last_id(),
+        "spend": {
+            "minutes": mtd["minutes"],
+            "cost": mtd["cost"],
+            "rate": mtd["rate"],
+            "next_tier": mtd["next_tier"],
+            "mode": cfg.mode,
+            # The same honesty boundary as every billing surface: real
+            # minutes, estimated money, and this server bills nobody.
+            "estimate": True,
+        },
     }
 
 
 # ── Develop: API keys ────────────────────────────────────────────────
 # Keys are hashed at rest and the plaintext is returned exactly once, at
-# creation. Scope enforcement is gated on hosted mode (see _require_scope):
-# in local mode every route stays open, as it always has been.
+# creation. Scope enforcement is gated on hosted mode (see _enforce_api_scopes
+# above): in local mode every route stays open, as it always has been.
 
 @app.get("/api/apikeys")
 async def list_api_keys():

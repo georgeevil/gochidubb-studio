@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -78,6 +79,21 @@ class GoChiDUBBClient:
         return data
 
     @staticmethod
+    def _prompt_headers(prompt: Optional[str]) -> Optional[dict]:
+        """Per-request headers carrying the natural-language request behind a
+        submission, for the server's activity feed to quote on the run card.
+
+        Percent-encoded because HTTP headers cannot carry raw UTF-8 and
+        prompts routinely will (a Russian dub starts with a Russian
+        sentence). The server unquotes and truncates on its side; purely
+        informational either way, like X-GoChiDUBB-Client.
+        """
+        p = (prompt or "").strip()
+        if not p:
+            return None
+        return {"X-GoChiDUBB-Prompt": urllib.parse.quote(p[:300], safe="")}
+
+    @staticmethod
     def _source_fields(source: str) -> tuple[Optional[dict], dict]:
         """Build (files, form) tuple from a source path or URL.
 
@@ -115,8 +131,12 @@ class GoChiDUBBClient:
         voxcpm_cfg: float = 0.0,
         voxcpm_steps: int = 0,
         review_gates: Optional[dict] = None,
+        prompt: Optional[str] = None,
     ) -> dict:
         """Submit a single-language dub. Returns dict with `job_id`.
+
+        prompt: the natural-language request that led to this call, quoted on
+        the server's activity-feed run card. Optional, informational only.
 
         review_gates: per-stage pause config, e.g. {"translation": "on",
         "subtitles": "flagged_only"} over gates transcript / translation /
@@ -154,7 +174,8 @@ class GoChiDUBBClient:
             form["scheduled_at"] = str(float(scheduled_at))
         if review_gates:
             form["review_gates"] = json.dumps(review_gates)
-        return await self._request("POST", "/api/dub", data=form, files=files)
+        return await self._request("POST", "/api/dub", data=form, files=files,
+                                   headers=self._prompt_headers(prompt))
 
     async def submit_compare(
         self,
@@ -173,6 +194,7 @@ class GoChiDUBBClient:
         context_hint: str = "",
         voxcpm_cfg: float = 0.0,
         voxcpm_steps: int = 0,
+        prompt: Optional[str] = None,
     ) -> dict:
         """Submit N separate dubs (Quick Test mode). 2-6 target_langs."""
         if isinstance(target_langs, (list, tuple)):
@@ -194,7 +216,9 @@ class GoChiDUBBClient:
         })
         if model:
             form["model"] = model
-        return await self._request("POST", "/api/quick_test", data=form, files=files)
+        return await self._request("POST", "/api/quick_test", data=form,
+                                   files=files,
+                                   headers=self._prompt_headers(prompt))
 
     async def submit_showcase(
         self,
@@ -213,6 +237,7 @@ class GoChiDUBBClient:
         context_hint: str = "",
         voxcpm_cfg: float = 0.0,
         voxcpm_steps: int = 0,
+        prompt: Optional[str] = None,
     ) -> dict:
         """Submit a multilingual showcase reel. 2-6 target_langs are
         dubbed independently then stitched into one continuous video."""
@@ -235,7 +260,9 @@ class GoChiDUBBClient:
         })
         if model:
             form["model"] = model
-        return await self._request("POST", "/api/showcase", data=form, files=files)
+        return await self._request("POST", "/api/showcase", data=form,
+                                   files=files,
+                                   headers=self._prompt_headers(prompt))
 
     async def redub(
         self,
@@ -248,6 +275,7 @@ class GoChiDUBBClient:
         tts_speed: Optional[str] = None,
         voxcpm_cfg: Optional[float] = None,
         voxcpm_steps: Optional[int] = None,
+        prompt: Optional[str] = None,
     ) -> dict:
         """Re-dub an existing job's source into new language(s) without
         re-uploading. Inherits settings from the original; overrides allowed."""
@@ -259,7 +287,9 @@ class GoChiDUBBClient:
                      ("voxcpm_steps", voxcpm_steps)):
             if v is not None:
                 form[k] = v
-        return await self._request("POST", f"/api/job/{job_id}/redub", data=form)
+        return await self._request("POST", f"/api/job/{job_id}/redub",
+                                   data=form,
+                                   headers=self._prompt_headers(prompt))
 
     # ── status / inspection ───────────────────────────────────────────
     async def get_job(self, job_id: str) -> dict:
