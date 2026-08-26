@@ -4169,6 +4169,17 @@ function WbTranslationTab({ job, onEdited }) {
     } catch (e) { setErr(String(e.message || e)); }
   };
 
+  // Flags are recomputed on every fetch, so a bare reload() brings the
+  // same flag straight back — acceptance has to be recorded on the job.
+  const accept = async (f) => {
+    setErr('');
+    try {
+      await wbPost(`/api/dub/${job.id}/flags/accept`,
+                   wbForm({ idx: f.idx, kind: f.kind || '' }));
+      await flagsDoc.reload();
+    } catch (e) { setErr(String(e.message || e)); }
+  };
+
   const shown = filter === 'flagged'
     ? cues.filter(c => flagByIdx[c.idx] !== undefined)
     : filter === 'edited'
@@ -4249,7 +4260,7 @@ function WbTranslationTab({ job, onEdited }) {
             )}
             {f && editing !== c.idx && (
               <div style={{ display: 'flex', gap: 6 }}>
-                <button className="btn btn-ghost" style={{ fontSize: 10.5 }} onClick={() => flagsDoc.reload()}>Accept</button>
+                <button className="btn btn-ghost" style={{ fontSize: 10.5 }} onClick={() => accept(f)}>Accept</button>
                 <button className="btn btn-ghost" style={{ fontSize: 10.5 }} onClick={() => teach(f)}
                         disabled={!f.source_span}>Add to glossary</button>
                 <button className="btn btn-ghost" style={{ fontSize: 10.5 }}
@@ -4698,7 +4709,13 @@ function WbSubtitlesTab({ job }) {
                     {editing === c.idx ? (
                       <textarea className="field" rows={2} autoFocus value={draft}
                                 onChange={e => setDraft(e.target.value)}
-                                onBlur={() => save(c.idx, { display_text: draft })}
+                                onBlur={() => {
+                                  // Click-in, click-out is not an edit: saving an
+                                  // override identical to what is shown would only
+                                  // paint a false "edited" badge on the cue.
+                                  if (draft === (c.display_text || c.text)) { setEditing(null); return; }
+                                  save(c.idx, { display_text: draft });
+                                }}
                                 style={{ resize: 'vertical', fontSize: 12 }}/>
                     ) : (
                       <span className="wrap-any" style={{ cursor: 'text', whiteSpace: 'pre-line' }}

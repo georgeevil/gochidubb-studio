@@ -8287,19 +8287,29 @@ async def get_job_flags(job_id: str, max_flags: int = 5):
                    or job.get("source_lang") or "")
     if source_lang == "auto":
         source_lang = ""
+    accepted = set(job.get("accepted_flags") or [])
+    # Not `max_flags or 5`: zero is a real request for none, and `0 or
+    # 5` would quietly answer it with the default five instead.
+    cap = max(0, min(int(max_flags), 20))
     try:
         flags = flag_segments(
             cp.get("segments") or [],
             target_lang=target_lang,
             source_lang=source_lang,
             glossary=_read_user_glossary(),
-            # Not `max_flags or 5`: zero is a real request for none, and `0 or
-            # 5` would quietly answer it with the default five instead.
-            max_flags=max(0, min(int(max_flags), 20)),
+            # Headroom for the accepted ones we filter below, so accepting
+            # a flag surfaces the next-ranked candidate instead of just
+            # shrinking the list.
+            max_flags=cap + len(accepted) if cap else 0,
         )
     except Exception as e:
         log.warning(f"[flags] job={job_id} failed: {e}")
         return JSONResponse({"error": f"Could not compute flags: {e}"}, 500)
+
+    if accepted:
+        flags = [f for f in flags
+                 if f"{f.get('idx')}:{f.get('kind')}" not in accepted]
+    flags = flags[:cap]
 
     return {
         "job_id": job_id,
@@ -8307,12 +8317,38 @@ async def get_job_flags(job_id: str, max_flags: int = 5):
         "source_lang": source_lang,
         "count": len(flags),
         "flags": flags,
+        "accepted_count": len(accepted),
         # The original audio, for the review screen's "hear this bit" —
         # #t=start,end on this file lands on the right moment because VAD
         # writes its trimmed copy to a different name and segment times are
         # remapped back to the original timeline.
         "audio_url": f"/outputs/{job_id}/audio_16k.wav",
     }
+
+
+@app.post("/api/dub/{job_id}/flags/accept")
+async def accept_job_flag(job_id: str, idx: int = Form(...),
+                          kind: str = Form(...)):
+    """Remember that a human looked at this flag and judged the line fine.
+
+    Flags are recomputed on every GET (deliberately — see get_job_flags),
+    so acceptance has to live on the job: without it the same flag comes
+    straight back on the next fetch and the Accept button visibly does
+    nothing. Keyed by (idx, kind), not idx alone, so accepting one finding
+    on a segment never hides a different kind of problem found there later.
+    An edit to the segment through /edit_translations clears its
+    acceptances — the text the human approved is gone.
+    """
+    job = jobs.get(job_id)
+    if not job:
+        return JSONResponse({"error": "Job not found"}, 404)
+    key = f"{int(idx)}:{(kind or '').strip()}"
+    accepted = list(job.get("accepted_flags") or [])
+    if key not in accepted:
+        accepted.append(key)
+        job["accepted_flags"] = accepted
+        save_job(job)
+    return {"ok": True, "accepted_count": len(accepted)}
 
 
 @app.get("/api/dub/{job_id}/stages")
@@ -8755,6 +8791,7 @@ async def edit_translations(job_id: str, edits: str = Form(...)):
 
     # Apply edits by segment index (string keys from the JSON)
     n_edited = 0
+    edited_idxs = set()
     for s in cp.get("segments", []):
         key = str(s.get("idx"))
         if key in edit_map:
@@ -8762,6 +8799,16 @@ async def edit_translations(job_id: str, edits: str = Form(...)):
             if new_text and new_text != s.get("translated_text"):
                 s["translated_text"] = new_text
                 n_edited += 1
+                edited_idxs.add(str(s.get("idx")))
+    # An accepted flag vouched for text that no longer exists — drop the
+    # acceptance for edited segments so /flags re-judges the new line.
+    if edited_idxs:
+        job = jobs[job_id]
+        kept = [k for k in (job.get("accepted_flags") or [])
+                if k.split(":", 1)[0] not in edited_idxs]
+        if kept != (job.get("accepted_flags") or []):
+            job["accepted_flags"] = kept
+            save_job(job)
     # Re-save the translation_done checkpoint with the edits
     work = OUTPUT_DIR / job_id
     _save_checkpoint(job_id, work, stage="translation_done", data=cp)

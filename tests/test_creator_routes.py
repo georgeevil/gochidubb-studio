@@ -1075,3 +1075,63 @@ def test_preset_responses_hide_the_record_and_the_server_path(client, voices_dir
     me = next(v for v in listed if v["id"] == "file:Public Shape")
     assert me["consent"] is True
     assert me["reference_file"] == "Public Shape.wav"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Flag acceptance: /flags/accept must actually silence a flag
+# ─────────────────────────────────────────────────────────────────────
+
+def test_accepting_a_flag_removes_it_from_the_next_fetch(flagged):
+    """Flags are recomputed per GET, so before /flags/accept existed the
+    Accept button reloaded the same flag right back — a visible no-op."""
+    d = flagged.get("/api/dub/cp1/flags").json()
+    f = d["flags"][0]
+    r = flagged.post("/api/dub/cp1/flags/accept",
+                     data={"idx": f["idx"], "kind": f["kind"]})
+    assert r.status_code == 200
+    assert r.json() == {"ok": True, "accepted_count": 1}
+    d2 = flagged.get("/api/dub/cp1/flags").json()
+    assert not any(g["idx"] == f["idx"] and g["kind"] == f["kind"]
+                   for g in d2["flags"])
+    assert d2["accepted_count"] == 1
+
+
+def test_accepting_the_same_flag_twice_records_it_once(flagged):
+    d = flagged.get("/api/dub/cp1/flags").json()
+    f = d["flags"][0]
+    for _ in range(2):
+        r = flagged.post("/api/dub/cp1/flags/accept",
+                         data={"idx": f["idx"], "kind": f["kind"]})
+    assert r.json()["accepted_count"] == 1
+
+
+def test_accept_404s_on_an_unknown_job(client):
+    r = client.post("/api/dub/nope/flags/accept",
+                    data={"idx": 0, "kind": "name_inconsistent"})
+    assert r.status_code == 404
+
+
+def test_editing_a_segment_clears_its_acceptance(flagged, monkeypatch):
+    """An acceptance vouched for text that an edit just replaced — the new
+    line must be re-judged, so /edit_translations drops it."""
+    import copy
+    cp = copy.deepcopy(CHECKPOINT)
+    monkeypatch.setattr(server, "_load_checkpoint",
+                        lambda jid, stage: cp
+                        if (jid == "cp1" and stage == "translation_done")
+                        else None)
+    monkeypatch.setattr(server, "_save_checkpoint",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(server, "_write_subtitle_files",
+                        lambda *a, **k: None)
+    d = flagged.get("/api/dub/cp1/flags").json()
+    f = d["flags"][0]
+    flagged.post("/api/dub/cp1/flags/accept",
+                 data={"idx": f["idx"], "kind": f["kind"]})
+    # Also accept a fabricated flag on another segment — it must survive.
+    flagged.post("/api/dub/cp1/flags/accept",
+                 data={"idx": 99, "kind": "glossary_miss"})
+    r = flagged.post("/api/dub/cp1/edit_translations",
+                     data={"edits": json.dumps({str(f["idx"]): "Новый текст."})})
+    assert r.status_code == 200 and r.json()["edited"] == 1
+    assert server.jobs["cp1"]["accepted_flags"] == ["99:glossary_miss"]
