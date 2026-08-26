@@ -323,12 +323,19 @@ class TestAssembleFitOverrides:
 class TestBuildAudioMixFilter:
     """build_audio_mix_filter() renders the dub+bed filter_complex graph."""
 
-    def test_legacy_flat_mix_is_byte_identical(self):
-        # ducking=False must reproduce the pre-ducking mix exactly, so the
-        # legacy toggle really is "the old behaviour" and not a near-miss.
+    def test_flat_mix_shape_with_the_limiter(self):
+        # ducking=False keeps the legacy flat-mix topology, now capped by an
+        # alimiter: bg_volume runs to 10x, so the old "sum stays under 1.0"
+        # arithmetic no longer holds and unlimited output would hard-clip.
         assert build_audio_mix_filter(0.15, ducking=False) == (
             "[1:a]volume=1.0[dub];[2:a]volume=0.15[bg];"
-            "[dub][bg]amix=inputs=2:duration=first:normalize=0[out]")
+            "[dub][bg]amix=inputs=2:duration=first:normalize=0[mix];"
+            "[mix]alimiter=limit=0.891:level=false[out]")
+
+    def test_both_variants_end_in_the_limiter(self):
+        for ducking in (False, True):
+            f = build_audio_mix_filter(10.0, ducking=ducking)
+            assert f.endswith("alimiter=limit=0.891:level=false[out]"), f
 
     def test_ducking_graph_shape(self):
         f = build_audio_mix_filter(0.5, ducking=True)

@@ -156,14 +156,27 @@ def test_bg_ducking_accepts_checkbox_spellings():
         assert C.coerce_field("bg_ducking", falsy) is False
 
 
-def test_legacy_flat_mix_level_becomes_the_ducked_bed_ceiling():
+def test_legacy_flat_mix_level_follows_defaults_to_balance_gain():
     # _save() wrote 0.15 into every existing file, so a stored 0.15 means
-    # "the old default" and should follow it to the new ducked-bed 0.5.
+    # "the old default": v2 moved it to the ducked-bed 0.5, and v3 moves
+    # every old default (0.5) or old ceiling (1.0) on to the measured
+    # balance gain of 10.
     c = _detached()
     c.background_volume = C._LEGACY_BG_VOLUME
     C._migrate(c, 1)
-    assert c.background_volume == 0.5
+    assert c.background_volume == 10.0
     assert c.config_version == C.CONFIG_VERSION
+
+
+def test_v3_maxed_slider_and_default_duck_follow_the_new_defaults():
+    # A stored 1.0 was the old CEILING — a maxed slider meant "as loud as
+    # allowed", not "exactly unity" — and True was the v2 ducking default.
+    c = _detached()
+    c.background_volume = 1.0
+    c.bg_ducking = True
+    C._migrate(c, 2)
+    assert c.background_volume == 10.0
+    assert c.bg_ducking is False
 
 
 def test_bg_migration_leaves_a_deliberate_level_alone():

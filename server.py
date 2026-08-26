@@ -7759,6 +7759,11 @@ async def _run_tts_and_merge_stage(
     merge_audio_video(
         state["video_path"], dubbed_wav, output_mp4,
         state.get("bg_audio_path", "") if state.get("keep_bg") else "",
+        # Same per-job-first rule as _stage_merge: a bed level fixed via a
+        # merge retry must survive resume/regenerate instead of silently
+        # reverting to the global default (None = fall through to config).
+        bg_volume=state.get("bg_volume"),
+        bg_ducking=state.get("bg_ducking"),
     )
 
     # Update the tts_done checkpoint so next regen starts from current audio.
@@ -8026,12 +8031,15 @@ STAGE_RETRY_OPTIONS = {
     "assemble": [],
     "merge": [
         {"key": "bg_volume", "type": "number", "label": "Background level",
-         "min": 0.0, "max": 1.0, "step": 0.05,
-         "hint": "How loud the music and effects sit when nobody is speaking. "
-                 "Re-running this stage is a re-mux — seconds, not a re-dub."},
+         "min": 0.0, "max": 10.0, "step": 0.25,
+         "hint": "Gain on the music/effects bed. 1 = the stem's original "
+                 "level, which sits buried under the louder dub voice; ~10 "
+                 "restores the source's balance. Re-running this stage is a "
+                 "re-mux — seconds, not a re-dub."},
         {"key": "bg_ducking", "type": "bool", "label": "Duck under speech",
-         "hint": "Pull the bed down while the dub talks. Off = a flat mix at "
-                 "the level above, which is louder but fights the voice."},
+         "hint": "Pull the bed down while the dub talks (off by default — "
+                 "at balance level the dip reads as pumping; turn on for "
+                 "speech-dense videos)."},
     ],
     "download": [],
 }
@@ -8585,8 +8593,14 @@ async def retry_stage(
         if k == "review_gates":
             continue  # resolved above, not copied raw
         if k in _RETRY_NUMERIC_KEYS:
+            # The per-job key is `bg_volume` but the FIELD_SPECS entry is
+            # `background_volume`; without the mapping coerce_field silently
+            # passes unknown keys through, so this override used to reach
+            # the ffmpeg filter string unchecked and uncast.
+            spec_key = "background_volume" if k == "bg_volume" else k
             try:
-                v = coerce_field(k, v) if v not in (None, "", 0, "0") else 0
+                v = (coerce_field(spec_key, v)
+                     if v not in (None, "", 0, "0") else 0)
             except ValueError as e:
                 return JSONResponse({"error": str(e)}, 400)
         ctx[k] = v
@@ -11684,6 +11698,46 @@ def _qc_sync_row(placements: list) -> tuple:
                     "Every placed segment within the stretch tolerance."), off)
 
 
+def _qc_bed_row(job: dict, placements: list) -> dict:
+    """Background bed loudness, dub vs source, over the longest speech-free
+    window — the programmatic answer to "is the music as loud as the
+    original?". Positive delta = louder than the source's absolute level;
+    the PASS band sits above zero on purpose, because the dub voice is
+    normalized ~10 dB hotter than the original program and a bed at true
+    source level (delta ≈ 0) is audibly buried under it."""
+    work = OUTPUT_DIR / (job.get("id") or "")
+    # keep_bg lives in the pipeline state, not reliably on the job dict —
+    # the separated stem on disk is the ground truth for "was a bed mixed".
+    if not (work / "background.wav").exists() and not job.get("keep_bg"):
+        return _qc_row("bed", "Background bed", "unavailable", "no bed",
+                       "No separated background stem — keep_bg was off, so "
+                       "nothing was mixed under the dub.")
+    source = work / "source_video.mp4"
+    output = work / "dubbed_video.mp4"
+    from pipeline.quality import bed_balance
+    m = bed_balance(str(source), str(output), placements,
+                    _finite_seconds(job.get("duration")))
+    if not m.get("available"):
+        return _qc_row("bed", "Background bed", "unavailable", "not computed",
+                       m.get("reason", "measurement unavailable"))
+    delta = m["delta_lu"]
+    value = (f"{delta:+.1f} LU vs source "
+             f"({m['output_lufs']} vs {m['source_lufs']} LUFS, "
+             f"{m['window_dur']:.0f}s music window)")
+    if delta < 4.0:
+        return _qc_row("bed", "Background bed", "warn", value,
+                       "Bed at or below the source's absolute level — "
+                       "likely buried under the hotter dub voice. Raise the "
+                       "background gain (merge retry re-mixes in seconds).")
+    if delta > 16.0:
+        return _qc_row("bed", "Background bed", "warn", value,
+                       "Bed far above the source — the limiter is working "
+                       "hard. Lower the background gain.")
+    return _qc_row("bed", "Background bed", "pass", value,
+                   "Bed restores the source's voice:music balance against "
+                   "the normalized dub voice.")
+
+
 def _qc_glossary_row(job: dict, segments: list) -> dict:
     from pipeline.flags import glossary_terms, _contains_phrase
     terms = glossary_terms(_read_user_glossary(), job.get("target_lang") or "")
@@ -11745,6 +11799,7 @@ def _build_qc_checklist(job_id: str) -> dict:
         _qc_loudness_row(loudnorm, target_i, target_tp),
         _qc_subtitles_row(job, segments),
         sync_row,
+        _qc_bed_row(job, placements),
         _qc_glossary_row(job, segments),
         _qc_consent_row(job, segments),
     ]

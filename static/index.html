@@ -5896,14 +5896,14 @@ function OutputTab({ system }) {
 
       <div style={group}>
         <div className="caps">Mix</div>
-        <NumberKnob label="Background volume" min={0} max={1} step={0.05}
+        <NumberKnob label="Background gain" min={0} max={10} step={0.25}
                     value={draft.background_volume}
-                    onChange={v => set('background_volume', Math.round(v * 20) / 20)}
-                    hint="Music/SFX bed level when no one is speaking; it ducks automatically under the dub. 0 mutes it."/>
+                    onChange={v => set('background_volume', Math.round(v * 4) / 4)}
+                    hint="Gain on the music/SFX bed. ×1 = the stem's original level, which sits buried under the louder dub voice; ~×10 restores the source's balance (a limiter guards the mix). 0 mutes it."/>
         <Toggle value={!!draft.bg_ducking}
                 onChange={v => set('bg_ducking', v)}
                 label="Duck background under speech"
-                hint="Off = legacy flat mix at the volume above."/>
+                hint="Off by default — at balance level the dip reads as pumping. Turn on for speech-dense videos."/>
       </div>
 
       {err && (

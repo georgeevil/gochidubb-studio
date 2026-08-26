@@ -541,7 +541,7 @@ function videoLangHTML(j) {
   const k = jobState(j);
   const done = k === "done";
   const bg = d.bg[j.id];
-  const bgVal = bg === undefined ? 0.5 : bg;
+  const bgVal = bg === undefined ? 10 : bg;
 
   return `<div class="card" style="margin-bottom:10px">
     <div class="spread" style="align-items:center;flex-wrap:wrap;gap:8px">
@@ -582,9 +582,9 @@ function videoLangHTML(j) {
             re-does the final mix only — seconds, and the voices are untouched.
           </p>
           <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
-            <input type="range" min="0" max="1" step="0.05" value="${bgVal}"
+            <input type="range" min="0" max="10" step="0.25" value="${bgVal}"
                    data-act="detail-bg" data-id="${esc(j.id)}" style="flex:1;min-width:180px">
-            <span class="mono" style="font-size:12px;min-width:3ch">${Math.round(bgVal * 100)}%</span>
+            <span class="mono" style="font-size:12px;min-width:5ch">×${bgVal}</span>
             <button type="button" class="btn btn--primary btn--sm"
                     data-act="detail-remix" data-id="${esc(j.id)}" ${d.busy ? "disabled" : ""}>
               ${d.busy === "remix:" + j.id ? "Re-mixing…" : "Apply"}
@@ -1801,7 +1801,7 @@ async function onAct(t, act) {
 
   if (act === "detail-remix") {
     const d = state.detail, id = t.dataset.id;
-    const level = d.bg[id] === undefined ? 0.5 : d.bg[id];
+    const level = d.bg[id] === undefined ? 10 : d.bg[id];
     d.busy = "remix:" + id; d.err = ""; d.note = ""; render();
     try {
       const fd = new FormData();

@@ -34,7 +34,7 @@ for _d in (UPLOAD_DIR, OUTPUT_DIR, JOBS_DB, STATIC_DIR, VOICE_PRESETS_DIR):
 
 # Bump when a setting's meaning changes and old files need fixing up; add the
 # corresponding step to _migrate().
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 
 # Validation table for the settings the product lets a user edit. set() and
 # update() both consult it, so every write path — the Settings UI,
@@ -64,7 +64,11 @@ FIELD_SPECS: dict = {
     "output_audio_bitrate": (str, ("128k", "192k", "256k", "320k")),
     # 0 = no cap (best available); otherwise a real frame height.
     "output_max_height":   (int, 360, 2160, 0),
-    "background_volume":   (float, 0.0, 1.0),
+    # A raw ffmpeg gain on the separated bed. 1.0 = the stem at its original
+    # level — which sits ~10 dB under the loudnorm-hot dub voice, so the
+    # useful range runs well past unity. Measured on a real job: ×10 restores
+    # the source's voice:music balance (an alimiter guards the sum).
+    "background_volume":   (float, 0.0, 10.0),
     "bg_ducking":          (bool,),
     "eta_realtime_factor": (float, 0.5, 60.0),
     "mode":                (str, ("local", "hosted")),
@@ -265,10 +269,15 @@ class UserConfig:
     output_crf: int = 23                 # 18 (larger, better) … 28 (smaller)
     output_audio_bitrate: str = "192k"
     output_max_height: int = 1080        # source download cap, 0 = best available
-    # Bed CEILING: music/SFX level when nobody speaks; with bg_ducking on,
-    # sidechain compression pulls it further down under speech.
-    background_volume: float = 0.5
-    bg_ducking: bool = True  # duck the bed under speech (off = legacy flat mix)
+    # Bed gain (raw ffmpeg volume multiplier on the separated stem). The dub
+    # voice is normalized ~10 dB hotter than the original program, so unity
+    # leaves the bed buried; ×10 restores the source's voice:music balance
+    # (measured — see docs/design/pro-workbench-plan.md changelog). A post-mix
+    # alimiter keeps the hot bed from clipping the sum.
+    background_volume: float = 10.0
+    bg_ducking: bool = False  # duck the bed under speech (off by default:
+    # with the bed at balance level, an 11 dB dip under every line reads as
+    # the music "pumping"; turn on for speech-dense content)
 
     # ── FFmpeg (extract / render) ─────────────────────────────────────
     # Soft timeout: while ffmpeg keeps reporting encode progress the deadline
@@ -395,6 +404,24 @@ def _migrate(c: "UserConfig", from_version: int) -> None:
     if from_version < 2 and c.background_volume == _LEGACY_BG_VOLUME:
         c.background_volume = 0.5
         changed.append("background_volume 0.15 -> 0.5 (ducked bed ceiling)")
+
+    # v2 → v3: the scale grew past unity once measurement showed the dub
+    # voice runs ~10 dB hotter than the original program, burying a
+    # unity-gain bed. A stored 0.5 is the old default; a stored 1.0 is the
+    # old CEILING — a maxed slider meant "as loud as allowed", not "exactly
+    # unity" — so both follow the new default. Any other value was a real
+    # choice inside the old range and survives. Ducking also flips to off
+    # by default, but only for configs still on the old default (True was
+    # the v2 default; an explicit False already survives as-is).
+    if from_version < 3:
+        if c.background_volume in (0.5, 1.0):
+            c.background_volume = 10.0
+            changed.append("background_volume -> 10.0 (bed balance vs the "
+                           "hot dub voice; alimiter guards the sum)")
+        if c.bg_ducking:
+            c.bg_ducking = False
+            changed.append("bg_ducking on -> off (default; the balanced bed "
+                           "made the duck read as pumping)")
 
     c.config_version = CONFIG_VERSION
     if changed:

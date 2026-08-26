@@ -113,3 +113,54 @@ class TestWhatAFinishedJobOffers:
             # A kilobyte-sized subtitle file must not advertise itself as
             # "0.0 MB", which reads as an empty download.
             assert f["size_label"] and not f["size_label"].startswith("0.0")
+
+
+class TestBedBalanceMeasurement:
+    """The programmatic answer to "is the music as loud as the original?" —
+    windows come from placements, so speech never contaminates the reading."""
+
+    def _placements(self):
+        return [
+            {"idx": 0, "dub_start": 2.0, "dub_end": 4.0},
+            {"idx": 1, "dub_start": 20.0, "dub_end": 22.0},
+        ]
+
+    def test_longest_speech_free_span_wins(self):
+        from pipeline.quality import bed_measure_window
+        w = bed_measure_window(self._placements(), total_duration=60.0)
+        # 22..60 (38s) beats 4..20 (16s) and the 2s lead-in; edges trimmed.
+        assert w is not None
+        start, dur = w
+        assert start == pytest.approx(22.5)
+        assert dur == pytest.approx(37.0)
+
+    def test_short_gaps_measure_nothing(self):
+        from pipeline.quality import bed_measure_window
+        tight = [{"idx": i, "dub_start": i * 3.0, "dub_end": i * 3.0 + 2.0}
+                 for i in range(10)]
+        assert bed_measure_window(tight, total_duration=30.0) is None
+
+    def test_missing_file_degrades_to_none(self):
+        from pipeline.quality import measure_window_lufs
+        assert measure_window_lufs("/nope/nothing.wav", 0.0, 3.0) is None
+
+
+class TestRetryOverrideCoercion:
+    """bg_volume used to skip validation entirely — coerce_field found no
+    'bg_volume' spec and passed the raw JSON through to the filter string."""
+
+    def test_out_of_range_bed_level_is_rejected(self, monkeypatch):
+        from fastapi.testclient import TestClient
+        import time as _t
+        server.jobs["bgj"] = {"id": "bgj", "status": "complete",
+                              "created": _t.time()}
+        monkeypatch.setattr(server, "_load_checkpoint",
+                            lambda *a: {"stage": "tts_done", "segments": []})
+        try:
+            c = TestClient(server.app)
+            r = c.post("/api/dub/bgj/retry_stage/merge",
+                       data={"overrides": '{"bg_volume": 99}'})
+            assert r.status_code == 400
+            assert "background_volume" in r.json()["error"]
+        finally:
+            server.jobs.pop("bgj", None)

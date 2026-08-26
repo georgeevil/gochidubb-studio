@@ -215,10 +215,12 @@ def test_qc_checklist_shape_and_warn_count(client, monkeypatch):
     d = client.get("/api/dub/q1/qc").json()
 
     assert [r["id"] for r in d["rows"]] == [
-        "loudness", "subtitles", "sync", "glossary", "consent"]
+        "loudness", "subtitles", "sync", "bed", "glossary", "consent"]
     by_id = {r["id"]: r for r in d["rows"]}
     assert by_id["loudness"]["state"] == "pass"
     assert by_id["sync"]["state"] == "warn"
+    # No keep_bg on this fixture job — the bed row must say so, not guess.
+    assert by_id["bed"]["state"] == "unavailable"
     # Subtitle and consent checks land with later tasks — until then the
     # rows must degrade to "unavailable", never claim a pass they didn't
     # check (and never crash the document).

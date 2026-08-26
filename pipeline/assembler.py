@@ -567,20 +567,26 @@ def build_audio_mix_filter(bg_volume: float, ducking: bool = True) -> str:
     hence the asplit. [dubm] stays the FIRST amix input, preserving the
     duration=first semantics of the legacy flat mix. bg_volume applies BEFORE
     the compressor so it keeps meaning "bed ceiling" (level when nobody
-    speaks) and existing configs keep their meaning. Headroom: the dub
-    true-peaks at -1.5 dBTP ~= 0.84, the ducked bed sits ~= 0.14, sum ~= 0.98
-    — no limiter needed.
+    speaks) and existing configs keep their meaning. Headroom: bg_volume now
+    runs to 10× (the bed at source *balance* against the loudnorm-hot dub),
+    so the old "sum ~= 0.98, no limiter needed" arithmetic no longer holds —
+    an alimiter caps the mix at -1 dBTP instead. It is transparent while the
+    sum stays under the ceiling, so quiet mixes are byte-for-byte unaffected
+    in practice and hot ones squash instead of wrapping into hard clips.
     """
+    limiter = "alimiter=limit=0.891:level=false"  # -1 dBTP, no auto make-up
     if not ducking:
         return (f"[1:a]volume=1.0[dub];[2:a]volume={bg_volume}[bg];"
-                f"[dub][bg]amix=inputs=2:duration=first:normalize=0[out]")
+                f"[dub][bg]amix=inputs=2:duration=first:normalize=0[mix];"
+                f"[mix]{limiter}[out]")
     return (
         f"[1:a]asplit=2[dubm][dubsc];"
         f"[2:a]volume={bg_volume}[bgin];"
         f"[bgin][dubsc]sidechaincompress="
         f"threshold={DUCK_THRESHOLD}:ratio={DUCK_RATIO}:"
         f"attack={DUCK_ATTACK_MS}:release={DUCK_RELEASE_MS}:makeup=1[bgduck];"
-        f"[dubm][bgduck]amix=inputs=2:duration=first:normalize=0[out]"
+        f"[dubm][bgduck]amix=inputs=2:duration=first:normalize=0[mix];"
+        f"[mix]{limiter}[out]"
     )
 
 
@@ -610,8 +616,8 @@ def merge_audio_video(video_path, dubbed_audio_path, output_path,
     except Exception:
         # Config unavailable (bare pipeline use) — fall back to what these
         # values were hardcoded to before they became settings.
-        bg_volume = 0.5 if bg_volume is None else bg_volume
-        bg_ducking = True if bg_ducking is None else bg_ducking
+        bg_volume = 10.0 if bg_volume is None else bg_volume
+        bg_ducking = False if bg_ducking is None else bg_ducking
         codec_pref = codec_pref or "h264"
         preset = preset or "veryfast"
         crf = 23 if crf is None else crf

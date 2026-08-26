@@ -649,3 +649,105 @@ def full_report(segments: List[dict],
         "loudness": ld,
         "rollup": rollup(asr, tr, tts, tm, ld),
     }
+
+
+# ── Background bed vs source (CLD-263 follow-up) ─────────────────────────
+# "Is the music in the dub as loud as in the original?" is only measurable
+# where nobody speaks: in speech regions the dub voice (loudnorm-hot) and
+# the original voice differ by design. The placements say where speech is,
+# so the longest inter-segment gap is the honest measurement window.
+
+BED_WINDOW_MIN_S = 3.0
+
+
+def bed_measure_window(placements: List[dict],
+                       total_duration: float,
+                       min_gap: float = BED_WINDOW_MIN_S) -> Optional[tuple]:
+    """(start, duration) of the longest speech-free span, or None.
+
+    Spans are the gaps between placed segments on the DUB timeline (which the
+    assembler keeps aligned to the source timeline), plus the lead-in before
+    the first segment and the tail after the last. Gaps shorter than
+    `min_gap` measure reverb tails more than music, so they don't count.
+    """
+    spans = []
+    placed = []
+    for i, p in enumerate(placements or []):
+        s, e = _finite(p.get("dub_start")), _finite(p.get("dub_end"))
+        if s is None or e is None or e <= s:
+            continue
+        placed.append((s, e))
+    placed.sort()
+    cursor = 0.0
+    for s, e in placed:
+        if s - cursor >= min_gap:
+            spans.append((cursor, s - cursor))
+        cursor = max(cursor, e)
+    total = _finite(total_duration)
+    if total and total - cursor >= min_gap:
+        spans.append((cursor, total - cursor))
+    if not spans:
+        return None
+    # Trim half a second off each edge so segment fade/trail energy doesn't
+    # leak into the measurement, then take the longest survivor.
+    trimmed = [(s + 0.5, d - 1.0) for s, d in spans if d - 1.0 >= min_gap - 1.0]
+    if not trimmed:
+        return None
+    return max(trimmed, key=lambda w: w[1])
+
+
+def measure_window_lufs(media_path: str, start: float,
+                        duration: float) -> Optional[float]:
+    """Integrated LUFS of one time window of a media file, via ffmpeg ebur128.
+
+    Returns None when ffmpeg is unavailable, the file is missing, or the
+    output carries no parseable loudness — a QC row degrades to
+    "unavailable" rather than guessing.
+    """
+    import os
+    import subprocess
+    if not media_path or not os.path.exists(media_path):
+        return None
+    try:
+        proc = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats",
+             "-ss", f"{max(0.0, start):.3f}", "-t", f"{max(0.1, duration):.3f}",
+             "-i", media_path, "-map", "a:0",
+             "-filter:a", "ebur128", "-f", "null", "-"],
+            capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log.warning(f"[bed] LUFS measurement failed for {media_path}: {e}")
+        return None
+    # ebur128 prints a summary block; the last "I: ... LUFS" line is the
+    # integrated value for the whole (windowed) input.
+    matches = re.findall(r"I:\s*(-?[\d.]+)\s*LUFS", proc.stderr or "")
+    if not matches:
+        return None
+    try:
+        return float(matches[-1])
+    except ValueError:
+        return None
+
+
+def bed_balance(source_path: str, output_path: str, placements: List[dict],
+                total_duration: float) -> Dict[str, Any]:
+    """Loudness delta of the background bed, dub output vs source, measured
+    over the longest speech-free window. Positive = the dub's bed is louder.
+    """
+    window = bed_measure_window(placements, total_duration)
+    if not window:
+        return {"available": False,
+                "reason": f"no speech-free span ≥ {BED_WINDOW_MIN_S:.0f}s"}
+    start, dur = window
+    src = measure_window_lufs(source_path, start, dur)
+    out = measure_window_lufs(output_path, start, dur)
+    if src is None or out is None:
+        return {"available": False, "reason": "measurement failed"}
+    return {
+        "available": True,
+        "window_start": round(start, 2),
+        "window_dur": round(dur, 2),
+        "source_lufs": round(src, 1),
+        "output_lufs": round(out, 1),
+        "delta_lu": round(out - src, 1),
+    }
