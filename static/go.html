@@ -1228,11 +1228,13 @@ const A = {
         const wav = await blobToWav(raw);
         const fd = new FormData();
         fd.set("audio", new File([wav], "my-voice.wav", { type: "audio/wav" }));
-        fd.set("name", "My voice (Go)");
+        // The preset endpoint's name rule is letters/digits/space/dash/
+        // underscore only — no parentheses.
+        fd.set("name", "My voice - Go");
         fd.set("description", "Recorded on the phone in GoChiDUBB Go");
         fd.set("consent_attested", "true");     // it's the speaker's own voice
         const r = await api("/api/voice_presets", { method: "POST", body: fd });
-        S.myVoice = { id: r.id, name: "My voice (Go)" };
+        S.myVoice = { id: r.id, name: "My voice - Go" };
         lsSet("go_myvoice", S.myVoice);
         toast("Voice saved — every dub can use it now");
         loadPresets();
