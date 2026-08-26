@@ -46,9 +46,16 @@ gochidubb.db-journal
 *.sqlite
 *.sqlite-journal
 
-# User-supplied reference voices (may be private)
+# User-supplied reference voices (may be private) — every extension the
+# upload endpoint accepts, plus the metadata sidecars (the .json carries
+# the consent record: hostname and user)
 presets/voices/*.wav
 presets/voices/*.mp3
+presets/voices/*.flac
+presets/voices/*.ogg
+presets/voices/*.m4a
+presets/voices/*.json
+presets/voices/*.txt
 # Designed-voice cache: clips VoxCPM drew from a style description, keyed by
 # (style, seed, language). Regenerated on demand and machine-specific.
 presets/voices/.designed/

@@ -4046,7 +4046,7 @@ const WB_GATE_LABEL = {
   voice_cast: 'Voice cast', subtitles: 'Subtitles', final_qc: 'Final mix QC',
 };
 const WB_TAB_FOR_STATUS = {
-  awaiting_transcript_review: 'translation',
+  awaiting_transcript_review: 'transcript',
   awaiting_translation_review: 'translation',
   awaiting_voice_review: 'translation',   // casting lives in the rail
   awaiting_subtitle_review: 'subtitles',
@@ -4074,7 +4074,11 @@ function GatesRail({ job }) {
         );
       })}
       <div style={{ fontSize: 10.5, color: 'var(--ink-4)', marginTop: 8, lineHeight: 1.5 }}>
-        Each armed gate pauses the job and fires <span className="mono">job.awaiting_review</span>. Defaults live in Settings.
+        Each armed gate pauses the job and fires <span className="mono">job.awaiting_review</span>. Defaults live in{' '}
+        <button onClick={() => window.dispatchEvent(new Event('gcd:open-settings'))}
+                style={{ color: 'var(--ink-2)', textDecoration: 'underline', fontSize: 10.5 }}>
+          Settings
+        </button>
       </div>
     </div>
   );
@@ -4127,6 +4131,91 @@ function WbEstimateNote({ jobId, edits }) {
       {est.free ? (est.free_reason || 'free') :
         `re-synth ${est.resynth_minutes} min · est. $${(est.est_cost_usd || 0).toFixed(2)}`}
     </span>
+  );
+}
+
+// ── Transcript tab ─────────────────────────────────────────────────
+// Shown only while the transcript gate holds the job: this is the one
+// window where fixing an ASR error is free — after approval the mistake
+// is baked into the translation. Edits go to /edit_transcript, which
+// rewrites the transcription_done checkpoint the translate stage reads.
+function WbTranscriptTab({ job }) {
+  const cpDoc = useWbDoc(`/api/dub/${job.id}/checkpoint/transcription_done`);
+  const [editing, setEditing] = useState(null);   // idx
+  const [draft, setDraft] = useState('');
+  const [editedIdxs, setEditedIdxs] = useState([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const segs = (cpDoc.doc && cpDoc.doc.segments) || [];
+  const audioUrl = `/outputs/${job.id}/audio_16k.wav`;
+
+  const save = async (idx) => {
+    setBusy(true); setErr('');
+    try {
+      await wbPost(`/api/dub/${job.id}/edit_transcript`,
+                   wbForm({ edits: JSON.stringify({ [String(idx)]: draft }) }));
+      setEditedIdxs(list => list.includes(idx) ? list : [...list, idx]);
+      setEditing(null);
+      await cpDoc.reload();
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>Source transcript</span>
+        <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>
+          {segs.length} segments{editedIdxs.length ? ` · ${editedIdxs.length} corrected` : ''}
+        </span>
+      </div>
+      <div style={{ fontSize: 11.5, color: 'var(--ink-3)', lineHeight: 1.5 }}>
+        What Whisper heard, before anything is translated. Fix names, terms and
+        mishearings here — after approval they are baked into every language.
+        Click a line to correct it; ▶ plays that moment of the original audio.
+      </div>
+      {cpDoc.err && <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>{cpDoc.err}</div>}
+      {err && <div style={{ fontSize: 12, color: 'var(--err)' }}>{err}</div>}
+      {!segs.length && !cpDoc.err && (
+        <div style={{ fontSize: 12, color: 'var(--ink-3)', padding: '18px 0' }}>
+          No transcription checkpoint yet.
+        </div>
+      )}
+      {segs.map(s => (
+        <div key={s.idx} style={{ border: '1px solid var(--line)', borderRadius: 10,
+                                  padding: '11px 13px', display: 'flex', flexDirection: 'column', gap: 7 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 10.5 }} className="mono">
+            <span style={{ color: 'var(--accent)' }}>#{s.idx}</span>
+            <span style={{ color: 'var(--ink-4)' }}>{(s.start ?? 0).toFixed(1)}s – {(s.end ?? 0).toFixed(1)}s</span>
+            {s.speaker && <span style={{ color: 'var(--ink-3)' }}>{(job.speaker_labels || {})[s.speaker] || s.speaker}</span>}
+            {editedIdxs.includes(s.idx) && (
+              <span style={{ color: 'var(--accent)' }}>corrected</span>
+            )}
+            <button className="btn btn-ghost" style={{ marginLeft: 'auto', padding: '1px 8px', fontSize: 10 }}
+                    onClick={() => wbPlay(`${audioUrl}#t=${s.start},${s.end}`)}>▶ source</button>
+          </div>
+          {editing === s.idx ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <textarea className="field" rows={2} value={draft}
+                        onChange={e => setDraft(e.target.value)} style={{ resize: 'vertical' }}/>
+              <div style={{ display: 'flex', gap: 6 }}>
+                <button className="btn btn-primary" disabled={busy || !draft.trim()}
+                        onClick={() => save(s.idx)} style={{ padding: '5px 12px', fontSize: 11 }}>
+                  {busy ? 'Saving…' : 'Save line'}
+                </button>
+                <button className="btn btn-ghost" onClick={() => setEditing(null)} style={{ fontSize: 11 }}>Cancel</button>
+              </div>
+            </div>
+          ) : (
+            <div className="wrap-any" style={{ fontSize: 13, cursor: 'text' }}
+                 onClick={() => { setEditing(s.idx); setDraft(s.text || ''); }}>
+              {s.text}
+            </div>
+          )}
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -4922,7 +5011,17 @@ function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, 
     awaiting_final_qc: 'Approve & deliver ▸',
   }[job.status] || 'Continue ▸';
 
+  // The Transcript tab exists only while the transcript gate holds the
+  // job — once approved, source-text edits change nothing until a
+  // retranslate, and a tab that silently does nothing is how the dead
+  // Accept button happened.
+  const transcriptArmed = job.status === 'awaiting_transcript_review'
+    || job.pending_gate === 'transcript';
+  // A stale selection (deep link to an unarmed job, or the gate clearing
+  // under us) falls through to Translation instead of a blank pane.
+  const effTab = (tab === 'transcript' && !transcriptArmed) ? 'translation' : tab;
   const tabs = [
+    ...(transcriptArmed ? [{ id: 'transcript', label: 'Transcript' }] : []),
     { id: 'translation', label: 'Translation' },
     { id: 'voices', label: 'Pronunciation & speakers' },
     { id: 'sync', label: 'Sync fit' },
@@ -4999,9 +5098,9 @@ function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, 
           {tabs.map(t => (
             <button key={t.id} onClick={() => setTab(t.id)} style={{
               padding: '5px 11px', borderRadius: 999, fontSize: 11.5, fontWeight: 500,
-              border: '1px solid ' + (tab === t.id ? 'var(--line-2)' : 'transparent'),
-              background: tab === t.id ? 'var(--bg-2)' : 'transparent',
-              color: tab === t.id ? 'var(--ink)' : 'var(--ink-3)' }}>
+              border: '1px solid ' + (effTab === t.id ? 'var(--line-2)' : 'transparent'),
+              background: effTab === t.id ? 'var(--bg-2)' : 'transparent',
+              color: effTab === t.id ? 'var(--ink)' : 'var(--ink-3)' }}>
               {t.label}
             </button>
           ))}
@@ -5009,11 +5108,12 @@ function ReviewView({ jobs, selectedJobId, voicePresets, onContinued, onCancel, 
 
         <div style={{ display: 'flex', gap: 18, alignItems: 'flex-start' }}>
           <div style={{ flex: 1, minWidth: 0 }}>
-            {tab === 'translation' && <WbTranslationTab job={job} onEdited={() => {}}/>}
-            {tab === 'voices' && <WbPronSpeakersTab job={job} siblings={siblings}/>}
-            {tab === 'sync' && <WbSyncFitTab job={job} setTab={setTab} onChanged={onContinued}/>}
-            {tab === 'subtitles' && <WbSubtitlesTab job={job}/>}
-            {tab === 'qc' && <WbFinalQCTab job={job} setTab={setTab} onApprove={proceed} busy={busy}/>}
+            {effTab === 'transcript' && <WbTranscriptTab job={job}/>}
+            {effTab === 'translation' && <WbTranslationTab job={job} onEdited={() => {}}/>}
+            {effTab === 'voices' && <WbPronSpeakersTab job={job} siblings={siblings}/>}
+            {effTab === 'sync' && <WbSyncFitTab job={job} setTab={setTab} onChanged={onContinued}/>}
+            {effTab === 'subtitles' && <WbSubtitlesTab job={job}/>}
+            {effTab === 'qc' && <WbFinalQCTab job={job} setTab={setTab} onApprove={proceed} busy={busy}/>}
           </div>
           <div style={{ width: 270, flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 12 }}>
             <GatesRail job={job}/>
@@ -6311,6 +6411,158 @@ function NotificationsTab() {
 }
 
 
+// ── Settings → Models ──────────────────────────────────────────────
+// Pull and delete are Ollama operations (POST /api/models/pull streams
+// SSE progress from `ollama pull`). When LM Studio is the backend the
+// server just uses whatever LM Studio serves, so this tab shows the
+// served list with a pointer at the LM Studio app instead of controls
+// that would fail against the wrong daemon.
+const OLLAMA_SUGGESTIONS = [
+  ['aya-expanse:8b',   '4.5 GB · multilingual translation specialist'],
+  ['qwen2.5:14b',      '8 GB · best balance'],
+  ['qwen2.5:7b',       '4 GB · good and fast'],
+  ['mistral-nemo:12b', '7 GB · European languages'],
+  ['gemma3:12b',       '7.5 GB · strong quality'],
+  ['gemma3:4b',        '3 GB · compact'],
+  ['llama3.2:3b',      '2 GB · tiny fallback'],
+];
+
+function ModelsTab({ system, onRefreshSystem }) {
+  const lmStudio = system?.translation_backend === 'lm_studio';
+  const installed = (lmStudio ? system?.lm_studio?.models : system?.ollama?.models) || [];
+  const backendOk = lmStudio ? system?.lm_studio?.ok : system?.ollama?.ok;
+  const [tag, setTag] = useState('');
+  const [pulling, setPulling] = useState(null);   // { model, percent, status }
+  const [confirmDel, setConfirmDel] = useState(null);
+  const [err, setErr] = useState('');
+  const [note, setNote] = useState('');
+
+  const pull = async (model) => {
+    model = (model || '').trim();
+    if (!model || pulling) return;
+    setErr(''); setNote('');
+    setPulling({ model, percent: 0, status: 'starting…' });
+    try {
+      const fd = new FormData(); fd.append('model', model);
+      const res = await fetch('/api/models/pull', { method: 'POST', body: fd });
+      const reader = res.body.getReader();
+      const dec = new TextDecoder();
+      let buf = '', failed = null;
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const line = buf.slice(0, i).split('\n').find(l => l.startsWith('data: '));
+          buf = buf.slice(i + 2);
+          if (!line) continue;
+          let ev; try { ev = JSON.parse(line.slice(6)); } catch (_) { continue; }
+          if (ev.status === 'error') failed = ev.error || 'pull failed';
+          else setPulling({ model, percent: ev.percent || 0, status: ev.status || '' });
+        }
+      }
+      if (failed) setErr(failed);
+      else { setNote(`${model} installed — it now appears in the dub form's model picker.`); setTag(''); }
+    } catch (e) { setErr(String(e.message || e)); }
+    setPulling(null);
+    if (onRefreshSystem) onRefreshSystem();
+  };
+
+  const del = async (model) => {
+    if (confirmDel !== model) {
+      setConfirmDel(model);
+      setTimeout(() => setConfirmDel(c => c === model ? null : c), 4000);
+      return;
+    }
+    setConfirmDel(null); setErr(''); setNote('');
+    try {
+      const fd = new FormData(); fd.append('model', model);
+      const r = await fetch('/api/models/delete', { method: 'POST', body: fd });
+      const d = await r.json();
+      if (d.error) setErr(d.error);
+      else { setNote(`${model} removed.`); if (onRefreshSystem) onRefreshSystem(); }
+    } catch (e) { setErr(String(e.message || e)); }
+  };
+
+  return (
+    <div style={{ maxWidth: 760, display: 'flex', flexDirection: 'column', gap: 16 }}>
+      <div style={{ fontSize: 11.5, color: 'var(--ink-3)', lineHeight: 1.5 }}>
+        Translation models served by {lmStudio ? 'LM Studio' : 'Ollama'}
+        {backendOk === false ? ' — backend not reachable right now.' : '.'}
+        {lmStudio && ' Download and load models in the LM Studio app; this list mirrors what it serves.'}
+      </div>
+
+      <div style={{ background: 'var(--bg-1)', border: '1px solid var(--line)',
+                    borderRadius: 'var(--r-lg)', padding: '14px 18px' }}>
+        <div className="caps" style={{ marginBottom: 8 }}>Installed ({installed.length})</div>
+        {installed.length === 0 && (
+          <div style={{ fontSize: 12, color: 'var(--ink-3)' }}>
+            {lmStudio ? 'LM Studio reports no models.' : 'No Ollama models installed yet — pull one below.'}
+          </div>
+        )}
+        {installed.map(m => (
+          <div key={m} style={{ display: 'flex', alignItems: 'center', gap: 10,
+                                borderTop: '1px solid var(--line)', padding: '7px 0' }}>
+            <span className="mono" style={{ fontSize: 12, flex: 1 }}>{m}</span>
+            {!lmStudio && (
+              <button className="btn btn-ghost" style={{ fontSize: 10.5, color: confirmDel === m ? 'var(--err)' : undefined }}
+                      disabled={!!pulling}
+                      onClick={() => del(m)}>
+                {confirmDel === m ? 'Really delete?' : 'Delete'}
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+
+      {!lmStudio && (
+        <div style={{ background: 'var(--bg-1)', border: '1px solid var(--line)',
+                      borderRadius: 'var(--r-lg)', padding: '14px 18px',
+                      display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div className="caps">Pull a model</div>
+          <div style={{ display: 'flex', gap: 8 }}>
+            <input className="field" style={{ flex: 1 }} value={tag}
+                   placeholder="ollama tag — e.g. aya-expanse:8b"
+                   onChange={e => setTag(e.target.value)}
+                   onKeyDown={e => { if (e.key === 'Enter') pull(tag); }}/>
+            <button className="btn btn-primary" disabled={!tag.trim() || !!pulling}
+                    onClick={() => pull(tag)}>Pull</button>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            {OLLAMA_SUGGESTIONS.filter(([id]) => !installed.includes(id)).map(([id, hint]) => (
+              <button key={id} className="btn btn-ghost" disabled={!!pulling}
+                      onClick={() => pull(id)}
+                      style={{ justifyContent: 'flex-start', gap: 10, fontSize: 11.5 }}>
+                <span className="mono">{id}</span>
+                <span style={{ color: 'var(--ink-4)', fontSize: 10.5 }}>{hint}</span>
+                <span style={{ marginLeft: 'auto', color: 'var(--accent)' }}>pull ↓</span>
+              </button>
+            ))}
+          </div>
+          {pulling && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 5 }}>
+              <div className="mono" style={{ fontSize: 11, color: 'var(--ink-2)' }}>
+                {pulling.model} · {pulling.status || 'pulling'} · {pulling.percent}%
+              </div>
+              <div style={{ height: 3, background: 'var(--bg-3)', borderRadius: 2, overflow: 'hidden' }}>
+                <div style={{ height: '100%', width: `${pulling.percent}%`, background: 'var(--accent)',
+                              transition: 'width 0.3s' }}/>
+              </div>
+              <div style={{ fontSize: 10.5, color: 'var(--ink-4)' }}>
+                Leaving this tab cancels the view, not the download — Ollama keeps pulling.
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {err && <div style={{ color: 'var(--err)', fontSize: 12 }}>{err}</div>}
+      {note && <div style={{ color: 'var(--accent)', fontSize: 12 }}>{note}</div>}
+    </div>
+  );
+}
+
 function SystemView({ system, onRefreshSystem }) {
   const [tab, setTab] = useState(_lsGet('system_tab', 'overview'));
   const pick = (t) => { setTab(t); _lsSet('system_tab', t); };
@@ -6338,7 +6590,7 @@ function SystemView({ system, onRefreshSystem }) {
       </div>
 
       <div style={{ display: 'flex', gap: 6, marginBottom: 22 }}>
-        {[['overview', 'Overview'], ['voice', 'Voice & TTS'], ['output', 'Output'], ['notify', 'Notifications'], ['setup', 'Setup'], ['logs', 'Logs']].map(([id, label]) => (
+        {[['overview', 'Overview'], ['voice', 'Voice & TTS'], ['models', 'Models'], ['output', 'Output'], ['notify', 'Notifications'], ['setup', 'Setup'], ['logs', 'Logs']].map(([id, label]) => (
           <button key={id} className={'tab' + (tab === id ? ' active' : '')} onClick={() => pick(id)}>
             {label}{id === 'setup' && issues.length > 0 ? ` · ${issues.length}` : ''}
           </button>
@@ -6346,6 +6598,7 @@ function SystemView({ system, onRefreshSystem }) {
       </div>
 
       {tab === 'voice' && <VoiceTtsTab system={system}/>}
+      {tab === 'models' && <ModelsTab system={system} onRefreshSystem={onRefreshSystem}/>}
       {tab === 'output' && <OutputTab system={system}/>}
       {tab === 'notify' && <NotificationsTab/>}
       {tab === 'setup' && <SetupTab system={system} onRefreshSystem={onRefreshSystem}/>}
@@ -6879,13 +7132,197 @@ function VoicesView({ presets, onRefresh }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// GLOSSARY VIEW (placeholder)
+// GLOSSARY VIEW — Library → Glossary
 // ═══════════════════════════════════════════════════════════════════
-function GlossaryEditor() {
+// The same glossary the review workbench teaches one term at a time
+// (via /api/glossary/term), shown whole. Adds go through the per-term
+// endpoint so its server-side merge lock keeps two quick saves from
+// losing one; edits and deletes save the full file through POST
+// /api/glossary, which validates and clears the translator's cache so
+// the change applies to the very next translation.
+
+function glossaryTermParts(v) {
+  if (typeof v === 'string') return { dst: v, say: '' };
+  return { dst: (v && v.dst) || '', say: (v && v.say) || '' };
+}
+
+// A term value is a plain string when it is only a translation — the
+// compact form hand-authored files use — and {dst?, say?} otherwise.
+function glossaryTermValue(dst, say) {
+  dst = (dst || '').trim(); say = (say || '').trim();
+  if (dst && say) return { dst, say };
+  if (say) return { say };
+  return dst;
+}
+
+function GlossaryTermRow({ term, value, onSave, onDelete, busy }) {
+  const [editing, setEditing] = useState(false);
+  const [dst, setDst] = useState('');
+  const [say, setSay] = useState('');
+  const [confirmDel, setConfirmDel] = useState(false);
+  const p = glossaryTermParts(value);
   return (
-    <div style={{ flex: 1, overflow: 'auto', padding: 'var(--pad)', background: 'var(--bg)' }}>
-      <div className="serif" style={{ fontSize: 'clamp(22px, 6vw, 32px)', marginBottom: 20 }}>Glossary</div>
-      <div style={{ color: 'var(--ink-3)' }}>Glossary editor coming soon — check back.</div>
+    <div style={{ borderTop: '1px solid var(--line)', padding: '7px 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+        <span style={{ fontSize: 12.5, fontWeight: 500, minWidth: 120 }} className="wrap-any">{term}</span>
+        {!editing && (
+          <>
+            <span style={{ fontSize: 12, color: 'var(--ink-2)', flex: 1 }} className="wrap-any">
+              {p.dst || <span style={{ color: 'var(--ink-4)' }}>—</span>}
+              {p.say && <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)', marginLeft: 8 }}>say “{p.say}”</span>}
+            </span>
+            <button className="btn btn-ghost" style={{ fontSize: 10.5 }}
+                    onClick={() => { setDst(p.dst); setSay(p.say); setEditing(true); }}>Edit</button>
+            <button className="btn btn-ghost" style={{ fontSize: 10.5, color: confirmDel ? 'var(--err)' : undefined }}
+                    disabled={busy}
+                    onClick={() => {
+                      if (!confirmDel) { setConfirmDel(true); setTimeout(() => setConfirmDel(false), 4000); return; }
+                      onDelete();
+                    }}>{confirmDel ? 'Really delete?' : 'Delete'}</button>
+          </>
+        )}
+      </div>
+      {editing && (
+        <div style={{ display: 'flex', gap: 6, marginTop: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          <input className="field" style={{ flex: 1, minWidth: 140 }} value={dst}
+                 placeholder="render as…" onChange={e => setDst(e.target.value)}/>
+          <input className="field" style={{ flex: 1, minWidth: 140 }} value={say}
+                 placeholder='say it like… (TTS respelling)' onChange={e => setSay(e.target.value)}/>
+          <button className="btn btn-primary" style={{ padding: '5px 12px', fontSize: 11 }}
+                  disabled={busy || (!dst.trim() && !say.trim())}
+                  onClick={async () => { await onSave(glossaryTermValue(dst, say)); setEditing(false); }}>
+            Save
+          </button>
+          <button className="btn btn-ghost" style={{ fontSize: 11 }} onClick={() => setEditing(false)}>Cancel</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GlossaryEditor() {
+  const [doc, setDoc] = useState(null);      // /api/glossary response
+  const [err, setErr] = useState('');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [nTerm, setNTerm] = useState('');
+  const [nDst, setNDst] = useState('');
+  const [nSay, setNSay] = useState('');
+  const [nLang, setNLang] = useState('');
+  const [nDomain, setNDomain] = useState('');
+
+  const load = () => fetch('/api/glossary').then(r => r.json()).then(setDoc)
+    .catch(e => setErr(String(e)));
+  useEffect(() => { load(); }, []);
+
+  // exists:false answers with an example template — real domains only
+  // when the file is actually on disk, so the page never shows sample
+  // terms as if the user had saved them.
+  const domains = (doc && doc.exists && doc.data && doc.data.domains) || [];
+
+  const saveAll = async (data) => {
+    setBusy(true); setErr(''); setNote('');
+    try {
+      const d = await wbPost('/api/glossary', wbForm({ body: JSON.stringify(data) }));
+      setNote(`Saved — ${d.total_terms} term(s) in ${d.domains} domain(s). Applies to the next translation.`);
+      await load();
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  const mutateTerm = (domainIdx, term, value) => {
+    const data = JSON.parse(JSON.stringify(doc.data));
+    if (value === undefined) delete data.domains[domainIdx].terms[term];
+    else data.domains[domainIdx].terms[term] = value;
+    return saveAll(data);
+  };
+
+  const addTerm = async () => {
+    setBusy(true); setErr(''); setNote('');
+    try {
+      await wbPost('/api/glossary/term', wbForm({
+        term: nTerm, translation: nDst, say: nSay,
+        target_lang: nLang, domain: nDomain }));
+      setNTerm(''); setNDst(''); setNSay('');
+      setNote('Term saved — applies to the next translation.');
+      await load();
+    } catch (e) { setErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  return (
+    <div className="scroll" style={{ flex: 1, minHeight: 0 }}>
+      <div style={{ padding: 'var(--pad)', maxWidth: 900,
+                    display: 'flex', flexDirection: 'column', gap: 18 }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
+          <div className="serif" style={{ fontSize: 22 }}>Glossary</div>
+          <span className="mono" style={{ fontSize: 11, color: 'var(--ink-3)' }}>
+            {domains.reduce((n, d) => n + Object.keys(d.terms || {}).length, 0)} terms · {domains.length} domain(s)
+          </span>
+        </div>
+        <div style={{ fontSize: 11.5, color: 'var(--ink-3)', lineHeight: 1.5 }}>
+          Names and terms the translator must render your way, and how the
+          voices should pronounce them. Terms land in the translation prompt
+          for matching jobs; “say it like” respellings reach TTS. The review
+          workbench's “Add to glossary” writes into this same file.
+        </div>
+
+        <div style={{ background: 'var(--bg-1)', border: '1px solid var(--line)',
+                      borderRadius: 'var(--r-lg)', padding: '16px 18px',
+                      display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>Add a term</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 10 }}>
+            <Field label="Term"><input className="field" value={nTerm} onChange={e => setNTerm(e.target.value)} placeholder="e.g. GoChi"/></Field>
+            <Field label="Render as" hint="Optional if a respelling is given">
+              <input className="field" value={nDst} onChange={e => setNDst(e.target.value)} placeholder="e.g. ГоЧи"/></Field>
+            <Field label="Say it like" hint="Optional — TTS respelling">
+              <input className="field" value={nSay} onChange={e => setNSay(e.target.value)} placeholder='e.g. "goh-chee"'/></Field>
+            <Field label="Language" hint="Optional — blank = every language">
+              <input className="field" value={nLang} onChange={e => setNLang(e.target.value)} placeholder="ru"/></Field>
+          </div>
+          <div>
+            <button className="btn btn-primary" onClick={addTerm}
+                    disabled={busy || !nTerm.trim() || (!nDst.trim() && !nSay.trim())}>
+              ＋ Add term
+            </button>
+          </div>
+        </div>
+
+        {err && <div style={{ color: 'var(--err)', fontSize: 12 }}>{err}</div>}
+        {note && <div style={{ color: 'var(--accent)', fontSize: 12 }}>{note}</div>}
+        {doc && doc.error && <div style={{ color: 'var(--err)', fontSize: 12 }}>{doc.error}</div>}
+
+        {doc && !domains.length && !doc.error && (
+          <div style={{ color: 'var(--ink-3)', fontSize: 12, lineHeight: 1.5 }}>
+            No glossary yet — add your first term above, or confirm one from a
+            review card in the workbench. The file is created on first save.
+          </div>
+        )}
+
+        {domains.map((d, di) => (
+          <div key={(d.name || '') + di}
+               style={{ background: 'var(--bg-1)', border: '1px solid var(--line)',
+                        borderRadius: 'var(--r-lg)', padding: '14px 18px' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 4 }}>
+              <span style={{ fontSize: 13.5, fontWeight: 600 }}>{d.name || 'unnamed domain'}</span>
+              {d.target_lang && <span className="chip mono" style={{ fontSize: 9 }}>{d.target_lang}</span>}
+              {(d.triggers || []).length > 0 && (
+                <span className="mono" style={{ fontSize: 10, color: 'var(--ink-4)' }}>
+                  triggers: {(d.triggers || []).join(', ')}
+                </span>
+              )}
+              <span className="mono" style={{ fontSize: 10, color: 'var(--ink-4)', marginLeft: 'auto' }}>
+                {Object.keys(d.terms || {}).length} term(s)
+              </span>
+            </div>
+            {Object.entries(d.terms || {}).map(([term, value]) => (
+              <GlossaryTermRow key={term} term={term} value={value} busy={busy}
+                onSave={(v) => mutateTerm(di, term, v)}
+                onDelete={() => mutateTerm(di, term, undefined)}/>
+            ))}
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -8179,35 +8616,6 @@ function AuditPanel() {
           </div>
         ))}
       </DevCard>
-    </div>
-  );
-}
-
-function ComingSoonView({ icon, title, blurb, points = [], phase }) {
-  return (
-    <div style={{ flex: 1, minHeight: 0, overflow: 'auto', padding: 'var(--pad)' }}>
-      <div style={{ maxWidth: 560, margin: '48px auto 0' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-          <div style={{ width: 30, height: 30, borderRadius: 'var(--r-md)',
-                        background: 'var(--bg-2)', border: '1px solid var(--line-2)',
-                        display: 'flex', alignItems: 'center', justifyContent: 'center',
-                        color: 'var(--accent)' }}>{icon}</div>
-          <span className="caps">In development · phase {phase}</span>
-        </div>
-        <div className="serif" style={{ fontSize: 28, marginBottom: 10 }}>{title}</div>
-        <div style={{ color: 'var(--ink-2)', lineHeight: 1.6, marginBottom: 18 }}>{blurb}</div>
-        {points.length > 0 && (
-          <div style={{ padding: 14, background: 'var(--bg-1)', border: '1px solid var(--line)',
-                        borderRadius: 'var(--r-lg)', display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {points.map((p, i) => (
-              <div key={i} style={{ display: 'flex', gap: 8, fontSize: 12, color: 'var(--ink-2)' }}>
-                <span style={{ color: 'var(--accent)', flexShrink: 0 }}>·</span>
-                <span>{p}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
     </div>
   );
 }
