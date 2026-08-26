@@ -9862,6 +9862,45 @@ async def continue_pipeline(
 
     cp = _latest_checkpoint(job_id)
     if not cp:
+        # A queued job the previous server process never started has no
+        # checkpoint — load_jobs_from_disk marks it error+stale_from_restart
+        # with "click Resume to continue", and until now Resume had nothing
+        # to continue *from*, so the very button the message named returned
+        # this 404. Everything run_pipeline needs survives on the job dict
+        # (the submit routes save `source` before enqueueing), so a restart
+        # orphan re-enqueues from scratch instead.
+        src = job.get("source") or ""
+        if (job.get("stale_from_restart") and job.get("status") == "error"
+                and src and os.path.exists(src)):
+            gates = job.get("review_gates")
+            job["error"] = ""
+            job.pop("stale_from_restart", None)
+            job["step_detail"] = "Requeued after server restart"
+            job["progress"] = 0
+            await enqueue_job(job_id, {
+                "source": src,
+                "source_lang": job.get("source_lang", "auto"),
+                "target_lang": job.get("target_lang", ""),
+                "model": job.get("model", ""),
+                "keep_bg": bool(job.get("keep_bg", True)),
+                "whisper_model": job.get("whisper_model", "large-v3"),
+                "reference_audio": ref_path or job.get("reference_audio", ""),
+                "speaker_mode": job.get("speaker_mode", "main"),
+                "context_hint": job.get("context_hint", ""),
+                "voice_style": final_style,
+                "voice_preset": final_preset,
+                "tts_speed": final_speed,
+                "wizard_mode": job.get("wizard_mode", "auto"),
+                "auto_denoise": bool(job.get("auto_denoise", False)),
+                "mode": job.get("mode") or "dub",
+                "voxcpm_cfg": float(job.get("voxcpm_cfg") or 0.0),
+                "voxcpm_steps": int(job.get("voxcpm_steps") or 0),
+                "review_gates": dict(gates) if isinstance(gates, dict) else None,
+            })
+            log.info(f"[continue] Job {job_id} had no checkpoint (restart "
+                     f"orphan) — requeued from the start")
+            return {"ok": True, "job_id": job_id, "status": "queued",
+                    "requeued_from_start": True}
         return JSONResponse({"error": "No checkpoint to continue from"}, 404)
 
     gate = app_review_gates.GATE_FOR_STATUS.get(job.get("status") or "")
@@ -11361,7 +11400,7 @@ _COMPACT_JOB_KEYS = (
     "created", "started_at", "completed_at",
     "batch_id", "batch_label", "batch_kind", "batch_position", "batch_total",
     "output_url", "srt_url",
-    "has_checkpoint", "latest_checkpoint_stage",
+    "has_checkpoint", "latest_checkpoint_stage", "stale_from_restart",
 )
 _COMPACT_META_KEYS = ("title", "thumbnail", "duration", "channel", "webpage_url")
 

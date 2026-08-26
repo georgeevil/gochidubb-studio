@@ -197,12 +197,21 @@ function runJobs(entry) {
 function runDoneJobs(entry) {
   return runJobs(entry).filter(j => j.status === "complete");
 }
+// A job the server can pick back up: parked at a checkpoint (interrupted /
+// errored mid-stage) or orphaned in the queue by a server restart. Both
+// resume through POST /continue.
+function resumable(j) {
+  return j && (j.status === "interrupted" ||
+    (j.status === "error" && (j.has_checkpoint || j.stale_from_restart)));
+}
 
 function feedCard(entry, i) {
   const jobs = runJobs(entry);
   const done = jobs.filter(j => j.status === "complete");
   const errs = jobs.filter(j => j.status === "error");
-  const running = jobs.length ? jobs.length - done.length - errs.length : 0;
+  const interrupted = jobs.filter(j => j.status === "interrupted");
+  const running = jobs.length
+    ? jobs.length - done.length - errs.length - interrupted.length : 0;
   const avg = jobs.length
     ? jobs.reduce((a, j) => a + (j.status === "complete" ? 100 : (+j.progress || 0)), 0) / jobs.length
     : 0;
@@ -214,12 +223,17 @@ function feedCard(entry, i) {
     return `<span class="chip ${cls}">${esc(code.toUpperCase())}${mk}</span>`;
   }).join("");
   const meta = `${fmtDur(entry.secs)} · ${(entry.langs || []).length} languages · ${timeAgo(entry.created)}`;
+  const stalled = jobs.filter(resumable);
   const actions = done.length
     ? `<button class="btn sm" onclick="A.openShare(${i})">Share</button>
        <button class="btn sm ghost" onclick="A.openPreview(${i})">Watch</button>`
-    : (errs.length && !running
-      ? `<span class="chip warn">failed — see Activity</span>`
-      : `<button class="btn sm ghost" onclick="A.openProgress(${i})">⏳ ${Math.round(avg)}%</button>`);
+    : (stalled.length && !running
+      ? `<button class="btn sm" onclick="A.resumeRun(${i})">▶ Resume</button>
+         <button class="btn sm ghost" onclick="A.openProgress(${i})">Details</button>`
+      : errs.length && !running
+        ? `<span class="chip warn">failed</span>
+           <button class="btn sm ghost" onclick="A.openProgress(${i})">Details</button>`
+        : `<button class="btn sm ghost" onclick="A.openProgress(${i})">⏳ ${Math.round(avg)}%</button>`);
   return `
   <div class="card feed-card">
     <div class="thumb"><div style="font-size:16px">▶</div>
@@ -241,10 +255,11 @@ function vActivity() {
   const others = Object.values(S.jobsById)
     .filter(j => !mine.has(j.id))
     .sort((a, b) => (b.created || 0) - (a.created || 0));
-  const busy = others.filter(j => !["complete", "error", "scheduled"].includes(j.status)).slice(0, 8);
+  const busy = others.filter(j =>
+    !["complete", "error", "scheduled"].includes(j.status) || resumable(j)).slice(0, 8);
   const doneJobs = others.filter(j => j.status === "complete").slice(0, 6);
   const row = (j) => {
-    const running = !["complete", "error"].includes(j.status);
+    const running = !["complete", "error", "interrupted"].includes(j.status);
     const sub = j.status === "complete"
       ? `${langName(j.target_lang)} · ready ${timeAgo(j.completed_at || j.created)}`
       : `${langName(j.target_lang)} · ${esc(j.step_detail || j.status)}`;
@@ -258,8 +273,12 @@ function vActivity() {
       </div>
       ${running
         ? `<span class="chip warn">⏳ ${Math.round(+j.progress || 0)}%</span>`
-        : `<button class="btn sm" onclick="A.shareJob('${esc(j.id)}')">Share</button>
-           <button class="btn sm ghost" onclick="A.redub('${esc(j.id)}')">Redub</button>`}
+        : resumable(j)
+          ? `<button class="btn sm" onclick="A.resumeJob('${esc(j.id)}')">▶ Resume</button>`
+          : j.status === "error"
+            ? `<span class="chip warn">failed</span>`
+            : `<button class="btn sm" onclick="A.shareJob('${esc(j.id)}')">Share</button>
+               <button class="btn sm ghost" onclick="A.redub('${esc(j.id)}')">Redub</button>`}
     </div>`;
   };
   return `
@@ -495,7 +514,8 @@ function vProgress() {
   const awaitingTr = jobs.filter(j => j.status === "awaiting_translation_review");
   const awaitingOther = jobs.filter(j => (j.status || "").startsWith("awaiting_") && j.status !== "awaiting_translation_review");
   const errs = jobs.filter(j => j.status === "error");
-  const allFailed = jobs.length > 0 && errs.length === jobs.length;
+  const stalled = jobs.filter(resumable);
+  const allFailed = jobs.length > 0 && errs.length === jobs.length && !stalled.length;
   const eta = jobs.reduce((a, j) => Math.max(a, +j.eta_seconds || 0), 0);
   const [big, sub] = awaitingTr.length
     ? ["Waiting for your OK", "Nothing has been recorded yet"]
@@ -523,7 +543,13 @@ function vProgress() {
           <div style="font-size:12px;color:var(--muted);margin-top:5px">${esc(sub)}${eta ? ` · ~${fmtDur(eta)} left` : ""}</div>
         </div>
         <div class="progress-track" style="width:100%;max-width:280px"><i style="width:${Math.round(avg)}%"></i></div>
-        ${errs.length ? `<div class="chip warn">${errs.length} of ${total} failed — the rest keep going</div>` : ""}
+        ${stalled.length ? `
+        <div style="width:100%;background:var(--amber-bg);border-radius:11px;padding:14px;display:flex;flex-direction:column;gap:9px;text-align:left">
+          <div style="font-size:13px;font-weight:700;color:var(--amber-ink)">The server restarted mid-dub</div>
+          <div style="font-size:12px;color:var(--amber-ink);line-height:1.45">Nothing is lost — ${stalled.length} of ${total} will pick up where they left off.</div>
+          <button class="btn" style="border:none;font-weight:700" onclick="A.resumeRun(${S.runs.indexOf(S.run)})">▶ Resume</button>
+        </div>` : ""}
+        ${errs.length && !stalled.length ? `<div class="chip warn">${errs.length} of ${total} failed — the rest keep going</div>` : ""}
         ${awaitingTr.length ? `
         <div style="width:100%;background:var(--amber-bg);border-radius:11px;padding:14px;display:flex;flex-direction:column;gap:9px;text-align:left">
           <div style="font-size:13px;font-weight:700;color:var(--amber-ink)">Paused — a few words need your OK</div>
@@ -1138,6 +1164,27 @@ const A = {
     }
     toast("Continuing without the desktop review");
     poll();
+  },
+
+  async resumeJob(id) {
+    try {
+      const r = await api(`/api/dub/${id}/continue`, { method: "POST" });
+      toast(r.requeued_from_start ? "Requeued from the start" : "Resuming from the checkpoint");
+    } catch (e) { toast("Couldn't resume: " + e.message); }
+    poll();
+  },
+  async resumeRun(i) {
+    const entry = S.runs[i];
+    if (!entry) return;
+    S.run = entry;
+    const targets = runJobs(entry).filter(resumable);
+    let ok = 0;
+    for (const j of targets) {
+      try { await api(`/api/dub/${j.id}/continue`, { method: "POST" }); ok++; }
+      catch (e) { toast("Couldn't resume " + (j.target_lang || "").toUpperCase() + ": " + e.message); }
+    }
+    if (ok) toast(`Resuming ${ok} dub${ok === 1 ? "" : "s"}`);
+    S.screen = "progress"; render(); poll();
   },
 
   // ── preview / share ──

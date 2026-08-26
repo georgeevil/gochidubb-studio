@@ -686,6 +686,83 @@ def test_the_go_page_does_not_pull_a_cdn(client):
 
 
 # ═══════════════════════════════════════════════════════════════════════
+#  POST /api/dub/{id}/continue — restart orphans requeue from scratch
+# ═══════════════════════════════════════════════════════════════════════
+#
+# load_jobs_from_disk marks a job the previous process left queued as
+# error + stale_from_restart with "click Resume to continue" — but a job
+# that never started has no checkpoint, so Resume used to 404 on the very
+# button the message named. The orphan path rebuilds the pipeline args
+# from the job dict (the submit routes save `source` before enqueueing)
+# and re-enqueues.
+
+@pytest.fixture
+def enqueue_spy(monkeypatch):
+    calls = []
+
+    async def _spy(job_id, pipeline_args):
+        calls.append((job_id, pipeline_args))
+    monkeypatch.setattr(server, "enqueue_job", _spy)
+    return calls
+
+
+def test_continue_requeues_a_restart_orphan(client, enqueue_spy,
+                                            monkeypatch, tmp_path):
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"\x00" * 16)
+    server.jobs["orph"] = _job(
+        "orph", status="error", stale_from_restart=True,
+        error="Interrupted by server restart — click Resume to continue",
+        source=str(src), source_lang="auto", target_lang="ru",
+        model="gemma4:e4b", keep_bg=True, whisper_model="large-v3",
+        voice_preset="auto", tts_speed="balanced", wizard_mode="auto",
+        review_gates={"translation": "flagged_only"},
+    )
+    monkeypatch.setattr(server, "_latest_checkpoint", lambda jid: None)
+    r = client.post("/api/dub/orph/continue", data={"voice_style": ""})
+    assert r.status_code == 200
+    d = r.json()
+    assert d["ok"] and d["requeued_from_start"]
+    assert len(enqueue_spy) == 1
+    jid, args = enqueue_spy[0]
+    assert jid == "orph"
+    assert args["source"] == str(src)
+    assert args["target_lang"] == "ru"
+    # The Go page's gate choice must survive the requeue — losing it would
+    # turn a "check the translation first" run into an unreviewed one.
+    assert args["review_gates"] == {"translation": "flagged_only"}
+    assert server.jobs["orph"]["error"] == ""
+    assert "stale_from_restart" not in server.jobs["orph"]
+
+
+def test_continue_still_404s_without_checkpoint_or_orphan_marker(
+        client, enqueue_spy, monkeypatch, tmp_path):
+    """A genuine pipeline error with no checkpoint must not silently
+    re-run: only jobs the restart itself stranded take the requeue path."""
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"\x00" * 16)
+    server.jobs["dead"] = _job("dead", status="error", source=str(src),
+                               target_lang="ru")
+    monkeypatch.setattr(server, "_latest_checkpoint", lambda jid: None)
+    r = client.post("/api/dub/dead/continue", data={"voice_style": ""})
+    assert r.status_code == 404
+    assert enqueue_spy == []
+
+
+def test_continue_orphan_with_missing_source_still_404s(
+        client, enqueue_spy, monkeypatch, tmp_path):
+    """The shared upload can be deleted from disk; requeueing then would
+    error instantly in the download stage with a worse message."""
+    server.jobs["gone"] = _job(
+        "gone", status="error", stale_from_restart=True,
+        source=str(tmp_path / "deleted.mp4"), target_lang="ru")
+    monkeypatch.setattr(server, "_latest_checkpoint", lambda jid: None)
+    r = client.post("/api/dub/gone/continue", data={"voice_style": ""})
+    assert r.status_code == 404
+    assert enqueue_spy == []
+
+
+# ═══════════════════════════════════════════════════════════════════════
 #  POST /api/quick_test?background=1 — the preparing status must terminate
 # ═══════════════════════════════════════════════════════════════════════
 # A job left in "preparing" never reaches a pipeline, never times out, and is
