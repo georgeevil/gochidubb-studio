@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 echo -e "${B}"
 echo "╔══════════════════════════════════════════════╗"
 echo "║    GoChiDUBB Studio — AI Video Dubbing       ║"
-echo "║    by TachikomaRed and smolemaru             ║"
+echo "║    by George Chigrichenko (@georgeevil)      ║"
 echo "╚══════════════════════════════════════════════╝"
 echo -e "${N}"
 

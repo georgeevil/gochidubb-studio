@@ -5,7 +5,7 @@
 **Local, agent-controllable AI video dubbing.**
 YouTube link in → voice-cloned dub in 65 languages out. No cloud, no per-minute fees, no upload of your face to anyone's server.
 
-*by [@georgeevil](https://github.com/georgeevil) credit to [@smolekoma](https://x.com/smolekoma) and [@smolemaru](https://x.com/smolemaru) &mdash; built with [Claude code(https://claude.ai)]*
+*by [George Chigrichenko](https://x.com/GChigrichenko) ([@georgeevil](https://github.com/georgeevil)) &mdash; built with [Claude Code](https://claude.ai)*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
@@ -35,7 +35,7 @@ optional [![CUDA 12.0+](https://img.shields.io/badge/CUDA-12.0+-76B900.svg)](htt
 | **Voice cloning** | ✅ VoxCPM2 | ✅ | ✅ | ✅ |
 | **Languages** | 65 | 29 | 40+ | 130+ |
 | **Multi-speaker diarization** | ✅ (pyannote) | ✅ | ✅ | ✅ |
-| **Background music preservation** | ✅ (audio-separator) | ✅ | ✅ | ✅ |
+| **Background music preservation** | ✅ (Demucs) | ✅ | ✅ | ✅ |
 | **YouTube URL → MP4** | ✅ in one step | ❌ | ❌ | ❌ |
 | **Stitched multilingual reel** | ✅ built-in | ❌ | ❌ | ❌ |
 | **MCP / agent control** | ✅ first-class | ❌ | ❌ | ❌ |
@@ -135,6 +135,8 @@ Or paste into `~/.claude.json`:
 }
 ```
 
+The MCP server exposes **32 tools**: dub / compare / showcase / redub, job status and listing, voice casting (get / set / preview), continue / cancel / rescue / delete, per-stage retry, review flags, translation edits, glossary terms, quality report, artifact audit, publish workflow (stage / approve / cancel / inbox), trending scout, duplicate check, and system / languages / models / voices.
+
 The repo ships a Claude Code skill at [`.claude/skills/gochidubb/SKILL.md`](.claude/skills/gochidubb/SKILL.md). Copy it to `~/.claude/skills/` and Claude knows when and how to drive the pipeline.
 
 ### CLI — works from any shell, any OS, any cron
@@ -157,11 +159,41 @@ python tools/gochidubb_cli.py redub 5038e404 --langs ja,it --mode showcase --wai
 python tools/gochidubb_cli.py system
 python tools/gochidubb_cli.py jobs --limit 20
 python tools/gochidubb_cli.py status <job_id>
+
+# Cast a voice per speaker (with audition), resume a job parked at a
+# review gate, or hand a stuck download a manually-fetched file
+python tools/gochidubb_cli.py cast <job_id> --set SPEAKER_00=anna --preview
+python tools/gochidubb_cli.py continue <job_id>
+python tools/gochidubb_cli.py rescue <job_id> ./video.mp4
 ```
+
+The full subcommand list: `dub, compare, showcase, redub, status, jobs, wait, showcase-status, showcase-rebuild, cast, continue, retry-stage, flags, edit-translations, glossary-term, quality, audit, publish, approve, publish-cancel, publish-inbox, scout, scout-dub, check-dup, cancel, rescue, delete, system, languages, models, voices`.
 
 Drive a remote box: `set GOCHIDUBB_URL=http://192.168.0.10:8910`
 
 See [`examples/`](examples/) for ready-to-run scripts.
+
+---
+
+## 🎛️ Five front doors
+
+One server, five surfaces — pick the one that fits the person in front of it:
+
+- **`/pro`** (also the default `/`) — the review workbench: tabbed review of subtitles, sync fit, cost, pronunciation, speakers and consent, with review gates that park a job before the expensive stages.
+- **`/creator`** — Creator mode: a guided, non-technical flow with confidence flags, a glossary, and a cost estimate up front.
+- **`/go`** — GoChiDUBB Go, the phone surface. Same jobs, a screen that fits a hand.
+- **`/admin`** — the vendor admin console: API keys, audit trail, usage and revenue estimates.
+- **`/beta`** — the stage-reuse cache inspector (see [Stage reuse](docs/stage-reuse.md)).
+
+Around them, the pieces that recent releases added:
+
+- **Voice library** — upload, record, edit and delete reference voices, or *Design a voice* from a style description (drawn once, then cloned, so it stays one person for the whole job).
+- **Voice casting** — assign a voice per detected speaker (`speaker_voice_map`) and audition it *before* the hours-long synthesis stage.
+- **Quality gates** — a suspect transcription or translation parks the job in an awaiting-review state before any GPU time is spent; resume from the UI, `continue` on the CLI, or `gochidubb_continue_job` over MCP, and subscribe to the `job.awaiting_review` webhook to be told when. Disable with `GOCHIDUBB_QUALITY_GATE=0`.
+- **Glossary, Transcript tab, model manager** — pin terminology across jobs, read the full transcript in place, and install/remove translation models from the UI.
+- **Background bed control** — the separated music bed has a per-job 0–10 gain with a QC row that measures the dub-vs-source balance; "the music is too quiet" is fixable on a finished dub in seconds (the merge stage is a pure re-mix).
+- **Subtitle burn-in** — `POST /api/dub/{id}/burn_subs` renders the SRT into the video with styling presets.
+- **Publish workflow** — stage an upload, review it in an inbox, approve or cancel; nothing is published without a human saying so.
 
 ---
 
@@ -196,7 +228,7 @@ YouTube URL or local file
    pyannote ─────────────────────► (speaker diarization, optional)
         │
         ▼
-   Ollama (Qwen3 / Gemma3 / Aya) ► (translation, length-matched)
+   LM Studio / Ollama (local LLM) ► (translation, length-matched)
         │
         ▼
    VoxCPM2 ──────────────────────► (voice cloning per speaker, 48 kHz)
@@ -373,7 +405,7 @@ that set (`uk`, `cs`, `ro`, `hu`, `bg`, `bn`, `ur`, `fa`, the Indian languages,
 the rest of Europe and Central Asia) are synthesized with Microsoft edge-tts
 neural voices: no cloning, but clean and intelligible.
 
-Source detection is automatic (Whisper). Translation goes through whatever Ollama model you have — `aya-expanse:8b` is the default for best multilingual quality.
+Source detection is automatic (Whisper). Translation goes through your local LLM server — LM Studio by default (`openai/gpt-oss-20b` recommended; see [Choosing a translation model](docs/choosing-a-translation-model.md)), or Ollama.
 
 ---
 
@@ -382,11 +414,11 @@ Source detection is automatic (Whisper). Translation goes through whatever Ollam
 | | Minimum | Recommended | Why |
 |---|---|---|---|
 | **VRAM** | 8 GB | 12 GB+ | VoxCPM2 + Whisper + a translation LLM coexist |
-| **RAM** | 16 GB | 32 GB | Audio-separator (background preservation) is hungry |
+| **RAM** | 16 GB | 32 GB | Vocal separation (Demucs, background preservation) is hungry |
 | **Disk** | 20 GB | 40 GB+ | Models + outputs |
 | **GPU** | Any CUDA 12.0+ | RTX 30/40 series | CPU fallback works but ~15× slower |
-| **Python** | 3.10–3.12 | 3.11 | |
-| **OS** | Win 10+, Linux, macOS | — | macOS requires CPU mode |
+| **Python** | 3.10–3.14 | 3.11–3.12 | The <3.15 ceiling comes from `spaces` |
+| **OS** | Win 10+, Linux, macOS | — | Apple Silicon runs on MPS (voxcpm ≥ 2.0.3); Intel Mac is CPU-only |
 
 No GPU? It still runs — just expect long jobs. The pipeline auto-falls back to `edge-tts` (Microsoft cloud TTS) if VoxCPM2 won't load, which sacrifices voice cloning but produces intelligible output fast.
 
@@ -398,9 +430,9 @@ No GPU? It still runs — just expect long jobs. The pipeline auto-falls back to
 | FFmpeg + yt-dlp (Windows static build) | ~100 MB | At install |
 | VoxCPM2 model weights | ~5 GB | First dubbing run, cached forever |
 | Whisper `large-v3` weights | ~3 GB | First dubbing run, cached forever |
-| Ollama translation model (e.g. `qwen3:8b`) | ~5 GB | At install (you pick it) |
+| Translation model — LM Studio or Ollama (e.g. `gpt-oss-20b`) | ~5 GB | At install (you pick it) |
 | pyannote diarization weights (optional) | ~500 MB | First multi-speaker run |
-| audio-separator UVR weights (optional) | ~250 MB | First background-preserve run |
+| Demucs `htdemucs_ft` weights (or audio-separator UVR) (optional) | ~250 MB | First background-preserve run |
 
 **Total for full setup: ~18 GB.** Skinny single-language setup without diarization or BGM preservation: ~12 GB.
 
@@ -408,7 +440,7 @@ No GPU? It still runs — just expect long jobs. The pipeline auto-falls back to
 
 ## 🔑 Tokens & API keys
 
-**Required tokens: NONE.** The default install runs 100% offline once dependencies are downloaded. No OpenAI / ElevenLabs / Anthropic key needed — translation is local (Ollama), TTS is local (VoxCPM2), ASR is local (Whisper).
+**Required tokens: NONE.** The default install runs 100% offline once dependencies are downloaded. No OpenAI / ElevenLabs / Anthropic key needed — translation is local (LM Studio or Ollama, both on your machine), TTS is local (VoxCPM2), ASR is local (Whisper).
 
 | Token | Required? | What for | Where to get |
 |---|---|---|---|
@@ -419,7 +451,7 @@ No GPU? It still runs — just expect long jobs. The pipeline auto-falls back to
 What "phones home" by default:
 - `yt-dlp` reaches YouTube/Vimeo/etc. — only when you submit a URL
 - `huggingface.co` for model downloads — first run only, then cached
-- `ollama.com` for translation model pulls — first install only
+- `lmstudio.ai` / `ollama.com` for translation model pulls — first install only
 - `edge-tts` for the cloud TTS fallback — only triggers if VoxCPM2 fails to load on your GPU
 
 There's no telemetry, no analytics, no phone-home from GoChiDUBB itself. Audit the network calls: search the repo for `httpx.` / `requests.` — only the integrations above.
@@ -531,7 +563,8 @@ something else is pointed at the server.
 | Feature | Install | Notes |
 |---|---|---|
 | Multi-speaker diarization | `pip install pyannote.audio` + HF token | Auto-detects N speakers, clones each |
-| Background music preservation | `pip install audio-separator` | Demuxes vocals, keeps original BGM |
+| Background music preservation | `pip install demucs` (recommended) or `pip install audio-separator` | Demuxes vocals, keeps original BGM; Demucs uses the `htdemucs_ft` model |
+| Lighter voice cloning | `pip install f5-tts`, then set `tts_engine=f5tts` | F5-TTS needs ~3 GB VRAM vs VoxCPM2's 8+; good quality, faster |
 | Faster Whisper on GPU | (already in requirements) | If CUDA isn't found, falls back to CPU |
 
 ---
@@ -592,6 +625,8 @@ Open the System tab → Models → click "Install" on `aya-expanse:8b` (best mul
 <summary><b>YouTube download fails / SSL error</b></summary>
 
 Update yt-dlp: `venv\Scripts\activate && pip install -U yt-dlp`. If it's an age-restricted or region-blocked video, set `YT_DLP_COOKIES_FROM_BROWSER=firefox` in `.env` (firefox is the most reliable on macOS; `chrome`/`edge`/`safari` also work but their keychains can block access). If browser cookie extraction fails, export a Netscape `cookies.txt` and point `YT_DLP_COOKIEFILE=/path/to/cookies.txt` at it. For SSL errors, check firewall/VPN/corporate proxy.
+
+Failed downloads are also classified and retried with different strategies automatically (`pipeline/rescue.py`), and a job that stays stuck can be handed a manually-downloaded file: `python tools/gochidubb_cli.py rescue <job_id> ./video.mp4`.
 
 </details>
 
@@ -682,7 +717,14 @@ Usually one of the child dubs failed silently. `python tools/gochidubb_cli.py sh
 <details>
 <summary><b>Background-preserve toggle does nothing</b></summary>
 
-Install the optional dep: `pip install audio-separator`. The UI shows a yellow warning if it's missing. First demux is slow (~30 s on GPU); subsequent ones are cached.
+Install the optional dep: `pip install demucs` (recommended) or `pip install audio-separator`. The UI shows a yellow warning if both are missing. First demux is slow (~30 s on GPU); subsequent ones are cached.
+
+</details>
+
+<details>
+<summary><b>The server restarted mid-job / a job is orphaned</b></summary>
+
+A job interrupted by a server restart is requeued with `python tools/gochidubb_cli.py continue <job_id>` (or the Continue button in the UI, or `gochidubb_continue_job` over MCP). Stages are checkpointed, so it resumes from the last finished stage rather than starting over.
 
 </details>
 
@@ -726,7 +768,7 @@ Yes. MIT licensed. The only "cost" is your electricity and GPU. No telemetry, no
 For reasonable speeds, yes. CPU works but a 1-minute dub takes ~30 minutes instead of ~2.
 
 **Does it work on Apple Silicon (M1/M2/M3)?**
-Yes via CPU + MPS fallback. Expect about 4-8× slower than a discrete GPU. PyTorch MPS support for VoxCPM2 is experimental — `edge-tts` fallback is reliable.
+Yes. VoxCPM2 runs on MPS (audio quality on MPS was fixed in voxcpm 2.0.3 — the requirement floor exists for this reason), and Demucs picks MPS automatically; Whisper runs on CPU (int8). Expect it slower than a discrete NVIDIA GPU. One caveat: the whisper-roundtrip TTS QA check is CUDA-only, so `qa=0.00` on a Mac means *not measured* — judge the output by ear.
 
 **Can I voice-clone a specific person?**
 Yes — drop a 5-30 second clean WAV/MP3 into `presets/voices/` and pick it as the reference. Please don't do this without that person's consent. See [SECURITY.md](SECURITY.md).
@@ -744,7 +786,7 @@ The server queues GPU work serially (one VoxCPM2 invocation at a time) to avoid 
 Yes — anything VoxCPM2 can fit as a reference (usually 5+ s of clean speech) clones fine. Singing is not supported.
 
 **Why VoxCPM2 instead of XTTS / OpenVoice / F5-TTS?**
-VoxCPM2 has the best cross-lingual cloning quality we tested at the 5 GB weight class. The architecture is swappable — `pipeline/synthesizer.py` has a base class; PRs for other backends welcome.
+VoxCPM2 has the best cross-lingual cloning quality we tested at the 5 GB weight class, so it's the default. F5-TTS now ships as a supported lighter alternative (`pip install f5-tts`, `tts_engine=f5tts`, ~3 GB VRAM). The architecture is swappable — `pipeline/synthesizer.py` has a base class (a CosyVoice 2 stub is waiting for a contributor); PRs for other backends welcome.
 
 **Can agents trigger this without my approval?**
 Each MCP tool call requires user confirmation by default (per the MCP spec). Gochidubb doesn't bypass that.
@@ -758,8 +800,8 @@ Each MCP tool call requires user confirmation by default (per the MCP spec). Goc
 - [x] Multi-speaker diarization
 - [x] Background music preservation
 - [x] Deterministic voice across cross-lingual segments
-- [ ] Subtitle burn-in toggle (currently SRT sidecar only)
-- [ ] Speaker labelling UI (assign names to detected speakers)
+- [x] Subtitle burn-in toggle (`POST /api/dub/{id}/burn_subs`, with styling presets)
+- [x] Speaker labelling UI (voice casting: name each detected speaker, assign a voice, audition it)
 - [ ] Browser-only mode (no Ollama dependency, use llama.cpp WASM)
 - [ ] Batch processing folder watcher
 - [ ] Docker image with everything pre-baked
@@ -788,8 +830,8 @@ We refuse to add features that defeat watermarking, anti-cloning safeguards, or 
 PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, code style, and the modular pipeline design — most contributions are a single drop-in file in `pipeline/`.
 
 Good first issues:
-- Add a TTS backend (XTTS, F5-TTS, OpenVoice)
-- Add a translation backend (OpenAI-compatible HTTP, vLLM, mlx_lm)
+- Add a TTS backend (XTTS, OpenVoice, or finish the CosyVoice 2 stub in `pipeline/synthesizer.py`)
+- Add a translation backend (vLLM, mlx_lm)
 - New language voices in the edge-tts fallback map
 - Improve the duration-matching prompt for hard language pairs
 
@@ -797,18 +839,23 @@ Good first issues:
 
 ## 💖 Credits
 
-Built by **[TachikomaRed](https://x.com/smolekoma)** and **[smolemaru](https://x.com/smolemaru)** &mdash; in collaboration with **[Claude](https://claude.ai)** (Anthropic).
+Built by **[George Chigrichenko](https://github.com/georgeevil)** &mdash; in collaboration with **[Claude](https://claude.ai)** (Anthropic).
 
-Follow the build on X: [@smolekoma](https://x.com/smolekoma) &middot; [@smolemaru](https://x.com/smolemaru)
+Follow the build on X: [@GChigrichenko](https://x.com/GChigrichenko)
 
 Standing on shoulders:
 - [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) — voice cloning TTS (Apache-2.0)
 - [faster-whisper](https://github.com/SYSTRAN/faster-whisper) — ASR (MIT)
 - [pyannote.audio](https://github.com/pyannote/pyannote-audio) — diarization (MIT)
+- [LM Studio](https://lmstudio.ai) — local LLM serving, default translation backend
 - [Ollama](https://ollama.com) — local LLM serving (MIT)
+- [Demucs](https://github.com/adefossez/demucs) — vocal separation (MIT)
+- [Silero VAD](https://github.com/snakers4/silero-vad) — voice activity detection (MIT)
+- [F5-TTS](https://github.com/SWivid/F5-TTS) — lighter voice-cloning engine (MIT)
 - [yt-dlp](https://github.com/yt-dlp/yt-dlp) — universal downloader (Unlicense)
 - [edge-tts](https://github.com/rany2/edge-tts) — cloud TTS fallback (GPL-3.0)
 - [audio-separator](https://github.com/karaokenerds/python-audio-separator) — stem separation (MIT)
+- [FFmpeg](https://ffmpeg.org) — every audio/video operation
 - [Model Context Protocol](https://modelcontextprotocol.io) — agent integration (Anthropic)
 
 ## 📜 License
@@ -819,8 +866,6 @@ MIT — see [LICENSE](LICENSE). VoxCPM2 is Apache-2.0. edge-tts is GPL-3.0; usin
 
 <div align="center">
 
-**If GoChiDUBB saved you a Heygen subscription, smash that ⭐ — that's how more people find it.**
-
-[![Star History Chart](https://api.star-history.com/svg?repos=georgeevil/gochidubb&type=Date)](https://star-history.com/#georgeevil/gochidubb&Date)
+**If GoChiDUBB saved you a Heygen or ElevenLabs subscription, smash that ⭐ — that's how more people find it.**
 
 </div>

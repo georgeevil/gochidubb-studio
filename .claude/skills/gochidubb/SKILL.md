@@ -17,7 +17,7 @@ ask things like *"dub this YouTube short into French and German"* or
 right tool and waits for it.
 
 Repo: https://github.com/georgeevil/gochidubb
-By [@smolekoma](https://x.com/smolekoma) and [@smolemaru](https://x.com/smolemaru), built with Claude.
+By [George Chigrichenko](https://x.com/GChigrichenko) ([@georgeevil](https://github.com/georgeevil)), built with Claude.
 
 ## When this skill applies
 

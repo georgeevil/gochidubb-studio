@@ -4,7 +4,7 @@ title GoChiDUBB Studio Installer
 
 :: ════════════════════════════════════════════════════════════════
 ::  GoChiDUBB Studio — Windows One-Click Installer
-::  Created by TachikomaRed and smolemaru
+::  Created by George Chigrichenko (@georgeevil)
 ::  Installs: Python packages, FFmpeg, yt-dlp, Ollama, VoxCPM2
 :: ════════════════════════════════════════════════════════════════
 

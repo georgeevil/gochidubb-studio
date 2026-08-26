@@ -1,7 +1,7 @@
 """
 GoChiDUBB Studio - Plug-and-Play AI Video Dubbing
 ==================================================
-Created by TachikomaRed and smolemaru
+Created by George Chigrichenko (@georgeevil)
 Run: python server.py
 Open: http://localhost:8910
 """

@@ -254,10 +254,9 @@ multi-GPU worker pool. That is the "Full hosted SaaS" path: weeks of backend
 work, several new dependencies (payments, auth), and infrastructure decisions —
 and it would need `CONTRIBUTING.md`'s no-new-deps rule discussed first.
 
-Open, not blocking: the design's header note says "All creator references
-removed — brand is gochidubb only", but `README.md` currently credits
-@smolekoma and @smolemaru. Whether to strip those is a call for you, not a
-side effect of a UI redesign — flagged, untouched.
+Resolved: repo attribution is George Chigrichenko
+([@georgeevil](https://github.com/georgeevil), [x.com/GChigrichenko](https://x.com/GChigrichenko));
+the in-product brand remains gochidubb only.
 
 
 ## 10. What shipped, and what is still open
