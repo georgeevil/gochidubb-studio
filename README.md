@@ -839,7 +839,7 @@ Good first issues:
 
 ## 💖 Credits
 
-Built by **[George Chigrichenko](https://github.com/georgeevil)** &mdash; in collaboration with **[Claude](https://claude.ai)** (Anthropic).
+Originally created by TachikomaRed and smolemaru (MIT); maintained and developed by **[George Chigrichenko](https://github.com/georgeevil)** since July 2026 &mdash; in collaboration with **[Claude](https://claude.ai)** (Anthropic).
 
 Follow the build on X: [@GChigrichenko](https://x.com/GChigrichenko)
 
@@ -860,7 +860,7 @@ Standing on shoulders:
 
 ## 📜 License
 
-MIT — see [LICENSE](LICENSE). VoxCPM2 is Apache-2.0. edge-tts is GPL-3.0; using it doesn't require this project to be GPL because it's a runtime dependency invoked as a process.
+MIT — see [LICENSE](LICENSE). VoxCPM2 is Apache-2.0. edge-tts is GPL-3.0 and is imported as a Python library, so an installed environment combines MIT and GPL-3.0 code: fine for personal/local use and for running as a service, but if you redistribute a bundled binary that includes edge-tts, GPL-3.0 terms apply to that bundle.
 
 ---
 
