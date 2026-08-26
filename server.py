@@ -10264,6 +10264,9 @@ def _voice_preset_payload() -> dict:
             "file_size": v.get("file_size", 0),
             "file_ext": v.get("file_ext", ""),
             "audio_url": v.get("audio_url"),
+            # A bool, not the record — the record carries host/user details
+            # that no browser needs. Enforcement stays in _resolve_casting.
+            "consent": bool(v.get("consent")),
         })
     return {"presets": file_presets + style_presets}
 

@@ -1508,7 +1508,7 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
             </button>
           ))}
         </div>
-        <Field label="Voice preset" hint="Auto-clone uses each speaker's extracted reference. Pick a preset to override.">
+        <Field label="Voice preset" hint="Auto-clone uses each speaker's extracted reference. Pick a preset to override. Manage saved voices in Library → Voices.">
           <Select value={voicePreset} onChange={setVoicePreset}>
             <option value="auto" style={{ background: '#16161c' }}>auto · clone source</option>
             {voicePresets.map(p => (
@@ -1518,6 +1518,23 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
             ))}
           </Select>
         </Field>
+        {/* Deliberately not persisted to localStorage: a forgotten style
+            silently replaces source-voice cloning on every later job. */}
+        <div style={{ marginTop: 14 }}>
+          <Field label="Design a voice (optional)"
+                 hint="Describe a voice and VoxCPM designs it once for the whole
+                       job — e.g. 'deep calm male narrator, slow pace'. It replaces
+                       source-voice cloning for every speaker; a style preset's own
+                       description is overridden, and an uploaded reference file
+                       wins over both.">
+            <input
+              className="field"
+              value={voiceStyle}
+              onChange={e => setVoiceStyle(e.target.value)}
+              placeholder="e.g. warm female narrator, unhurried pace"
+            />
+          </Field>
+        </div>
         <div style={{ marginTop: 14 }}>
           <Field label="TTS speed">
             <div style={{ display: 'flex', gap: 6 }}>
@@ -1715,7 +1732,7 @@ function SubTab({ active, onClick, label }) {
   );
 }
 
-function FileSlot({ file, setFile, accept }) {
+function FileSlot({ file, setFile, accept, caption = 'video/audio · up to 4 GB' }) {
   const [drag, setDrag] = useState(false);
   const inputRef = useRef(null);
 
@@ -1766,7 +1783,7 @@ function FileSlot({ file, setFile, accept }) {
         color: 'var(--ink-2)',
       }}>{I.upload}</div>
       <div style={{ fontSize: 13, color: 'var(--ink)', marginBottom: 3 }}>Drop or click to choose</div>
-      <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)' }}>video/audio · up to 4 GB</div>
+      <div className="mono" style={{ fontSize: 10, color: 'var(--ink-4)' }}>{caption}</div>
     </div>
   );
 }
@@ -6389,13 +6406,427 @@ function SystemView({ system, onRefreshSystem }) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// VOICES VIEW (placeholder)
+// VOICES VIEW — the voice library (Library → Voices)
 // ═══════════════════════════════════════════════════════════════════
-function VoicesView() {
+
+// Mirrors _VOICE_NAME_RE / _VOICE_AUDIO_EXTS in server.py so a bad name or
+// file fails here with a message instead of a bare 400 from the endpoint.
+const VOICE_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9 _\-]{0,49}$/;
+const VOICE_EXTS = ['.wav', '.mp3', '.flac', '.ogg', '.m4a'];
+
+// MediaRecorder hands back webm/opus, which the preset endpoint rejects by
+// design (VoxCPM reads the file straight off disk). Re-encode to 16-bit
+// mono WAV in the page — same approach the Go phone page uses.
+async function recordingToWav(blob) {
+  const ac = new (window.AudioContext || window.webkitAudioContext)();
+  const buf = await ac.decodeAudioData(await blob.arrayBuffer());
+  const rate = buf.sampleRate;
+  const ch = buf.getChannelData(0);
+  const n = ch.length;
+  const out = new DataView(new ArrayBuffer(44 + n * 2));
+  const ws = (o, s) => { for (let i = 0; i < s.length; i++) out.setUint8(o + i, s.charCodeAt(i)); };
+  ws(0, 'RIFF'); out.setUint32(4, 36 + n * 2, true); ws(8, 'WAVE');
+  ws(12, 'fmt '); out.setUint32(16, 16, true); out.setUint16(20, 1, true);
+  out.setUint16(22, 1, true); out.setUint32(24, rate, true);
+  out.setUint32(28, rate * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true);
+  ws(36, 'data'); out.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, ch[i]));
+    out.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  try { ac.close(); } catch (_) {}
+  return new Blob([out], { type: 'audio/wav' });
+}
+
+function presetAudioUrl(p) {
+  // audio_url arrives unescaped ("file:My Voice" has a space); encodeURI
+  // keeps the path slashes while fixing the rest.
+  return encodeURI(p.audio_url || `/api/voice_presets/${p.id}/audio`);
+}
+
+// One player per row, stopped on unmount so switching tabs never leaves a
+// disembodied voice talking.
+function VoicePlayButton({ url }) {
+  const [playing, setPlaying] = useState(false);
+  const audioRef = useRef(null);
+  useEffect(() => () => { audioRef.current?.pause(); }, []);
+  const toggle = () => {
+    if (playing) { audioRef.current?.pause(); setPlaying(false); return; }
+    if (!audioRef.current) {
+      audioRef.current = new Audio(url);
+      audioRef.current.onended = () => setPlaying(false);
+      audioRef.current.onerror = () => setPlaying(false);
+    }
+    audioRef.current.currentTime = 0;
+    audioRef.current.play().then(() => setPlaying(true)).catch(() => setPlaying(false));
+  };
   return (
-    <div style={{ flex: 1, overflow: 'auto', padding: 'var(--pad)', background: 'var(--bg)' }}>
-      <div className="serif" style={{ fontSize: 'clamp(22px, 6vw, 32px)', marginBottom: 20 }}>Voice Library</div>
-      <div style={{ color: 'var(--ink-3)' }}>Voice library coming soon — check back.</div>
+    <button className="btn" onClick={toggle} style={{ minWidth: 72, justifyContent: 'center' }}>
+      {playing ? '■ Stop' : '▶ Play'}
+    </button>
+  );
+}
+
+function VoiceMetaChips({ p }) {
+  const kb = p.file_size ? (p.file_size > 1048576
+    ? (p.file_size / 1048576).toFixed(1) + ' MB'
+    : Math.round(p.file_size / 1024) + ' KB') : null;
+  const chips = [p.file_ext, kb, p.language, p.gender, ...(p.tags || [])].filter(Boolean);
+  return (
+    <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', alignItems: 'center' }}>
+      {chips.map((c, i) => <span key={i} className="chip mono" style={{ fontSize: 9 }}>{c}</span>)}
+      <span className="chip mono" style={{
+        fontSize: 9,
+        color: p.consent ? 'var(--accent)' : 'var(--ink-4)',
+        borderColor: p.consent ? 'var(--accent-dim)' : 'var(--line)',
+      }}>{p.consent ? 'consent ✓' : 'no consent record'}</span>
+    </div>
+  );
+}
+
+// Inline metadata editor shared by every row. PUT sends the full form —
+// the endpoint treats present fields as authoritative and that is what a
+// form that shows every field should do.
+function VoicePresetRow({ p, onChanged }) {
+  const [editing, setEditing] = useState(false);
+  const [confirmDel, setConfirmDel] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  const [form, setForm] = useState(null);
+
+  const startEdit = () => {
+    setForm({
+      name: p.name || '', description: p.description || '',
+      language: p.language || '', gender: p.gender || '',
+      tags: (p.tags || []).join(', '), consent: !!p.consent,
+    });
+    setErr(null); setEditing(true);
+  };
+
+  const save = async () => {
+    if (!VOICE_NAME_RE.test(form.name.trim())) {
+      setErr('Name must be 1–50 letters, digits, spaces, dashes or underscores, starting with a letter or digit.');
+      return;
+    }
+    setBusy(true); setErr(null);
+    const fd = new FormData();
+    fd.append('name', form.name.trim());
+    fd.append('description', form.description);
+    fd.append('language', form.language);
+    fd.append('gender', form.gender);
+    fd.append('tags', form.tags);
+    fd.append('consent_attested', form.consent ? 'true' : 'false');
+    try {
+      const r = await fetch(`/api/voice_presets/${encodeURIComponent(p.id)}`, { method: 'PUT', body: fd });
+      const d = await r.json();
+      if (d.ok) { setEditing(false); onChanged(); }
+      else setErr(d.error || 'Save failed');
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setBusy(false); }
+  };
+
+  const del = async () => {
+    if (!confirmDel) { setConfirmDel(true); setTimeout(() => setConfirmDel(false), 4000); return; }
+    setBusy(true);
+    try {
+      const r = await fetch(`/api/voice_presets/${encodeURIComponent(p.id)}`, { method: 'DELETE' });
+      const d = await r.json();
+      if (d.ok) onChanged();
+      else { setErr(d.error || 'Delete failed'); setBusy(false); }
+    } catch (e) { setErr(String(e.message || e)); setBusy(false); }
+  };
+
+  return (
+    <div style={{ background: 'var(--bg-1)', border: '1px solid var(--line)',
+                  borderRadius: 'var(--r-lg)', padding: '14px 16px' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+        <VoicePlayButton url={presetAudioUrl(p)}/>
+        <div style={{ flex: 1, minWidth: 180 }}>
+          <div style={{ fontSize: 13.5, fontWeight: 500 }}>{p.name}</div>
+          {p.description && (
+            <div style={{ fontSize: 11.5, color: 'var(--ink-3)', marginTop: 2, lineHeight: 1.45 }}>{p.description}</div>
+          )}
+          <div style={{ marginTop: 6 }}><VoiceMetaChips p={p}/></div>
+        </div>
+        <div style={{ display: 'flex', gap: 6 }}>
+          <button className="btn" onClick={editing ? () => setEditing(false) : startEdit}>
+            {editing ? 'Close' : 'Edit'}
+          </button>
+          <button className="btn" onClick={del} disabled={busy}
+                  style={{ color: confirmDel ? 'var(--err)' : undefined,
+                           borderColor: confirmDel ? 'var(--err)' : undefined }}>
+            {confirmDel ? 'Really delete?' : 'Delete'}
+          </button>
+        </div>
+      </div>
+      {editing && form && (
+        <div style={{ marginTop: 14, paddingTop: 14, borderTop: '1px solid var(--line)',
+                      display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
+            <Field label="Name">
+              <input className="field" value={form.name}
+                     onChange={e => setForm({ ...form, name: e.target.value })}/>
+            </Field>
+            <Field label="Language" hint="ISO code — en, ru, es …">
+              <input className="field" value={form.language}
+                     onChange={e => setForm({ ...form, language: e.target.value })}/>
+            </Field>
+            <Field label="Gender">
+              <Select value={form.gender} onChange={v => setForm({ ...form, gender: v })}>
+                {['', 'male', 'female', 'neutral'].map(g => (
+                  <option key={g} value={g} style={{ background: '#16161c' }}>{g || '—'}</option>
+                ))}
+              </Select>
+            </Field>
+          </div>
+          <Field label="Description">
+            <input className="field" value={form.description}
+                   onChange={e => setForm({ ...form, description: e.target.value })}/>
+          </Field>
+          <Field label="Tags" hint="Comma-separated">
+            <input className="field" value={form.tags}
+                   onChange={e => setForm({ ...form, tags: e.target.value })}/>
+          </Field>
+          <Toggle value={form.consent} onChange={v => setForm({ ...form, consent: v })}
+                  label="The voice's owner consented to cloning"
+                  hint="Recorded with the preset. Whether it is required is the
+                        voice-consent policy in Settings."/>
+          {err && <div style={{ color: 'var(--err)', fontSize: 12 }}>{err}</div>}
+          <div><button className="btn btn-primary" onClick={save} disabled={busy}>
+            {busy ? 'Saving…' : 'Save changes'}
+          </button></div>
+        </div>
+      )}
+      {!editing && err && <div style={{ color: 'var(--err)', fontSize: 12, marginTop: 8 }}>{err}</div>}
+    </div>
+  );
+}
+
+function AddVoiceCard({ onSaved }) {
+  const [name, setName] = useState('');
+  const [desc, setDesc] = useState('');
+  const [language, setLanguage] = useState('');
+  const [gender, setGender] = useState('');
+  const [tags, setTags] = useState('');
+  const [consent, setConsent] = useState(false);
+  const [file, setFile] = useState(null);
+  const [recBlob, setRecBlob] = useState(null);
+  const [recUrl, setRecUrl] = useState(null);
+  const [recording, setRecording] = useState(false);
+  const [recSecs, setRecSecs] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+  const recRef = useRef(null);   // { recorder, stream, timer }
+
+  const micOk = !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia);
+
+  const stopTracks = () => {
+    const r = recRef.current;
+    if (!r) return;
+    clearInterval(r.timer);
+    try { r.stream.getTracks().forEach(t => t.stop()); } catch (_) {}
+    recRef.current = null;
+  };
+  useEffect(() => () => stopTracks(), []);
+
+  const startRec = async () => {
+    setErr(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const recorder = new MediaRecorder(stream);
+      const chunks = [];
+      recorder.ondataavailable = e => { if (e.data.size) chunks.push(e.data); };
+      recorder.onstop = async () => {
+        stopTracks();
+        setRecording(false);
+        try {
+          const wav = await recordingToWav(new Blob(chunks, { type: recorder.mimeType }));
+          setRecBlob(wav);
+          setRecUrl(u => { if (u) URL.revokeObjectURL(u); return URL.createObjectURL(wav); });
+          setFile(null);   // the recording is now the source
+        } catch (e) { setErr('Could not encode the recording: ' + (e.message || e)); }
+      };
+      recorder.start();
+      setRecSecs(0); setRecording(true);
+      recRef.current = { recorder, stream, timer: setInterval(() => setRecSecs(s => s + 1), 1000) };
+    } catch (e) {
+      setErr('Microphone unavailable: ' + (e.message || e));
+    }
+  };
+  const stopRec = () => { try { recRef.current?.recorder.stop(); } catch (_) { setRecording(false); } };
+
+  const source = file || recBlob;
+  const save = async () => {
+    setErr(null);
+    const clean = name.trim();
+    if (!VOICE_NAME_RE.test(clean)) {
+      setErr('Name must be 1–50 letters, digits, spaces, dashes or underscores, starting with a letter or digit.');
+      return;
+    }
+    if (!source) { setErr('Pick an audio file or record a sample first.'); return; }
+    if (file) {
+      const ext = '.' + (file.name.split('.').pop() || '').toLowerCase();
+      if (!VOICE_EXTS.includes(ext)) {
+        setErr(`Unsupported file type '${ext}'. Use ${VOICE_EXTS.join(', ')}.`);
+        return;
+      }
+    }
+    setSaving(true);
+    const fd = new FormData();
+    fd.append('audio', file || new File([recBlob], clean + '.wav', { type: 'audio/wav' }));
+    fd.append('name', clean);
+    fd.append('description', desc);
+    fd.append('language', language);
+    fd.append('gender', gender);
+    fd.append('tags', tags);
+    fd.append('consent_attested', consent ? 'true' : 'false');
+    try {
+      const r = await fetch('/api/voice_presets', { method: 'POST', body: fd });
+      const d = await r.json();
+      if (d.ok) {
+        setName(''); setDesc(''); setLanguage(''); setGender(''); setTags('');
+        setConsent(false); setFile(null); setRecBlob(null);
+        setRecUrl(u => { if (u) URL.revokeObjectURL(u); return null; });
+        onSaved();
+      } else setErr(d.error || 'Upload failed');
+    } catch (e) { setErr(String(e.message || e)); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <div style={{ background: 'var(--bg-1)', border: '1px solid var(--line)',
+                  borderRadius: 'var(--r-lg)', padding: '16px 18px',
+                  display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ fontSize: 14, fontWeight: 600 }}>Add a voice</div>
+      <div style={{ fontSize: 11.5, color: 'var(--ink-3)', lineHeight: 1.5 }}>
+        10–30 seconds of clean speech from one person. It becomes a preset every
+        dub form can pick, and the Go phone page lists it too.
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 12 }}>
+        <Field label="Audio file" hint={VOICE_EXTS.join(' · ')}>
+          <FileSlot file={file} setFile={f => { setFile(f); if (f) { setRecBlob(null); setRecUrl(u => { if (u) URL.revokeObjectURL(u); return null; }); } }}
+                    accept={VOICE_EXTS.join(',')} caption="10–30s of clean speech"/>
+        </Field>
+        <Field label="Or record here"
+               hint={micOk ? 'Read anything out loud for ~20 seconds.'
+                           : 'Recording needs localhost or HTTPS — this address has no microphone API. Upload a file instead.'}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            {recording ? (
+              <>
+                <button className="btn" onClick={stopRec} style={{ color: 'var(--err)', borderColor: 'var(--err)' }}>■ Stop</button>
+                <span className="mono" style={{ fontSize: 12 }}>
+                  {Math.floor(recSecs / 60)}:{String(recSecs % 60).padStart(2, '0')}
+                </span>
+              </>
+            ) : (
+              <button className="btn" onClick={startRec} disabled={!micOk}>
+                {recBlob ? '● Re-record' : '● Record sample'}
+              </button>
+            )}
+            {recUrl && !recording && <audio controls src={recUrl} style={{ height: 30, flex: 1, minWidth: 120 }}/>}
+          </div>
+        </Field>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 10 }}>
+        <Field label="Name">
+          <input className="field" value={name} onChange={e => setName(e.target.value)}
+                 placeholder="e.g. My voice"/>
+        </Field>
+        <Field label="Language" hint="Optional — ISO code">
+          <input className="field" value={language} onChange={e => setLanguage(e.target.value)}
+                 placeholder="en"/>
+        </Field>
+        <Field label="Gender">
+          <Select value={gender} onChange={setGender}>
+            {['', 'male', 'female', 'neutral'].map(g => (
+              <option key={g} value={g} style={{ background: '#16161c' }}>{g || '—'}</option>
+            ))}
+          </Select>
+        </Field>
+      </div>
+      <Field label="Description" hint="Optional — shows in every voice picker">
+        <input className="field" value={desc} onChange={e => setDesc(e.target.value)}
+               placeholder="e.g. calm narration, recorded on the studio mic"/>
+      </Field>
+      <Field label="Tags" hint="Optional — comma-separated">
+        <input className="field" value={tags} onChange={e => setTags(e.target.value)}
+               placeholder="narration, deep"/>
+      </Field>
+      <Toggle value={consent} onChange={setConsent}
+              label="The voice's owner consented to cloning"
+              hint="Your own voice counts — tick it. Stored with the preset; the
+                    voice-consent policy in Settings decides if it is required."/>
+      {err && <div style={{ color: 'var(--err)', fontSize: 12 }}>{err}</div>}
+      <div>
+        <button className="btn btn-primary" onClick={save} disabled={saving || recording}>
+          {saving ? 'Saving…' : 'Save voice'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function VoicesView() {
+  const [presets, setPresets] = useState(null);
+  const [loadErr, setLoadErr] = useState(null);
+  const reload = () => fetch('/api/voice_presets').then(r => r.json())
+    .then(d => { setPresets(d.presets || []); setLoadErr(null); })
+    .catch(e => setLoadErr(String(e)));
+  useEffect(() => { reload(); }, []);
+
+  const files = (presets || []).filter(p => p.type === 'file');
+  // 'auto' is the dub form's default, not a voice — it has nothing to show here.
+  const styles = (presets || []).filter(p => p.type === 'style' && p.id !== 'auto');
+
+  return (
+    <div className="scroll" style={{ flex: 1, minHeight: 0 }}>
+      <div style={{ padding: 'var(--pad)', maxWidth: 900,
+                    display: 'flex', flexDirection: 'column', gap: 18 }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
+          <div className="serif" style={{ fontSize: 22 }}>Voice library</div>
+          {presets && (
+            <span className="mono" style={{ fontSize: 11, color: 'var(--ink-3)' }}>
+              {files.length} saved · {styles.length} built-in styles
+            </span>
+          )}
+        </div>
+
+        <AddVoiceCard onSaved={reload}/>
+
+        <div className="caps" style={{ marginTop: 6 }}>Your voices</div>
+        {presets === null && !loadErr && (
+          <div style={{ color: 'var(--ink-3)', fontSize: 12 }}>Loading…</div>
+        )}
+        {loadErr && <div style={{ color: 'var(--err)', fontSize: 12 }}>{loadErr}</div>}
+        {presets !== null && files.length === 0 && (
+          <div style={{ color: 'var(--ink-3)', fontSize: 12, lineHeight: 1.5 }}>
+            No saved voices yet. Upload or record one above — it shows up in the
+            dub form's Voice preset picker, in per-speaker casting, and on the
+            Go phone page.
+          </div>
+        )}
+        {files.map(p => <VoicePresetRow key={p.id} p={p} onChanged={reload}/>)}
+
+        {styles.length > 0 && (
+          <>
+            <div className="caps" style={{ marginTop: 6 }}>Built-in styles</div>
+            <div style={{ fontSize: 11.5, color: 'var(--ink-3)', lineHeight: 1.5, marginTop: -8 }}>
+              These are descriptions, not recordings — VoxCPM designs a fresh
+              voice from the text once per job. Pick them in the dub form, or
+              write your own description there under "Design a voice".
+            </div>
+            {styles.map(p => (
+              <div key={p.id} style={{ background: 'var(--bg-1)', border: '1px solid var(--line)',
+                                       borderRadius: 'var(--r-lg)', padding: '12px 16px' }}>
+                <div style={{ fontSize: 13, fontWeight: 500 }}>{p.name}</div>
+                <div className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)', marginTop: 3 }}>
+                  "{p.style}"
+                </div>
+              </div>
+            ))}
+          </>
+        )}
+      </div>
     </div>
   );
 }
