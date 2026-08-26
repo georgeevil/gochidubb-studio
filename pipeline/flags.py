@@ -380,7 +380,13 @@ def glossary_terms(glossary: Any, target_lang: str) -> Dict[str, str]:
             if dl and lang and dl != lang:
                 continue
             for k, v in (domain.get("terms") or {}).items():
-                if isinstance(k, str) and isinstance(v, str):
+                # A term value is a plain string or a {dst?, say?} object;
+                # `say` is a TTS respelling (pipeline/pronounce.py) — only
+                # `dst` is a translation to check against. A say-only entry
+                # has no dst and simply isn't a glossary decision here.
+                if isinstance(v, dict):
+                    v = v.get("dst")
+                if isinstance(k, str) and isinstance(v, str) and v.strip():
                     terms[k] = v
         return terms
     if isinstance(glossary, dict):

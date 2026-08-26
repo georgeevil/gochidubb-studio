@@ -73,6 +73,23 @@ FIELD_SPECS: dict = {
     # typo cannot turn into an arbitrary --remote-components argument.
     "ytdlp_remote_components": (str, ("", "ejs:github", "ejs:npm")),
     "download_rescue_llm":     (bool,),
+    # Review gates (see app/review_gates.py). These are the Pro defaults;
+    # any request that sends wizard_mode (creator.html, the CLI) suppresses
+    # them, so arming one here can never surprise those clients.
+    "review_gate_transcript":  (str, ("off", "on", "flagged_only")),
+    "review_gate_translation": (str, ("off", "on", "flagged_only")),
+    "review_gate_voice_cast":  (str, ("off", "on", "flagged_only")),
+    "review_gate_subtitles":   (str, ("off", "on", "flagged_only")),
+    "review_gate_final_qc":    (str, ("off", "on", "flagged_only")),
+    "voice_consent_policy":    (str, ("off", "warn", "require")),
+    # Loudness target for the assembled dub track (EBU R128 loudnorm).
+    "loudness_target":         (float, -31.0, -8.0),
+    "loudness_true_peak":      (float, -9.0, 0.0),
+    # Subtitle cue limits (pipeline/subtitles.py validator).
+    "subtitle_max_chars_per_line": (int, 16, 80),
+    "subtitle_max_lines":          (int, 1, 4),
+    "subtitle_max_cps":            (float, 5.0, 40.0),
+    "subtitle_min_gap_ms":         (int, 0, 1000),
 }
 
 _TRUTHY = ("1", "true", "yes", "on")
@@ -201,6 +218,39 @@ class UserConfig:
     reuse_translate_min_semantic: float = 0.67
     reuse_tts_max_failed_qa: float = 0.25
     qa_same_language: bool = False       # whisper-roundtrip QA on same-language dubs too
+
+    # ── Review gates ──────────────────────────────────────────────────
+    # Default gate mode per review point ("off" | "on" | "flagged_only").
+    # These apply only to submissions that did NOT send wizard_mode — see
+    # app/review_gates.py::resolve_gates for the precedence contract.
+    review_gate_transcript: str = "off"
+    review_gate_translation: str = "off"
+    review_gate_voice_cast: str = "off"
+    review_gate_subtitles: str = "off"
+    review_gate_final_qc: str = "off"
+
+    # ── Voice consent (CLD-272) ───────────────────────────────────────
+    # What happens when a cast resolves to cloning a real person's voice
+    # (the source speaker, or an uploaded file preset) with no consent
+    # attestation on record. "off" = today's behaviour; "warn" clones and
+    # marks the cast report; "require" downgrades that speaker to a preset.
+    voice_consent_policy: str = "off"    # "off" | "warn" | "require"
+
+    # ── Loudness (assembled dub track) ────────────────────────────────
+    # EBU R128 loudnorm targets for the final mix. -16 LUFS is the historic
+    # hardcoded default; -14 matches YouTube's normalization point, -23 EBU
+    # broadcast. Free numeric fields (bounded), not an enum — the UI offers
+    # presets over them but power users can type.
+    loudness_target: float = -16.0       # integrated loudness, LUFS
+    loudness_true_peak: float = -1.5     # true peak ceiling, dBTP
+
+    # ── Subtitles (review workbench validator) ────────────────────────
+    # Cue limits the subtitle validator holds cues against. The defaults
+    # mirror pipeline/subtitles.py::DEFAULT_LIMITS (Netflix-style).
+    subtitle_max_chars_per_line: int = 42
+    subtitle_max_lines: int = 2
+    subtitle_max_cps: float = 17.0
+    subtitle_min_gap_ms: int = 120
 
     # ── Output / render ───────────────────────────────────────────────
     # How the finished video is encoded. Defaults reproduce the behaviour
@@ -388,6 +438,18 @@ def _load_config() -> UserConfig:
         "YT_DLP_COOKIEFILE": "ytdlp_cookiefile",
         "YT_DLP_REMOTE_COMPONENTS": "ytdlp_remote_components",
         "GOCHIDUBB_DOWNLOAD_RESCUE_LLM": "download_rescue_llm",
+        "GOCHIDUBB_GATE_TRANSCRIPT": "review_gate_transcript",
+        "GOCHIDUBB_GATE_TRANSLATION": "review_gate_translation",
+        "GOCHIDUBB_GATE_VOICE_CAST": "review_gate_voice_cast",
+        "GOCHIDUBB_GATE_SUBTITLES": "review_gate_subtitles",
+        "GOCHIDUBB_GATE_FINAL_QC": "review_gate_final_qc",
+        "GOCHIDUBB_CONSENT_POLICY": "voice_consent_policy",
+        "GOCHIDUBB_LOUDNESS_TARGET": "loudness_target",
+        "GOCHIDUBB_LOUDNESS_TRUE_PEAK": "loudness_true_peak",
+        "GOCHIDUBB_SUBTITLE_MAX_CHARS_PER_LINE": "subtitle_max_chars_per_line",
+        "GOCHIDUBB_SUBTITLE_MAX_LINES": "subtitle_max_lines",
+        "GOCHIDUBB_SUBTITLE_MAX_CPS": "subtitle_max_cps",
+        "GOCHIDUBB_SUBTITLE_MIN_GAP_MS": "subtitle_min_gap_ms",
         "MAX_SOURCE_DURATION_SEC": "max_source_duration_sec",
         "PUBLISH_DESCRIPTION_TEMPLATE": "publish_description_template",
     }

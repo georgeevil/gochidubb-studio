@@ -102,6 +102,7 @@ async def gochidubb_dub(
     scheduled_at: Optional[float] = None,
     voxcpm_cfg: float = 0.0,
     voxcpm_steps: int = 0,
+    review_gates: Optional[dict] = None,
     wait: bool = False,
     wait_timeout: float = 1800.0,
 ) -> dict:
@@ -130,11 +131,19 @@ async def gochidubb_dub(
             hard — heavy accent, noisy reference, awkward language pair.
         voxcpm_steps: Per-job VoxCPM inference steps, 4-24. 0 (default)
             follows the global setting and the tts_speed tier.
+        review_gates: Per-stage pause config superseding wizard_mode, e.g.
+            {"translation": "on", "subtitles": "flagged_only"} over gates
+            transcript / translation / voice_cast / subtitles / final_qc
+            (modes off | on | flagged_only). Each armed gate parks the job
+            at an awaiting_* status; act on it (gochidubb_get_flags,
+            gochidubb_edit_translations) then gochidubb_continue_job.
         wait: If True, block until job finishes and return final status + url.
             Ignored for scheduled jobs (they start later).
         wait_timeout: Max seconds to wait when wait=True.
 
-    Returns dict with `job_id`. If wait=True, also `status` and `url`.
+    Returns dict with `job_id`. If wait=True, also `status` and `url` —
+    or `pending_gate` when the job parked at a review gate instead of
+    finishing.
     """
     c = await _get_client()
     res = await c.submit_dub(
@@ -146,12 +155,15 @@ async def gochidubb_dub(
         context_hint=context_hint, wizard_mode=wizard_mode,
         mode=mode, scheduled_at=scheduled_at,
         voxcpm_cfg=voxcpm_cfg, voxcpm_steps=voxcpm_steps,
+        review_gates=review_gates,
     )
     job_id = res.get("job_id")
     if wait and job_id and not res.get("scheduled_at"):
         final = await c.wait_for_job(job_id, timeout=wait_timeout)
         res["status"] = final.get("status")
         res["error"] = final.get("error")
+        if final.get("pending_gate"):
+            res["pending_gate"] = final["pending_gate"]
         if final.get("status") == "complete":
             res["url"] = c.output_url(job_id)
     return res
@@ -462,8 +474,9 @@ async def gochidubb_quality_report(job_id: str) -> dict:
     """Per-stage quality report for a job: 0-100 scores (asr, translation,
     tts, timing, loudness) + overall + actionable verdicts.
 
-    Each verdict's `suggested_action` names an existing server capability
-    (retry_tts / edit_translations / regenerate_segment / retranslate), so
+    Each verdict's `suggested_action` is now a tool you can actually call:
+    edit_translations -> gochidubb_edit_translations, retranslate /
+    retry_tts -> gochidubb_retry_stage (stage 'translate' or 'tts'), so
     you can act on the report mechanically. Stages with `available: false`
     were not measured — do not treat them as perfect."""
     c = await _get_client()
@@ -478,6 +491,73 @@ async def gochidubb_audit_job(job_id: str) -> dict:
     segments listed. `ok: false` means at least one loss finding."""
     c = await _get_client()
     return await c.audit(job_id)
+
+
+@mcp.tool()
+async def gochidubb_retry_stage(
+    job_id: str,
+    stage: str,
+    stop_after: str = "",
+    overrides: Optional[dict] = None,
+) -> dict:
+    """Re-run one pipeline stage (and everything after it) from the
+    previous stage's checkpoint.
+
+    Args:
+        job_id: The job to retry.
+        stage: One of download, extract, transcribe, diarize, translate,
+            tts, assemble, merge. Costs follow the stage: translate is
+            cheap, tts re-synthesizes.
+        stop_after: Optionally halt after a later stage instead of running
+            to the end (e.g. stage='translate', stop_after='translate' to
+            inspect a retranslation before paying for TTS).
+        overrides: Pipeline settings to change for this run, whitelisted
+            server-side. Pass {"review_gates": {...}} to re-arm gates so
+            the retried run pauses for review again.
+    """
+    c = await _get_client()
+    return await c.retry_stage(job_id, stage, stop_after=stop_after,
+                               overrides=overrides)
+
+
+@mcp.tool()
+async def gochidubb_get_flags(job_id: str, max_flags: int = 5) -> dict:
+    """The handful of translated spans worth attention before synthesis —
+    inconsistent renderings, untransliterated names, glossary misses.
+
+    Recomputed on every call, so it reflects edits already applied through
+    gochidubb_edit_translations. Use while a job is parked at the
+    translation gate; fix what matters, then gochidubb_continue_job."""
+    c = await _get_client()
+    return await c.get_flags(job_id, max_flags=max_flags)
+
+
+@mcp.tool()
+async def gochidubb_edit_translations(job_id: str, edits: dict) -> dict:
+    """Rewrite the translated line for one or more segments in the saved
+    checkpoint. `edits` maps segment idx to the new text, e.g.
+    {"41": "…y luego Marta Nieves vino al programa."}. Subtitles re-export
+    automatically; follow with gochidubb_continue_job to proceed."""
+    c = await _get_client()
+    return await c.edit_translations(job_id, edits)
+
+
+@mcp.tool()
+async def gochidubb_add_glossary_term(
+    term: str,
+    target_lang: str,
+    translation: str = "",
+    say: str = "",
+    domain: str = "",
+) -> dict:
+    """Teach the glossary one term for one target language: a rendering
+    (`translation`), a pronunciation respelling (`say`, e.g. "goh-chee" —
+    spoken by TTS but never shown in subtitles), or both. Applies to every
+    later translation for that language, across jobs."""
+    c = await _get_client()
+    return await c.add_glossary_term(term, translation=translation,
+                                     target_lang=target_lang,
+                                     domain=domain, say=say)
 
 
 # ─────────────────────────────────────────────────────────────────────

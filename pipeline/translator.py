@@ -150,7 +150,13 @@ _BUILTIN_GLOSSARY = {
 USER_GLOSSARY_FILE = os.path.join(os.path.dirname(__file__), "..", "presets", "user_glossary.json")
 
 def _load_user_glossary(target_lang: str = "ru") -> Dict:
-    """Load user-defined glossary terms for one target language."""
+    """Load user-defined glossary terms for one target language.
+
+    A term's value is a plain string (the translation) or a
+    ``{dst?, say?}`` object — `say` is a TTS respelling that belongs to
+    pipeline/pronounce.py, so only `dst` matters here. An object without
+    `dst` is a pronunciation-only entry and never reaches the prompt.
+    """
     if not os.path.exists(USER_GLOSSARY_FILE):
         return {}
     try:
@@ -160,7 +166,11 @@ def _load_user_glossary(target_lang: str = "ru") -> Dict:
             terms = {}
             for domain in data.get("domains", []):
                 if domain.get("target_lang") == target_lang:
-                    terms.update(domain.get("terms", {}))
+                    for k, v in (domain.get("terms") or {}).items():
+                        if isinstance(v, dict):
+                            v = v.get("dst")
+                        if isinstance(v, str) and v.strip():
+                            terms[k] = v
             return terms
     except Exception as e:
         log.warning(f"Failed to load user glossary: {e}")
@@ -1554,6 +1564,11 @@ async def translate_segments(
     # keep their surrounding context.
     keys: List[Optional[str]] = []
     for s in segments:
+        # A segment a human marked non_speech is never sent to the model —
+        # whatever the ASR heard there is noise, not a line to translate.
+        if s.get("non_speech"):
+            keys.append(None)
+            continue
         text = (s.get("text") or "").strip()
         keys.append(" ".join(text.lower().split()) if text else None)
     repeats = {
@@ -1567,7 +1582,9 @@ async def translate_segments(
     for i, s in enumerate(segments):
         key = keys[i]
         if key is None:
-            s["translated_text"] = ""
+            # Keep an existing translation (a non_speech mark after a
+            # translate run must not wipe what is already there).
+            s["translated_text"] = s.get("translated_text") or ""
             continue
         if key in repeats and key in first_seen:
             slot_of[i] = first_seen[key]

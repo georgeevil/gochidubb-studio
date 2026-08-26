@@ -213,7 +213,8 @@ from app.db import init_db, save_job_sync, load_all_jobs, delete_job_db
 from app import (logbuf, artifact_store, reuse_runtime, reuse as app_reuse,
                  activity, apikeys as app_apikeys, webhooks as app_webhooks,
                  billing as app_billing, audit as app_audit,
-                 estimate as app_estimate, admin as app_admin)
+                 estimate as app_estimate, admin as app_admin,
+                 review_gates as app_review_gates)
 
 
 # Force UTF-8 stdout for foreign-language transcripts on Windows cp1252 consoles
@@ -819,15 +820,19 @@ async def _job_queue_worker():
             #   1. Auto lip-sync (Wav2Lip) if the job opted in.
             #   2. Showcase stitch if this was the last sibling in a showcase batch.
             # Both are best-effort — failures log but don't fail the job.
+            # "Returned cleanly" now includes "paused at a review gate" —
+            # the success hooks only make sense once the job actually
+            # finished (a gated sibling reaches them via the continue path).
+            done = job_id in jobs and jobs[job_id].get("status") == "complete"
             try:
-                if job_id in jobs and jobs[job_id].get("lip_sync"):
+                if done and jobs[job_id].get("lip_sync"):
                     log.info(f"[queue] post-hook: running auto lip-sync on {job_id}")
                     await asyncio.get_event_loop().run_in_executor(
                         None, _run_wav2lip_sync, job_id)
             except Exception as e:
                 log.warning(f"[lipsync] auto hook failed: {e}", exc_info=True)
             try:
-                if job_id in jobs and jobs[job_id].get("batch_kind") == "showcase":
+                if done and jobs[job_id].get("batch_kind") == "showcase":
                     await _maybe_assemble_showcase(jobs[job_id].get("batch_id", ""))
             except Exception as e:
                 log.warning(f"[showcase] post-process hook failed: {e}", exc_info=True)
@@ -1332,6 +1337,9 @@ def scan_file_presets() -> dict:
             "language": meta.get("language", ""),     # iso code or empty
             "tags": meta.get("tags", []) if isinstance(meta.get("tags"), list) else [],
             "created_at": meta.get("created_at"),
+            # Consent attestation captured at preset save (CLD-272); absent
+            # on presets uploaded before the checkbox existed.
+            "consent": meta.get("consent"),
             # File facts (computed, not stored)
             "file_size": path.stat().st_size if path.exists() else 0,
             "file_ext": path.suffix.lower().lstrip("."),
@@ -1477,6 +1485,26 @@ def _source_ref_for(speaker: str, ctx: dict, job_id: str) -> str:
     return fallback if fallback and os.path.exists(fallback) else ""
 
 
+# Where a "require" consent policy sends a speaker whose real voice may not
+# be cloned: the first built-in designed voice. Designed voices are drawn
+# from a text description — nobody's voice, so nothing to attest.
+_CONSENT_FALLBACK_PRESET = "male_warm"
+
+
+def _clone_consent_attested(kind: str, speaker: str, job_id: str,
+                            voice_id: str) -> bool:
+    """Is there an attestation for cloning this real voice?
+
+    kind "source": the record lives on the job (POST /consent).
+    kind "file": the record lives in the preset's metadata sidecar,
+    captured when the preset was saved.
+    """
+    if kind == "source":
+        job = jobs.get(job_id) or {}
+        return bool((job.get("voice_consent") or {}).get(speaker))
+    return bool(scan_file_presets().get(voice_id, {}).get("consent"))
+
+
 async def _resolve_casting(cast: dict, speakers, ctx: dict, job_id: str,
                            engine, target_lang: str) -> tuple:
     """Turn {speaker: voice_id} into ({speaker: ref_wav}, {speaker: ""}, report).
@@ -1487,6 +1515,13 @@ async def _resolve_casting(cast: dict, speakers, ctx: dict, job_id: str,
     (deleted preset file, failed render) degrades to the source voice for
     that speaker alone and says so in the report, rather than taking the
     whole dub down or silently recasting everyone.
+
+    cfg.voice_consent_policy guards the casts that clone a real person —
+    the source speaker, or an uploaded file preset. "warn" clones anyway
+    and marks the report entry `consent: "missing"`; "require" downgrades
+    that speaker to _CONSENT_FALLBACK_PRESET with the reason on the report.
+    Designed voices are exempt: they are drawn from a description, not
+    from anyone.
     """
     choices = _voice_choices()
     refs, transcripts, report = {}, {}, []
@@ -1533,6 +1568,49 @@ async def _resolve_casting(cast: dict, speakers, ctx: dict, job_id: str,
             if not chosen:
                 report.append({"speaker": sp, "voice": resolved_id,
                                "status": "no_source_ref", "used": "none"})
+
+        # ── Consent policy (CLD-272) ─────────────────────────────────
+        policy = getattr(cfg, "voice_consent_policy", "off")
+        consent_missing = False
+        if chosen and policy in ("warn", "require"):
+            clone_kind = None
+            if want.startswith("file:") and chosen != src:
+                clone_kind = "file"
+            elif chosen == src:
+                clone_kind = "source"
+            if clone_kind and not _clone_consent_attested(
+                    clone_kind, sp, job_id, want):
+                if policy == "require":
+                    fb_spec = VOICE_PRESETS.get(_CONSENT_FALLBACK_PRESET) or {}
+                    fb = await _blocking(
+                        _materialize_designed_voice, engine,
+                        fb_spec.get("style", ""), fb_spec.get("seed"),
+                        target_lang,
+                    ) if fb_spec.get("style") else ""
+                    if fb:
+                        chosen = fb
+                        resolved_id = _CONSENT_FALLBACK_PRESET
+                        report.append({
+                            "speaker": sp, "voice": want,
+                            "status": "no_consent",
+                            "used": _CONSENT_FALLBACK_PRESET,
+                            "reason": "no clone consent · using preset",
+                        })
+                        log.warning(f"[consent] {sp}: no attestation for "
+                                    f"{clone_kind} clone — recast to "
+                                    f"{_CONSENT_FALLBACK_PRESET}")
+                    else:
+                        # A failed fallback render must not take the dub
+                        # down — degrade to warn behaviour and say so.
+                        consent_missing = True
+                        log.warning(f"[consent] {sp}: fallback preset failed "
+                                    f"to render; cloning WITHOUT consent "
+                                    f"(policy=require)")
+                else:
+                    consent_missing = True
+                    log.warning(f"[consent] {sp}: cloning {clone_kind} voice "
+                                f"without an attestation (policy=warn)")
+
         if chosen:
             refs[sp] = chosen
             # Empty transcript = Controllable Cloning (reference only). A
@@ -1542,6 +1620,10 @@ async def _resolve_casting(cast: dict, speakers, ctx: dict, job_id: str,
             if not any(r["speaker"] == sp for r in report):
                 report.append({"speaker": sp, "voice": resolved_id,
                                "status": "ok", "used": resolved_id})
+            if consent_missing:
+                for r in report:
+                    if r["speaker"] == sp:
+                        r["consent"] = "missing"
 
     return refs, transcripts, report
 
@@ -1550,6 +1632,10 @@ async def _resolve_casting(cast: dict, speakers, ctx: dict, job_id: str,
 async def lifespan(app: FastAPI):
     # Init SQLite store (creates table + migrates legacy JSON files)
     init_db(BASE / "gochidubb.db")
+    # Activity-feed persistence (hasattr: tolerate an app/activity.py from
+    # before attach_store existed — the feed then stays in-memory only).
+    if hasattr(activity, "attach_store"):
+        activity.attach_store(BASE / "gochidubb.db")
     # Beta stage-reuse store, same file as the job store.
     artifact_store.init_store(BASE / "gochidubb.db")
     load_jobs_from_disk()
@@ -1729,13 +1815,19 @@ def _tool_for_path(path: str) -> str:
 
 _MAIN_LOOP = None
 
-# Job status -> the webhook event it corresponds to. Only these three fire;
-# they are the ones the design names.
+# Job status -> the webhook event it corresponds to. Only these three events
+# fire; they are the ones the design names. Every awaiting_* gate status maps
+# to job.awaiting_review — awaiting_transcript_review was missing from this
+# table for as long as it existed, so the transcript gate silently fired no
+# webhook at all.
 _WEBHOOK_EVENT_FOR_STATUS = {
     "complete": "job.completed",
     "error": "job.failed",
+    "awaiting_transcript_review": "job.awaiting_review",
     "awaiting_translation_review": "job.awaiting_review",
     "awaiting_voice_review": "job.awaiting_review",
+    "awaiting_subtitle_review": "job.awaiting_review",
+    "awaiting_final_qc": "job.awaiting_review",
 }
 
 
@@ -1955,8 +2047,11 @@ def _serialize_segments(segments: list) -> list:
             "text": s.get("text", ""),
             "speaker": s.get("speaker", "SPEAKER_00"),
         }
+        # `non_speech` is pipeline-meaningful state (a human ruled the
+        # segment out of synthesis), unlike tts_text, which stays off this
+        # whitelist deliberately — see pipeline/pronounce.py.
         for opt in ("translated_text", "audio_path", "qa_score", "tts_tier",
-                    "qa", "avg_logprob", "no_speech_prob",
+                    "qa", "avg_logprob", "no_speech_prob", "non_speech",
                     "word_conf_mean", "word_conf_min"):
             if s.get(opt) is not None:
                 item[opt] = s.get(opt)
@@ -2707,6 +2802,37 @@ def _finalize_translation(job, work, ctx, update, perf) -> None:
     )
 
 
+def _say_map_for(target_lang: str) -> dict:
+    """{term: respelling} from the user glossary for this target language.
+
+    Never fatal: pronunciation is a nicety, and a broken glossary file must
+    not take a TTS stage down with it.
+    """
+    try:
+        from pipeline.pronounce import build_say_map
+        return build_say_map(_read_user_glossary(), target_lang)
+    except Exception as e:
+        log.warning(f"[pronounce] say map unavailable ({e})")
+        return {}
+
+
+def _compose_tts_texts(segments: list, style_prefix: str,
+                       say_map: dict) -> int:
+    """Write tts_text through the one seam (pipeline/pronounce.py) for every
+    segment it applies to. Returns how many segments got one."""
+    if not style_prefix and not say_map:
+        return 0
+    from pipeline.pronounce import compose_tts_text
+    n = 0
+    for s in segments:
+        composed = compose_tts_text(s, style_prefix=style_prefix,
+                                    say_map=say_map)
+        if composed is not None:
+            s["tts_text"] = composed
+            n += 1
+    return n
+
+
 async def _stage_tts(job, work, ctx, update, perf):
     tts = get_tts_engine()
     tts_dir = str(work / "tts_segments")
@@ -2817,26 +2943,31 @@ async def _stage_tts(job, work, ctx, update, perf):
         voice_seed=voice_seed,
     )
 
-    # Apply Voice Design prefix ONLY in voice_design mode (VoxCPM-only:
-    # edge-tts would literally read the style description out loud).
+    # Compose tts_text through the one seam (pipeline/pronounce.py):
+    # glossary `say` respellings for every VoxCPM segment, plus the Voice
+    # Design style prefix ONLY in voice_design mode (VoxCPM-only either way:
+    # edge-tts and F5 never read tts_text, so they can never speak either).
     #
     # It goes on `tts_text`, NOT `translated_text`. The prefix is an
-    # instruction to the model, not part of the dialogue, and
-    # `translated_text` is what the rest of the system treats as the line:
-    # the assemble stage rewrites subtitles.srt from it, the translation
-    # editor shows it, and the partial-retry reuse check compares it. Writing
-    # the prefix there put "(middle-aged male voice, warm and calm, clear
-    # articulation)" at the head of all 1602 subtitle lines of a real dub,
-    # and made every reuse comparison mismatch (prefixed checkpoint text vs
-    # clean translation text), so a partial TTS retry re-synthesized
-    # everything. `tts_text` is absent from _serialize_segments' whitelist,
-    # so it never reaches a checkpoint.
-    if mode == "voice_design" and isinstance(tts_used, VoxCPMSynthesizer):
-        style = eff_style.strip().strip("()")
-        for s in segments:
-            base = s.get("translated_text") or s.get("text", "")
-            if base and not base.startswith("("):
-                s["tts_text"] = f"({style}){base}"
+    # instruction to the model (and a respelling is a phonetic stand-in),
+    # not part of the dialogue, and `translated_text` is what the rest of
+    # the system treats as the line: the assemble stage rewrites
+    # subtitles.srt from it, the translation editor shows it, and the
+    # partial-retry reuse check compares it. Writing the prefix there put
+    # "(middle-aged male voice, warm and calm, clear articulation)" at the
+    # head of all 1602 subtitle lines of a real dub, and made every reuse
+    # comparison mismatch (prefixed checkpoint text vs clean translation
+    # text), so a partial TTS retry re-synthesized everything. `tts_text` is
+    # absent from _serialize_segments' whitelist, so it never reaches a
+    # checkpoint — and is therefore recomputed here on every run, which is
+    # what makes a glossary edit apply on retry.
+    if isinstance(tts_used, VoxCPMSynthesizer):
+        style = eff_style.strip().strip("()") if mode == "voice_design" else ""
+        n_composed = _compose_tts_texts(
+            segments, style, _say_map_for(target_lang))
+        if n_composed:
+            log.info(f"[tts] Composed tts_text for {n_composed} segment(s) "
+                     f"(style={'yes' if style else 'no'})")
 
     # Keep already-rendered segments when this is a partial retry
     if ctx.get("tts_keep_existing"):
@@ -2856,6 +2987,17 @@ async def _stage_tts(job, work, ctx, update, perf):
                 if (old.get("translated_text") or "").strip() != \
                         (s.get("translated_text") or "").strip():
                     continue
+                # Same words are not enough — a speaker merge/reassign since
+                # the last run means this audio was synthesized in the OLD
+                # speaker's voice. Seeds are deterministic per (job, speaker,
+                # segment), so reusing it would leave one line in a ghost's
+                # voice inside an otherwise consistent dub. Checkpoints from
+                # before the speaker field was whitelisted carry no speaker at
+                # all — those can't have seen a relabel, so absence on either
+                # side is a match, not a mismatch.
+                old_spk, new_spk = old.get("speaker"), s.get("speaker")
+                if old_spk and new_spk and old_spk != new_spk:
+                    continue
                 if os.path.exists(old["audio_path"]):
                     s["audio_path"] = old["audio_path"]
                     recovered += 1
@@ -2867,6 +3009,15 @@ async def _stage_tts(job, work, ctx, update, perf):
                  f"existing segment(s), synthesizing {len(todo)}")
     else:
         todo = segments
+
+    # Segments a human marked as non-speech (music, crowd noise, a cough the
+    # diarizer labeled a speaker) are never synthesized. They stay in the
+    # list — indices must not shift — they simply get no audio_path, which
+    # the assembler already treats as "place nothing here".
+    n_non_speech = sum(1 for s in todo if s.get("non_speech"))
+    if n_non_speech:
+        todo = [s for s in todo if not s.get("non_speech")]
+        log.info(f"[tts] Skipping {n_non_speech} non-speech segment(s)")
 
     def synth_progress(done, total):
         pct = 65 + int((done / max(total, 1)) * 20)
@@ -2959,6 +3110,9 @@ async def _stage_assemble(job, work, ctx, update, perf):
         assemble_dubbed_audio,
         segments, ctx["duration"], dubbed_wav,
         ctx.get("sample_rate", 48000), apply_loudnorm=True,
+        loudness_target=getattr(cfg, "loudness_target", None),
+        loudness_true_peak=getattr(cfg, "loudness_true_peak", None),
+        fit_overrides=_sync_fit_overrides(job),
     )
     _save_placements(work, segments)
     ctx["dubbed_wav"] = dubbed_wav
@@ -2973,11 +3127,12 @@ async def _stage_assemble(job, work, ctx, update, perf):
     # Rewrite the subtitles against that timeline. The first write happens
     # back in the translate stage, before a single segment has been placed,
     # so its timings leave the SRT out of sync with the audio by however far
-    # the dub had to shift.
+    # the dub had to shift. Cue-based: display overrides applied, .vtt
+    # written alongside the .srt.
     try:
-        write_srt(segments, str(work / "subtitles.srt"))
+        _write_subtitle_files(job, work, segments)
     except Exception as e:
-        log.warning(f"Could not rewrite SRT against dubbed timings: {e}")
+        log.warning(f"Could not rewrite subtitles against dubbed timings: {e}")
     # Persist what the assembler measured (previously log-only): how many
     # segments needed atempo stretching, and the ffmpeg loudnorm measurement
     # (input/output LUFS, true peak, LRA) parsed from print_format=json.
@@ -3015,14 +3170,16 @@ async def _stage_merge(job, work, ctx, update, perf):
         perf["mp4_mb"] = round(os.path.getsize(output_mp4) / 1024 / 1024, 1)
     except OSError:
         pass
+    # No status here: the driver owns the complete transition (a final_qc
+    # gate must be able to intercept before job.completed fires — see the
+    # tail of run_pipeline_stages). This stage only publishes its artifacts.
     update(
-        status="complete",
         progress=100,
         output_url=f"/outputs/{job['id']}/dubbed_video.mp4?v={int(time.time())}",
         completed_at=time.time(),
-        step_detail="Done!",
+        step_detail="Rendered — finishing up",
     )
-    log.info(f"Pipeline complete: {output_mp4}")
+    log.info(f"Pipeline render complete: {output_mp4}")
 
 
 async def _finalize_reupload(job, work, ctx, update):
@@ -3088,45 +3245,130 @@ STAGE_HANDLERS = {
 # ─────────────────────────────────────────────────────────────
 # Pipeline driver
 # ─────────────────────────────────────────────────────────────
-def _wizard_pause_after(stage_id: str, ctx: dict) -> Optional[tuple]:
-    """Return (status, detail, checkpoint) if the wizard pauses after a stage."""
-    mode = ctx.get("wizard_mode", "auto")
-    if stage_id == "diarize" and mode == "review_transcript":
-        return ("awaiting_transcript_review",
-                "Review transcription — edit or approve to continue",
-                "transcription_done")
-    if stage_id == "translate" and mode == "review_translation":
-        return ("awaiting_translation_review",
-                "Review translation — edit, retranslate, or approve to continue",
-                "translation_done")
-    if stage_id == "translate" and mode == "review_voices":
-        # After translate, not after diarize, even though the speaker
-        # references exist by then. Casting is only worth reviewing if you can
-        # hear it, and a preview has to speak the lines the dub will actually
-        # speak — at the diarize gate the text is still in the source
-        # language, so a cross-lingual preview would demonstrate the wrong
-        # phonetics. Translation is minutes; the stage this gate protects is
-        # hours (a measured 12.25h for 1602 segments), so the gate still sits
-        # in front of essentially all of the cost.
-        return ("awaiting_voice_review",
-                "Cast the voices — assign one per speaker, preview, then continue",
-                "translation_done")
-    return None
+# One evaluator behind every human pause. The gate model (which gates exist,
+# which stage boundary arms each one, what status/checkpoint each parks at,
+# how off/on/flagged_only resolve) lives in app/review_gates.py; this section
+# adapts it to the driver — findings computation, the legacy quality gate,
+# and the pause tuple the loop consumes.
+#
+# Gates are deliberately placed *before* the expensive stage each one
+# protects: transcription is checked before a translator is paid for it,
+# translation before the GPU synthesizes it. A gate after the last stage can
+# only ask for a retry; a gate before one can save the work entirely.
 
-
-# Which stage's gate runs after which pipeline stage, and where it parks.
-# Deliberately placed *before* the expensive stage each one protects:
-# transcription is checked before a translator is paid for it, translation
-# before the GPU synthesizes it. A gate after the last stage can only ask for
-# a retry; a gate before one can save the work entirely.
-_GATE_AFTER_STAGE = {
-    "diarize": ("asr", "awaiting_transcript_review", "transcription_done"),
-    "translate": ("translation", "awaiting_translation_review", "translation_done"),
+# What the pause status line tells the user, per gate.
+_GATE_DETAILS = {
+    "transcript": "Review transcription — edit or approve to continue",
+    "translation": ("Review translation — edit, retranslate, or approve "
+                    "to continue"),
+    "voice_cast": ("Cast the voices — assign one per speaker, preview, "
+                   "then continue"),
+    "subtitles": "Review subtitles — edit cues or approve to continue",
+    "final_qc": "Final QC — review the checklist, then approve to deliver",
 }
 
+# The legacy score-driven quality gate checks one quality stage per boundary.
+_LEGACY_QUALITY_STAGE = {"diarize": "asr", "translate": "translation"}
 
-def _quality_gate_after(stage_id: str, ctx: dict, job: dict,
-                        job_id: str) -> Optional[tuple]:
+
+def _resolved_review_gates(explicit: Optional[dict], wizard_mode: Optional[str],
+                           job: dict) -> dict:
+    """Resolve a job's effective gate set (see review_gates.resolve_gates).
+
+    Showcase siblings force the subtitle and final_qc gates off regardless of
+    what was asked: _maybe_assemble_showcase fires when the last sibling
+    *completes*, and one sibling parked at QC would stall the whole reel.
+    quick_test batches gate normally — they are Pro's main fan-out.
+    """
+    gates = app_review_gates.resolve_gates(
+        explicit, wizard_mode, app_review_gates.defaults_from_cfg(cfg))
+    if (job or {}).get("batch_kind") == "showcase":
+        gates["subtitles"] = "off"
+        gates["final_qc"] = "off"
+    return gates
+
+
+def _parse_review_gates_form(raw: str):
+    """(explicit dict | None, error string | None) from a form field.
+
+    Empty string means "not sent" — wizard_mode/cfg decide. The JSON is
+    validated here so a submit with a typo'd gate name is a 400 at submit
+    time, not a silently unarmed gate discovered hours into a dub.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None
+    try:
+        explicit = json.loads(raw)
+        return app_review_gates.sanitize_explicit(explicit), None
+    except (ValueError, TypeError) as e:
+        return None, f"Bad review_gates: {e}"
+
+
+def _gate_findings(gate_name: str, ctx: dict, job: dict,
+                   job_id: str) -> Optional[int]:
+    """Findings count for one flagged_only gate; None when uncomputable.
+
+    None makes first_pending() pause — a review the user explicitly asked
+    for must not be skipped because its check crashed (see the fail-safe
+    note in app/review_gates.py).
+    """
+    segments = ctx.get("segments") or []
+    target_lang = ctx.get("target_lang") or job.get("target_lang") or ""
+    source_lang = ctx.get("effective_src") or ""
+    try:
+        if gate_name == "transcript":
+            from pipeline.quality import full_report, gate
+            result = gate(full_report(segments, target_lang=target_lang,
+                                      source_lang=source_lang), "asr")
+            return 0 if result["pass"] else max(len(result["reasons"]), 1)
+
+        if gate_name == "translation":
+            from pipeline.quality import full_report, gate
+            n = len(flag_segments(
+                segments, target_lang=target_lang, source_lang=source_lang,
+                glossary=_read_user_glossary(), max_flags=20))
+            result = gate(full_report(segments, target_lang=target_lang,
+                                      source_lang=source_lang), "translation")
+            if not result["pass"]:
+                n += max(len(result["reasons"]), 1)
+            return n
+
+        if gate_name == "voice_cast":
+            speakers = {s.get("speaker") for s in segments if s.get("speaker")}
+            cast = ctx.get("speaker_voice_map") or {}
+            return 1 if len(speakers) > 1 and not cast else 0
+
+        if gate_name == "subtitles":
+            # pipeline/subtitles.py may not exist yet (it lands with the
+            # subtitle workbench task) — ImportError falls through to the
+            # fail-safe None below, exactly like any other compute failure.
+            from pipeline import subtitles as _subs
+            cues = _subs.build_cues(segments, job.get("subtitle_overrides"))
+            return len(_subs.validate_cues(cues, _subtitle_limits()))
+
+        if gate_name == "final_qc":
+            return _build_qc_checklist(job_id)["warn_count"]
+    except Exception as e:
+        log.warning(f"[gate] {gate_name} findings uncomputable ({e}) — "
+                    f"pausing for review instead of shipping unreviewed")
+        return None
+    return 0
+
+
+def _subtitle_limits() -> dict:
+    """Subtitle validator limits from cfg (fields land with the subtitle
+    task; getattr defaults mirror pipeline.subtitles.DEFAULT_LIMITS)."""
+    return {
+        "max_chars_per_line": int(getattr(cfg, "subtitle_max_chars_per_line", 42)),
+        "max_lines": int(getattr(cfg, "subtitle_max_lines", 2)),
+        "max_cps": float(getattr(cfg, "subtitle_max_cps", 17.0)),
+        "min_gap_ms": int(getattr(cfg, "subtitle_min_gap_ms", 120)),
+    }
+
+
+def _legacy_quality_pause(stage_id: str, ctx: dict, job: dict,
+                          job_id: str) -> Optional[tuple]:
     """Pause the job when this stage's output is not worth building on.
 
     Off unless `quality_gate` is enabled, and never fatal: a scorer that
@@ -3140,10 +3382,9 @@ def _quality_gate_after(stage_id: str, ctx: dict, job: dict,
     # degrade to "gate off" rather than failing the whole pipeline.
     if not getattr(cfg, "quality_gate", False):
         return None
-    mapping = _GATE_AFTER_STAGE.get(stage_id)
-    if not mapping:
+    stage_name = _LEGACY_QUALITY_STAGE.get(stage_id)
+    if not stage_name:
         return None
-    stage_name, status, cp_name = mapping
     try:
         from pipeline.quality import full_report, gate
         report = full_report(
@@ -3173,10 +3414,64 @@ def _quality_gate_after(stage_id: str, ctx: dict, job: dict,
     why = "; ".join(result["reasons"])
     log.warning(f"[gate] {stage_name} gate FAILED for {job_id}: {why}")
     app_audit.record("job.quality_gate", target=job_id, detail=why)
+    # Park at the boundary's first gate so /continue's one-gate bookkeeping
+    # treats a quality pause exactly like a requested review of the same
+    # artifact ("transcript" for diarize, "translation" for translate).
+    gate_name = app_review_gates.BOUNDARY_GATES[stage_id][0]
+    status, cp_name = app_review_gates.GATE_STATUS[gate_name]
+    job["pending_gate"] = gate_name
     return (status,
             f"Paused by the {stage_name} quality gate — {why}. "
             f"Review, retranslate, or continue anyway.",
             cp_name)
+
+
+def _evaluate_gate(stage_id: str, ctx: dict, job: dict,
+                   job_id: str) -> Optional[tuple]:
+    """Return (status, detail, checkpoint) if a gate pauses after this stage.
+
+    Order: requested gates first (in boundary order — translation before
+    voice_cast at the translate boundary), then the legacy score-driven
+    quality gate as a backstop when the boundary's own gate is off. A
+    cleared gate (see job["gates_cleared"]) never re-fires until its stage
+    is re-run — that is what lets /continue advance exactly one gate without
+    destroying the pause config.
+    """
+    if stage_id not in app_review_gates.BOUNDARY_GATES:
+        return None
+    gates = ctx.get("review_gates")
+    if not isinstance(gates, dict):
+        # Legacy checkpoint / legacy queued job: derive from wizard_mode the
+        # way submissions always have, and remember the answer so the next
+        # checkpoint carries it.
+        gates = _resolved_review_gates(None, ctx.get("wizard_mode", "auto"), job)
+        ctx["review_gates"] = gates
+        job.setdefault("review_gates", gates)
+    cleared = ctx.get("gates_cleared") or []
+
+    findings: dict = {}
+    for g in app_review_gates.BOUNDARY_GATES[stage_id]:
+        if gates.get(g) == "flagged_only" and g not in cleared:
+            findings[g] = _gate_findings(g, ctx, job, job_id)
+
+    pending = app_review_gates.first_pending(stage_id, gates, cleared, findings)
+    if pending:
+        status, cp_name = app_review_gates.GATE_STATUS[pending]
+        detail = _GATE_DETAILS[pending]
+        count = findings.get(pending)
+        if gates.get(pending) == "flagged_only":
+            detail += (f" ({count} finding(s))" if isinstance(count, int)
+                       else " (checks could not run — reviewing to be safe)")
+        job["pending_gate"] = pending
+        return (status, detail, cp_name)
+
+    # Legacy auto-gate backstop: only when this boundary's own gate is off
+    # and not already cleared — an armed gate handled (or skipped) the same
+    # artifact above, and a cleared one was just approved by a human.
+    first_gate = app_review_gates.BOUNDARY_GATES[stage_id][0]
+    if gates.get(first_gate, "off") == "off" and first_gate not in cleared:
+        return _legacy_quality_pause(stage_id, ctx, job, job_id)
+    return None
 
 
 async def run_pipeline_stages(
@@ -3249,6 +3544,10 @@ async def run_pipeline_stages(
             # Anchor for the failure log window: if this stage dies, the UI
             # shows exactly the ring entries produced since this point.
             job["_stage_log_from"] = logbuf.current_seq()
+            # Re-running a stage re-arms its boundary's gates and every later
+            # one — a retranslate must pause at the translation gate again.
+            ctx["gates_cleared"] = job["gates_cleared"] = \
+                app_review_gates.reset_cleared(sid, ctx.get("gates_cleared"))
             update(
                 status=spec["status"], progress=lo, stage_id=sid,
                 step_detail=spec["hint"],
@@ -3299,13 +3598,13 @@ async def run_pipeline_stages(
             _save_checkpoint(job_id, work, stage=spec["checkpoint"],
                              data=_ctx_for_checkpoint(ctx))
 
-            pause = _wizard_pause_after(sid, ctx) or _quality_gate_after(
-                sid, ctx, job, job_id)
+            pause = _evaluate_gate(sid, ctx, job, job_id)
             if pause:
                 status, detail, cp_name = pause
                 update(status=status, progress=hi, step_detail=detail,
                        checkpoint_stage=cp_name)
-                log.info(f"[wizard] Paused after '{sid}' for job {job_id}")
+                log.info(f"[gate] Paused after '{sid}' for job {job_id} "
+                         f"(gate={job.get('pending_gate')})")
                 return
 
         # A partial run (stop_after set, or a stage list that doesn't reach
@@ -3327,6 +3626,15 @@ async def run_pipeline_stages(
                     stage_id=None,
                     checkpoint_stage=PIPELINE_STAGES[stop_i]["checkpoint"],
                 )
+        else:
+            # The driver, not _stage_merge, owns the final transition: a
+            # final_qc gate has to intercept *before* "complete" (and its
+            # job.completed webhook) fires, so merge only publishes its
+            # artifacts and the complete happens here — one firing site,
+            # shared with nothing. (_finalize_reupload above keeps its own
+            # complete: reupload jobs never gate.)
+            job.pop("pending_gate", None)
+            update(status="complete", step_detail="Done!")
 
         log.info(
             f"[perf] ═ pipeline job={job_id} finished "
@@ -3387,17 +3695,27 @@ async def run_pipeline(
     # Per-job VoxCPM overrides; 0 = follow Settings → Voice & TTS (CLD-189)
     voxcpm_cfg: float = 0.0,
     voxcpm_steps: int = 0,
+    # Resolved {gate: mode} dict from the submit route; None = resolve here
+    # from wizard_mode (legacy enqueue sites, batch/showcase fan-outs).
+    review_gates: Optional[dict] = None,
 ):
     """Main dubbing pipeline entry point.
 
     Builds the initial stage context from the request and runs every stage.
-    When wizard_mode != 'auto' the driver pauses at the matching checkpoint
-    with status='awaiting_review' so the user can inspect/edit intermediate
-    results before continuing."""
+    An armed review gate (from `review_gates`, wizard_mode, or cfg defaults —
+    see app/review_gates.py) makes the driver pause at the matching
+    checkpoint so the user can inspect/edit intermediate results before
+    continuing."""
     job = jobs[job_id]
     job["wizard_mode"] = wizard_mode
     job["mode"] = normalize_job_mode(mode) or "dub"
+    gates = (dict(review_gates) if isinstance(review_gates, dict)
+             else _resolved_review_gates(None, wizard_mode, job))
+    job["review_gates"] = gates
+    job["gates_cleared"] = []
     ctx = {
+        "review_gates": gates,
+        "gates_cleared": [],
         "source": source,
         "source_lang": source_lang,
         "target_lang": target_lang,
@@ -4388,6 +4706,7 @@ async def start_dub(
     tts_speed: str = Form("balanced"),
     wizard_mode: str = Form("auto"),  # "auto" | "review_translation"
                                       # | "review_transcript" | "review_voices"
+    review_gates: str = Form(""),  # JSON {gate: mode}; wins over wizard_mode
     auto_denoise: bool = Form(False),
     lip_sync: bool = Form(False),  # if True, auto-run Wav2Lip after pipeline completes
     mode: str = Form("dub"),  # "dub" | "reupload" (3E: reupload = no dubbing)
@@ -4404,6 +4723,10 @@ async def start_dub(
         voxcpm_cfg, voxcpm_steps)
     if _vox_err:
         return JSONResponse({"error": _vox_err}, 400)
+
+    explicit_gates, _gate_err = _parse_review_gates_form(review_gates)
+    if _gate_err:
+        return JSONResponse({"error": _gate_err}, 400)
 
     # Validate translation model exists in Ollama - fall back gracefully
     # otherwise. Reupload jobs never translate, so they skip the check —
@@ -4503,6 +4826,9 @@ async def start_dub(
     # time arrives (and survives restarts, since both persist to disk).
     now = time.time()
     is_scheduled = scheduled_at > now + 10  # 10s grace for clock skew
+    # Resolved at submit so the UI can show the job's gates while it is
+    # still queued/scheduled; run_pipeline takes this dict as-is.
+    resolved_gates = _resolved_review_gates(explicit_gates, wizard_mode, {})
     pipeline_args = {
         "source": actual_source,
         "source_lang": source_lang,
@@ -4521,6 +4847,7 @@ async def start_dub(
         "mode": mode,
         "voxcpm_cfg": voxcpm_cfg,
         "voxcpm_steps": voxcpm_steps,
+        "review_gates": resolved_gates,
     }
 
     jobs[job_id] = {
@@ -4542,6 +4869,8 @@ async def start_dub(
         "voxcpm_cfg": voxcpm_cfg,
         "voxcpm_steps": voxcpm_steps,
         "wizard_mode": wizard_mode,
+        "review_gates": resolved_gates,
+        "gates_cleared": [],
         "lip_sync": bool(lip_sync),
         "mode": mode,
         "created": time.time(),
@@ -5295,6 +5624,7 @@ async def start_quick_test(
     context_hint: str = Form(""),
     batch_label: str = Form(""),
     wizard_mode: str = Form("auto"),       # "auto" | "review_translation" | …
+    review_gates: str = Form(""),          # JSON {gate: mode}; wins over wizard_mode
     lip_sync: bool = Form(False),
     scheduled_at: float = Form(0.0),
     voxcpm_cfg: float = Form(0.0),         # 0 = use the global setting
@@ -5321,6 +5651,12 @@ async def start_quick_test(
         voxcpm_cfg, voxcpm_steps)
     if _vox_err:
         return JSONResponse({"error": _vox_err}, 400)
+    explicit_gates, _gate_err = _parse_review_gates_form(review_gates)
+    if _gate_err:
+        return JSONResponse({"error": _gate_err}, 400)
+    # quick_test batches gate normally (they're Pro's main fan-out); only
+    # showcase batches force the delivery gates off, in _resolved_review_gates.
+    resolved_gates = _resolved_review_gates(explicit_gates, wizard_mode, {})
     if not video and not source.strip():
         return JSONResponse({"error": "Provide either a video file or a URL"}, 400)
     if video and source.strip():
@@ -5421,6 +5757,8 @@ async def start_quick_test(
                 "whisper_model": whisper_model,
                 "keep_bg": keep_bg,
                 "wizard_mode": wizard_mode,
+                "review_gates": dict(resolved_gates),
+                "gates_cleared": [],
                 "lip_sync": lip_sync,
                 "auto_denoise": auto_denoise,
                 # Every sibling shares the source's metadata; the translate
@@ -5469,6 +5807,7 @@ async def start_quick_test(
             "auto_denoise": auto_denoise,
             "voxcpm_cfg": voxcpm_cfg,
             "voxcpm_steps": voxcpm_steps,
+            "review_gates": dict(resolved_gates),
         }
 
     async def _materialize():
@@ -7311,17 +7650,23 @@ async def _run_tts_and_merge_stage(
             log.info(f"[stage] Designed voice materialised: "
                      f"{os.path.basename(designed)}")
         else:
-            # Fall back to the per-segment style prefix. It goes on
-            # `tts_text`, never `translated_text`: the SRT, the translation
-            # editor and the assembler's emotion-tag heuristic all read the
-            # latter and must not see a model instruction.
             log.warning("[stage] Could not materialise the designed voice; "
                         "falling back to per-segment voice design")
-            style = eff_style.strip().strip("()")
-            for s in segments:
-                base = s.get("translated_text") or s.get("text", "")
-                if base and not base.startswith("("):
-                    s["tts_text"] = f"({style}){base}"
+
+    # Compose tts_text through the one seam — glossary `say` respellings for
+    # every VoxCPM segment, plus the per-segment style prefix when the
+    # designed voice could not be materialised above. It goes on `tts_text`,
+    # never `translated_text`: the SRT, the translation editor and the
+    # assembler's emotion-tag heuristic all read the latter and must not see
+    # a model instruction. Recomputed here on every re-run, so a glossary
+    # edit applies to retry_tts / redub / per-segment regen too.
+    if isinstance(tts_used, VoxCPMSynthesizer):
+        style = eff_style.strip().strip("()") if mode == "voice_design" else ""
+        n_composed = _compose_tts_texts(
+            segments, style, _say_map_for(target_lang_for_voice))
+        if n_composed:
+            log.info(f"[stage] Composed tts_text for {n_composed} segment(s) "
+                     f"(style={'yes' if style else 'no'})")
 
     # Preserve-mode: skip TTS for segments that already have valid audio
     if preserve_existing_audio_paths:
@@ -7337,6 +7682,13 @@ async def _run_tts_and_merge_stage(
         synth_input = todo
     else:
         synth_input = segments
+
+    # Human-marked non-speech segments are never synthesized; they keep
+    # their place in the list (indices must not shift) with no audio_path.
+    n_non_speech = sum(1 for s in synth_input if s.get("non_speech"))
+    if n_non_speech:
+        synth_input = [s for s in synth_input if not s.get("non_speech")]
+        log.info(f"[stage] Skipping {n_non_speech} non-speech segment(s)")
 
     tts_dir = str(work / tts_subdir)
     total = len(synth_input)
@@ -7377,8 +7729,10 @@ async def _run_tts_and_merge_stage(
                 progress_callback=synth_progress,
             )
 
-    # Re-merge synth_input back into segments list if preserve-mode
-    if preserve_existing_audio_paths:
+    # Re-merge synth_input back into segments when it became a subset —
+    # preserve-mode, or a non-speech filter above. (Engines mutate the
+    # segment dicts in place, but merging by idx doesn't rely on that.)
+    if preserve_existing_audio_paths or n_non_speech:
         by_idx = {s.get("idx"): s for s in segments}
         for s in synth_input:
             if s.get("idx") in by_idx:
@@ -7393,7 +7747,11 @@ async def _run_tts_and_merge_stage(
     update(status="assembling", progress=88, step_detail="Assembling dubbed audio...")
     dubbed_wav = str(work / audio_output_name)
     assemble_dubbed_audio(segments, state["duration"], dubbed_wav,
-                          tts_used.sample_rate, apply_loudnorm=True)
+                          tts_used.sample_rate, apply_loudnorm=True,
+                          loudness_target=getattr(cfg, "loudness_target", None),
+                          loudness_true_peak=getattr(cfg, "loudness_true_peak",
+                                                     None),
+                          fit_overrides=_sync_fit_overrides(job))
     _save_placements(work, segments)
 
     update(status="merging", progress=93, step_detail="Rendering final video...")
@@ -7602,6 +7960,7 @@ _RETRY_OVERRIDE_KEYS = {
     "tts_speed", "auto_denoise", "wizard_mode", "reference_audio",
     "skip_diarization", "translate_failed_only", "tts_keep_existing",
     "voxcpm_cfg", "voxcpm_steps", "bg_volume", "bg_ducking",
+    "review_gates",
 }
 
 # Retry overrides that are numbers handed straight to VoxCPM rather than
@@ -8208,13 +8567,23 @@ async def retry_stage(
         for k in ("stage", "job_id", "saved_at"):
             ctx.pop(k, None)
 
-    # A retry always runs to the end unless told otherwise, so drop any
-    # wizard pause inherited from the original run.
-    ctx["wizard_mode"] = "auto"
+    # A retry always runs to the end unless told otherwise: every gate is
+    # off, UNLESS the override payload re-arms some via `review_gates` —
+    # that is how the workbench's re-assemble comes back to the QC screen.
+    # ("auto" as wizard_mode makes resolve start from all-off; the explicit
+    # dict, validated, lands on top.)
+    try:
+        ctx["review_gates"] = _resolved_review_gates(
+            ov.get("review_gates"), "auto", job)
+    except ValueError as e:
+        return JSONResponse({"error": f"Bad review_gates: {e}"}, 400)
+    ctx["gates_cleared"] = []
     for k, v in ov.items():
         if k not in _RETRY_OVERRIDE_KEYS:
             log.warning(f"[retry] Ignoring non-overridable key '{k}'")
             continue
+        if k == "review_gates":
+            continue  # resolved above, not copied raw
         if k in _RETRY_NUMERIC_KEYS:
             try:
                 v = coerce_field(k, v) if v not in (None, "", 0, "0") else 0
@@ -8235,6 +8604,9 @@ async def retry_stage(
 
     _clear_job_error(job)
     job.pop("cancel_requested", None)
+    job.pop("pending_gate", None)
+    job["review_gates"] = dict(ctx["review_gates"])
+    job["gates_cleared"] = []
     job["status"] = "queued"
     job["step_detail"] = f"Queued — retrying from '{stage}'"
     # Surface the changed settings on the job so History/Result reflect them.
@@ -8380,15 +8752,14 @@ async def edit_translations(job_id: str, edits: str = Form(...)):
     work = OUTPUT_DIR / job_id
     _save_checkpoint(job_id, work, stage="translation_done", data=cp)
 
-    # Re-export SRT with the user's edits so .srt download always matches
-    # what gets spoken. Also update tts_done if it exists (per-segment
-    # regen panel uses it for translated_text display).
+    # Re-export subtitles with the user's edits so the .srt/.vtt downloads
+    # always match what gets spoken. Also update tts_done if it exists
+    # (per-segment regen panel uses it for translated_text display).
     if n_edited > 0:
         try:
-            srt_path = str(work / "subtitles.srt")
-            write_srt(cp.get("segments", []), srt_path)
+            _write_subtitle_files(jobs[job_id], work, cp.get("segments", []))
         except Exception as e:
-            log.warning(f"[edit] SRT re-export failed: {e}")
+            log.warning(f"[edit] subtitle re-export failed: {e}")
         tcp = _load_checkpoint(job_id, "tts_done")
         if tcp:
             tcp_segs = tcp.get("segments", [])
@@ -8448,6 +8819,269 @@ async def edit_speaker_ref(
              f"({n_updated} checkpoints updated)")
     return {"ok": True, "speaker_id": speaker_id,
             "new_ref_path": user_ref, "checkpoints_updated": n_updated}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Speaker relabeling (CLD-267) — merge/reassign/rename/mark_non_speech
+# ═══════════════════════════════════════════════════════════════════════
+
+_SPEAKER_EDIT_OPS = ("merge", "reassign", "rename", "mark_non_speech")
+# Statuses where speaker edits are safe: the job is parked before TTS was
+# committed. The post-TTS review statuses (subtitle/final QC) are absent on
+# purpose — merging speakers under synthesized audio is what the reuse
+# speaker-equality check exists to survive, not what a route should invite.
+_SPEAKER_EDIT_STATUSES = {
+    "awaiting_transcript_review", "awaiting_translation_review",
+    "awaiting_voice_review", "paused", "error", "interrupted",
+}
+
+
+def _speaker_edit_refusal(job: dict) -> Optional[str]:
+    """None when this job may edit speakers now, else the reason not to."""
+    status = job.get("status") or ""
+    if status in _BUSY_STATUSES:
+        return f"Job is {status} — wait for it to pause before editing speakers"
+    if status not in _SPEAKER_EDIT_STATUSES:
+        return (f"Job is {status} — speakers can only be edited while parked "
+                f"at a pre-TTS review (or paused/errored)")
+    if not _load_checkpoint(job.get("id") or "", "transcription_done"):
+        return "No transcription checkpoint yet — nothing to relabel"
+    return None
+
+
+def _validate_speaker_ops(raw) -> tuple:
+    """(clean ops list, error string|None)."""
+    if not isinstance(raw, list) or not raw:
+        return [], "ops must be a non-empty array"
+    if len(raw) > 100:
+        return [], "Too many ops in one request (100 max)"
+    clean = []
+    for i, op in enumerate(raw):
+        if not isinstance(op, dict):
+            return [], f"ops[{i}] must be an object"
+        kind = op.get("op")
+        if kind not in _SPEAKER_EDIT_OPS:
+            return [], (f"ops[{i}].op must be one of "
+                        f"{', '.join(_SPEAKER_EDIT_OPS)}")
+        if kind == "merge":
+            src = str(op.get("from") or "").strip()
+            dst = str(op.get("into") or "").strip()
+            if not src or not dst or src == dst:
+                return [], f"ops[{i}]: merge needs distinct 'from' and 'into'"
+            clean.append({"op": "merge", "from": src, "into": dst})
+        elif kind == "reassign":
+            to = str(op.get("to") or "").strip()
+            try:
+                idx = int(op.get("segment_idx"))
+            except (TypeError, ValueError):
+                return [], f"ops[{i}]: reassign needs an integer segment_idx"
+            if not to:
+                return [], f"ops[{i}]: reassign needs 'to'"
+            clean.append({"op": "reassign", "segment_idx": idx, "to": to})
+        elif kind == "rename":
+            sp = str(op.get("speaker") or "").strip()
+            label = str(op.get("label") or "").strip()
+            if not sp or not label or len(label) > 80:
+                return [], f"ops[{i}]: rename needs 'speaker' and a label ≤80 chars"
+            clean.append({"op": "rename", "speaker": sp, "label": label})
+        else:  # mark_non_speech
+            idxs = op.get("segment_idxs")
+            if not isinstance(idxs, list) or not idxs:
+                return [], f"ops[{i}]: mark_non_speech needs segment_idxs"
+            try:
+                idxs = sorted({int(x) for x in idxs})
+            except (TypeError, ValueError):
+                return [], f"ops[{i}]: segment_idxs must be integers"
+            clean.append({"op": "mark_non_speech", "segment_idxs": idxs})
+    return clean, None
+
+
+def _apply_speaker_ops(job: dict, ops: list) -> dict:
+    """Apply validated ops to one job: both resumable checkpoints
+    (mirroring edit_speaker_ref's write-through) plus the job-level cast
+    map and display labels. Returns per-op counts.
+
+    Indices never shift: merge/reassign rewrite `speaker`, mark_non_speech
+    sets a flag — segments stay exactly where they are, so flags,
+    regenerate_segment and placements keep their idx keying.
+    """
+    job_id = job["id"]
+    work = OUTPUT_DIR / job_id
+    counts = {"merged_segments": 0, "reassigned": 0, "renamed": 0,
+              "marked_non_speech": 0, "checkpoints_updated": 0}
+
+    for stage in ("transcription_done", "translation_done"):
+        cp = _load_checkpoint(job_id, stage)
+        if not cp:
+            continue
+        segs = cp.get("segments") or []
+        first_cp = counts["checkpoints_updated"] == 0
+        for op in ops:
+            if op["op"] == "merge":
+                n = 0
+                for s in segs:
+                    if s.get("speaker") == op["from"]:
+                        s["speaker"] = op["into"]
+                        n += 1
+                # The ghost's artifacts go with them: their reference clip
+                # entry (merged segments inherit `into`'s cast/refs) and
+                # their seat in the casting map.
+                for key in ("speaker_refs", "speaker_transcripts",
+                            "source_speaker_refs", "speaker_voice_map"):
+                    if isinstance(cp.get(key), dict):
+                        cp[key].pop(op["from"], None)
+                if first_cp:
+                    counts["merged_segments"] += n
+            elif op["op"] == "reassign":
+                for s in segs:
+                    if s.get("idx") == op["segment_idx"]:
+                        s["speaker"] = op["to"]
+                        if first_cp:
+                            counts["reassigned"] += 1
+            elif op["op"] == "mark_non_speech":
+                wanted = set(op["segment_idxs"])
+                for s in segs:
+                    if s.get("idx") in wanted:
+                        s["non_speech"] = True
+                        if first_cp:
+                            counts["marked_non_speech"] += 1
+            # rename is display-only — job-level, below.
+        _save_checkpoint(job_id, work, stage=stage, data=cp)
+        counts["checkpoints_updated"] += 1
+
+    labels = dict(job.get("speaker_labels") or {})
+    cast = dict(job.get("speaker_voice_map") or {})
+    for op in ops:
+        if op["op"] == "rename":
+            labels[op["speaker"]] = op["label"]
+            counts["renamed"] += 1
+        elif op["op"] == "merge":
+            cast.pop(op["from"], None)
+            labels.pop(op["from"], None)
+    if labels:
+        job["speaker_labels"] = labels
+    if "speaker_voice_map" in job:
+        job["speaker_voice_map"] = cast
+    save_job(job)
+    return counts
+
+
+def _speaker_summary(job_id: str, labels: dict) -> list:
+    """Per-speaker rows after an edit, from the freshest edited checkpoint."""
+    cp = (_load_checkpoint(job_id, "translation_done")
+          or _load_checkpoint(job_id, "transcription_done")) or {}
+    rows: dict = {}
+    for s in cp.get("segments") or []:
+        sp = s.get("speaker") or "SPEAKER_00"
+        row = rows.setdefault(sp, {"speaker": sp, "segments": 0,
+                                   "seconds": 0.0, "non_speech": 0})
+        if s.get("non_speech"):
+            row["non_speech"] += 1
+            continue
+        row["segments"] += 1
+        try:
+            row["seconds"] += max(float(s.get("end", 0)) -
+                                  float(s.get("start", 0)), 0.0)
+        except (TypeError, ValueError):
+            pass
+    out = []
+    for sp in sorted(rows):
+        row = rows[sp]
+        row["seconds"] = round(row["seconds"], 1)
+        row["label"] = (labels or {}).get(sp, "")
+        out.append(row)
+    return out
+
+
+@app.post("/api/dub/{job_id}/speakers/edit")
+async def edit_speakers(job_id: str, request: _ScoutRequest):
+    """Merge, reassign, rename or mark-non-speech diarized speakers.
+
+    Body: {"ops": [{"op": "merge", "from": "S2", "into": "S1"} | {"op":
+    "reassign", "segment_idx": 7, "to": "S1"} | {"op": "rename", "speaker":
+    "S1", "label": "Coach"} | {"op": "mark_non_speech", "segment_idxs":
+    [3, 4]}], "apply_to_siblings": false}.
+
+    Writes through both resumable checkpoints, exactly like
+    edit_speaker_ref, so /continue and every stage retry see the same
+    speakers. Only allowed while the job is parked pre-TTS — merging under
+    already-synthesized audio is the one window where a relabel could speak
+    in a ghost's voice. Sibling fan-out is explicit, never automatic:
+    apply_to_siblings applies the same ops to every batch sibling that also
+    passes the guard, and the response says what happened to each.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    job = jobs[job_id]
+    refusal = _speaker_edit_refusal(job)
+    if refusal:
+        return JSONResponse({"error": refusal}, 409)
+
+    body = await _json_body(request)
+    ops, err = _validate_speaker_ops(body.get("ops"))
+    if err:
+        return JSONResponse({"error": err}, 400)
+
+    counts = _apply_speaker_ops(job, ops)
+    log.info(f"[speakers] job={job_id} applied {len(ops)} op(s): {counts}")
+
+    siblings = []
+    if body.get("apply_to_siblings") and job.get("batch_id"):
+        for sib in list(jobs.values()):
+            if (sib.get("batch_id") != job.get("batch_id")
+                    or sib.get("id") == job_id):
+                continue
+            sib_refusal = _speaker_edit_refusal(sib)
+            if sib_refusal:
+                siblings.append({"job_id": sib.get("id"), "ok": False,
+                                 "reason": sib_refusal})
+                continue
+            sib_counts = _apply_speaker_ops(sib, ops)
+            siblings.append({"job_id": sib.get("id"), "ok": True,
+                             "applied": sib_counts})
+        log.info(f"[speakers] job={job_id} fanned out to "
+                 f"{sum(1 for s in siblings if s['ok'])}/{len(siblings)} "
+                 f"sibling(s)")
+
+    return {"ok": True, "job_id": job_id, "applied": counts,
+            "speakers": _speaker_summary(job_id, job.get("speaker_labels")),
+            "siblings": siblings}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Voice consent (CLD-272) — attestation records, enforced by policy
+# ═══════════════════════════════════════════════════════════════════════
+
+def _consent_record() -> dict:
+    """One attestation, same shape everywhere it is stored."""
+    return {"attested_by": "local", "attested_at": time.time(),
+            "scope": "dubbing"}
+
+
+@app.post("/api/dub/{job_id}/consent")
+async def attest_voice_consent(job_id: str, speaker: str = Form(""),
+                               attested: bool = Form(False)):
+    """Record (or withdraw) a consent attestation for cloning one source
+    speaker's voice. A plain job field, so it survives redub and retry via
+    save_job. Enforcement happens in _resolve_casting, per
+    cfg.voice_consent_policy."""
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    speaker = (speaker or "").strip()
+    if not speaker:
+        return JSONResponse({"error": "speaker is required"}, 400)
+    job = jobs[job_id]
+    consent = dict(job.get("voice_consent") or {})
+    if attested:
+        consent[speaker] = _consent_record()
+    else:
+        consent.pop(speaker, None)
+    job["voice_consent"] = consent
+    save_job(job)
+    log.info(f"[consent] job={job_id} speaker={speaker} "
+             f"{'attested' if attested else 'withdrawn'}")
+    return {"ok": True, "job_id": job_id, "speaker": speaker,
+            "attested": bool(attested), "voice_consent": consent}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -8619,8 +9253,11 @@ async def set_voice_casting(job_id: str, request: _ScoutRequest):
 async def preview_voice_casting(job_id: str, request: _ScoutRequest):
     """Synthesize a couple of real lines per speaker in the proposed cast.
 
-    Body: {"map": {...}, "per_speaker": 1}. The map is optional — without it
-    the saved cast is previewed. Nothing is persisted: this renders into
+    Body: {"map": {...}, "per_speaker": 1, "text": ""}. The map is optional —
+    without it the saved cast is previewed. `text`, when present, is
+    synthesized verbatim once per requested speaker instead of picking real
+    lines — the pronunciation editor's ▶ passes a sentence containing the
+    respelling here. Nothing is persisted: this renders into
     outputs/<job>/voice_preview/ and hands back URLs, so auditioning a cast
     never touches the dub.
     """
@@ -8640,6 +9277,11 @@ async def preview_voice_casting(job_id: str, request: _ScoutRequest):
         return JSONResponse({"error": "Nothing to preview yet"}, 409)
 
     body = await _json_body(request)
+    custom_text = str(body.get("text") or "").strip()
+    if len(custom_text) > 500:
+        return JSONResponse(
+            {"error": f"Preview text is too long ({len(custom_text)} "
+                      f"characters, maximum 500)."}, 400)
     rows = _speaker_rows(state, job_id)
     speakers = {r["speaker"] for r in rows}
     raw = body.get("map")
@@ -8662,23 +9304,35 @@ async def preview_voice_casting(job_id: str, request: _ScoutRequest):
         cast, sorted(speakers), state, job_id, tts_used, target_lang,
     )
 
-    # Pick the lines: the same mid-length rule as the summary, widened when
-    # more than one per speaker is asked for.
-    by_speaker: dict = {}
-    for sg in state.get("segments") or []:
-        text = (sg.get("translated_text") or "").strip()
-        if text:
-            by_speaker.setdefault(sg.get("speaker") or "SPEAKER_00", []).append(sg)
-    chosen = []
-    for sp in sorted(speakers):
-        pool = sorted(by_speaker.get(sp, []), key=lambda g: len(g.get("translated_text", "")))
-        if not pool:
-            continue
-        mid = len(pool) // 2
-        for off in range(per_speaker):
-            i = mid + off - per_speaker // 2
-            if 0 <= i < len(pool):
-                chosen.append(pool[i])
+    if custom_text:
+        # Arbitrary-text preview (CLD-266): speak this exact sentence once
+        # per requested speaker — the speakers named in the map when one was
+        # sent, else everyone. This is deliberately NOT run through the
+        # pronunciation seam: the editor sends the respelled sentence it
+        # wants heard, and applying the map here would double-respell it.
+        req = (sorted(set(cast) & speakers) or sorted(speakers)
+               if isinstance(raw, dict) and raw else sorted(speakers))
+        chosen = [{"speaker": sp, "translated_text": custom_text,
+                   "text": custom_text, "start": None} for sp in req]
+    else:
+        # Pick the lines: the same mid-length rule as the summary, widened
+        # when more than one per speaker is asked for.
+        by_speaker: dict = {}
+        for sg in state.get("segments") or []:
+            text = (sg.get("translated_text") or "").strip()
+            if text:
+                by_speaker.setdefault(sg.get("speaker") or "SPEAKER_00", []).append(sg)
+        chosen = []
+        for sp in sorted(speakers):
+            pool = sorted(by_speaker.get(sp, []),
+                          key=lambda g: len(g.get("translated_text", "")))
+            if not pool:
+                continue
+            mid = len(pool) // 2
+            for off in range(per_speaker):
+                i = mid + off - per_speaker // 2
+                if 0 <= i < len(pool):
+                    chosen.append(pool[i])
 
     if not chosen:
         return JSONResponse({"error": "No translated lines to preview"}, 409)
@@ -8751,6 +9405,7 @@ async def list_job_files(job_id: str):
     wanted = [
         ("video", "dubbed_video.mp4", "Dubbed video", "video/mp4"),
         ("subtitles", "subtitles.srt", "Subtitles", "text/plain"),
+        ("subtitles_vtt", "subtitles.vtt", "Subtitles (WebVTT)", "text/vtt"),
         ("dub_audio", "dubbed_audio.wav", "Dubbed audio only", "audio/wav"),
         ("background", "background.wav", "Background music & effects", "audio/wav"),
         ("vocals", "vocals.wav", "Isolated original speech", "audio/wav"),
@@ -9165,12 +9820,14 @@ async def continue_pipeline(
     tts_speed: str = Form(""),
     reference: Optional[UploadFile] = File(None),
 ):
-    """Continue the pipeline from the most recent checkpoint. Called after
-    the user has reviewed (and possibly edited) the transcript/translation
-    in wizard mode.
+    """Continue the pipeline from the most recent checkpoint.
 
-    - If stopped at translation_done: runs TTS + merge.
-    - If stopped at transcription_done: runs translate + TTS + merge.
+    Approving a review clears exactly ONE gate — the one the job's status
+    names. When another gate is armed at the same boundary (translation
+    cleared, voice_cast still pending) the job flips straight to that gate's
+    status and no stage runs; the response then carries `now_awaiting`.
+    Non-gate statuses (error, interrupted, paused) resume as before —
+    crash-resume never touched a gate.
 
     Voice settings, if provided, override what was originally requested."""
     if job_id not in jobs:
@@ -9193,6 +9850,52 @@ async def continue_pipeline(
     if not cp:
         return JSONResponse({"error": "No checkpoint to continue from"}, 404)
 
+    gate = app_review_gates.GATE_FOR_STATUS.get(job.get("status") or "")
+    if gate:
+        cleared = list(job.get("gates_cleared") or [])
+        if gate not in cleared:
+            cleared.append(gate)
+        job["gates_cleared"] = cleared
+        job.pop("pending_gate", None)
+
+        # Same-boundary re-check: is another gate armed right here?
+        gates = job.get("review_gates") or cp.get("review_gates")
+        if not isinstance(gates, dict):
+            gates = _resolved_review_gates(
+                None, job.get("wizard_mode", "auto"), job)
+        boundary = app_review_gates.BOUNDARY_FOR_GATE[gate]
+        ctx_like = dict(cp)
+        for k in ("stage", "job_id", "saved_at"):
+            ctx_like.pop(k, None)
+        findings: dict = {}
+        for g in app_review_gates.BOUNDARY_GATES[boundary]:
+            if gates.get(g) == "flagged_only" and g not in cleared:
+                findings[g] = _gate_findings(g, ctx_like, job, job_id)
+        nxt = app_review_gates.first_pending(boundary, gates, cleared, findings)
+        if nxt:
+            status, cp_name = app_review_gates.GATE_STATUS[nxt]
+            job["pending_gate"] = nxt
+            job["status"] = status
+            job["step_detail"] = _GATE_DETAILS[nxt]
+            job["checkpoint_stage"] = cp_name
+            save_job(job)
+            try:
+                activity.record_job(
+                    job_id, status,
+                    title=job.get("title") or job.get("source_label"))
+            except Exception:
+                log.debug("[activity] could not record transition",
+                          exc_info=True)
+            try:
+                _fire_webhooks(status, job)
+            except Exception:
+                log.debug("[webhooks] could not schedule delivery",
+                          exc_info=True)
+            log.info(f"[continue] Job {job_id} cleared '{gate}' — "
+                     f"now awaiting '{nxt}' at the same boundary")
+            return {"ok": True, "job_id": job_id,
+                    "now_awaiting": nxt, "status": status}
+
     # Reset error/stale flags so the History UI immediately reflects that
     # the job is alive again. _continue_from_checkpoint will set status
     # to "translating"/"synthesizing" as it starts each stage.
@@ -9200,7 +9903,7 @@ async def continue_pipeline(
     _clear_job_error(job)
     save_job(job)
 
-    asyncio.create_task(_continue_from_checkpoint(
+    _spawn_background(_continue_from_checkpoint(
         job_id, cp, final_style, final_preset, final_speed, ref_path,
     ))
     return {"ok": True, "job_id": job_id, "resuming_from": cp.get("stage")}
@@ -9234,8 +9937,24 @@ async def _continue_from_checkpoint(
     stage = cp.get("stage", "")
     next_stage = _stage_after_checkpoint(stage)
     if not next_stage:
+        # merge_done: nothing left to run — the final_qc Approve lands here.
+        # This bypasses the driver's webhook-firing update() closure, so the
+        # complete transition fires its webhook and activity record
+        # explicitly (exactly once — the driver never sees this job again).
         log.info(f"[continue] Job {job_id} is already at the final stage")
-        job.update(status="complete", progress=100); save_job(job)
+        job.update(status="complete", progress=100)
+        job.pop("pending_gate", None)
+        save_job(job)
+        try:
+            activity.record_job(
+                job_id, "complete",
+                title=job.get("title") or job.get("source_label"))
+        except Exception:
+            log.debug("[activity] could not record transition", exc_info=True)
+        try:
+            _fire_webhooks("complete", job)
+        except Exception:
+            log.debug("[webhooks] could not schedule delivery", exc_info=True)
         return
 
     ctx = dict(cp)
@@ -9250,8 +9969,13 @@ async def _continue_from_checkpoint(
         ctx["tts_speed"] = tts_speed
     if ref_path:
         ctx["reference_audio"] = ref_path
-    # The user just approved this checkpoint — don't pause on it again.
-    ctx["wizard_mode"] = "auto"
+    # The user just approved this checkpoint. The approved gate is in
+    # job["gates_cleared"] (appended by /continue), so it won't re-fire —
+    # but LATER gates stay armed, which is the point: wizard_mode is no
+    # longer forced to "auto" here.
+    ctx["gates_cleared"] = list(job.get("gates_cleared") or [])
+    if isinstance(job.get("review_gates"), dict):
+        ctx["review_gates"] = job["review_gates"]
 
     log.info(
         f"[continue] Resuming job {job_id} from checkpoint '{stage}' "
@@ -9259,6 +9983,18 @@ async def _continue_from_checkpoint(
     )
     try:
         await run_pipeline_stages(job_id, ctx, start_stage=next_stage)
+        # A continued job finishes HERE, not in the queue worker, so the
+        # worker's post-success hooks never see it. The showcase stitch is
+        # the one that matters: a gated sibling that was approved last must
+        # still trigger the reel. (Subtitle/final-QC gates are forced off
+        # for showcase batches, but the translation and voice gates are not.)
+        if (job.get("status") == "complete"
+                and job.get("batch_kind") == "showcase"):
+            try:
+                await _maybe_assemble_showcase(job.get("batch_id", ""))
+            except Exception as e:
+                log.warning(f"[showcase] post-continue hook failed: {e}",
+                            exc_info=True)
     except JobCancelled:
         log.info(f"[continue] Job {job_id} cancelled")
         job.update(status="cancelled"); job.pop("cancel_requested", None)
@@ -9547,6 +10283,7 @@ async def create_voice_preset(
     language: str = Form(""),
     tags: str = Form(""),                  # comma-separated
     style: str = Form(""),
+    consent_attested: bool = Form(False),  # "the voice's owner consented"
 ):
     """Upload a new voice reference. Saves the audio as
     `presets/voices/<name>.<ext>` and writes a JSON sidecar with the
@@ -9599,6 +10336,10 @@ async def create_voice_preset(
         "style": (style or "").strip()[:300],
         "created_at": time.time(),
     }
+    # Consent captured at save time, stored with the preset (CLD-272).
+    # Enforcement is _resolve_casting's job, per cfg.voice_consent_policy.
+    if consent_attested:
+        meta["consent"] = _consent_record()
     try:
         _voice_metadata_path(audio_path).write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -9619,6 +10360,7 @@ async def update_voice_preset(
     language: Optional[str] = Form(None),
     tags: Optional[str] = Form(None),
     style: Optional[str] = Form(None),
+    consent_attested: Optional[bool] = Form(None),  # None = leave as-is
 ):
     """Update metadata for a file-based preset. Optionally rename it
     (renames the audio file + sidecar). Fields left as None are preserved."""
@@ -9638,6 +10380,11 @@ async def update_voice_preset(
         meta["tags"] = [t.strip() for t in tags.split(",") if t.strip()]
     if style is not None:
         meta["style"] = style.strip()[:300]
+    if consent_attested is not None:
+        if consent_attested:
+            meta["consent"] = _consent_record()
+        else:
+            meta.pop("consent", None)
 
     # Rename if a new name was given
     final_audio = src_audio
@@ -10001,6 +10748,21 @@ async def set_glossary(body: str = Form(...)):
             return JSONResponse({"error": f"domains[{i}].terms must be an object"}, 400)
         if not isinstance(d.get("triggers", []), list):
             return JSONResponse({"error": f"domains[{i}].triggers must be an array"}, 400)
+        # A term value is a translation string, or a {dst?, say?} object
+        # (say = TTS respelling; either or both). Anything else would break
+        # the translator's flatten, so refuse it at save time.
+        for term, value in (d.get("terms") or {}).items():
+            if isinstance(value, str):
+                continue
+            if isinstance(value, dict):
+                bad = [k for k in value if k not in ("dst", "say")]
+                if not bad and all(isinstance(v, str)
+                                   for v in value.values()):
+                    continue
+            return JSONResponse(
+                {"error": f"domains[{i}].terms[{term!r}] must be a string "
+                          f"or an object with only string 'dst'/'say' keys"},
+                400)
 
     # Ensure parent dir exists
     USER_GLOSSARY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -10048,7 +10810,8 @@ _GLOSSARY_DOMAIN_RE = re.compile(r"^[\w .\-]{1,64}$", re.UNICODE)
 async def set_glossary_term(term: str = Form(""),
                             translation: str = Form(""),
                             target_lang: str = Form(""),
-                            domain: str = Form("")):
+                            domain: str = Form(""),
+                            say: str = Form("")):
     """Merge one term into the glossary, server-side.
 
     The review screen saves terms one at a time. POST /api/glossary is a
@@ -10063,9 +10826,12 @@ async def set_glossary_term(term: str = Form(""),
     # with a 422 pydantic blob before any of the messages below could run.
     term = (term or "").strip()
     translation = (translation or "").strip()
+    say = (say or "").strip()
     lang = (target_lang or "").strip().lower()
-    if not term or not translation:
-        return JSONResponse({"error": "term and translation are required"}, 400)
+    if not term or (not translation and not say):
+        return JSONResponse(
+            {"error": "term and a translation (or a 'say' respelling) "
+                      "are required"}, 400)
     if not lang:
         return JSONResponse({"error": "target_lang is required"}, 400)
     if lang not in _QUICK_TEST_KNOWN_LANGS:
@@ -10082,6 +10848,10 @@ async def set_glossary_term(term: str = Form(""),
         return JSONResponse(
             {"error": f"Translation is too long ({len(translation)} "
                       f"characters, maximum {_GLOSSARY_MAX_TERM})."}, 400)
+    if len(say) > _GLOSSARY_MAX_TERM:
+        return JSONResponse(
+            {"error": f"Respelling is too long ({len(say)} characters, "
+                      f"maximum {_GLOSSARY_MAX_TERM})."}, 400)
     domain_name = (domain or "").strip() or _GLOSSARY_REVIEW_DOMAIN
     if len(domain_name) > _GLOSSARY_MAX_DOMAIN or not _GLOSSARY_DOMAIN_RE.match(
             domain_name):
@@ -10107,7 +10877,22 @@ async def set_glossary_term(term: str = Form(""),
         if not isinstance(target.get("terms"), dict):
             target["terms"] = {}
         previous = target["terms"].get(term)
-        target["terms"][term] = translation
+        # Merge over what is already stored: a retranslation must not drop
+        # an existing respelling, and adding a respelling must not drop the
+        # translation. Storage stays backward-compatible — a term with no
+        # `say` is written as the plain string it always was.
+        prev_dst = (previous.get("dst") if isinstance(previous, dict)
+                    else previous) or ""
+        prev_say = previous.get("say", "") if isinstance(previous, dict) else ""
+        final_dst = translation or prev_dst
+        final_say = say or prev_say
+        if final_say:
+            entry = {"say": final_say}
+            if final_dst:
+                entry = {"dst": final_dst, "say": final_say}
+        else:
+            entry = final_dst
+        target["terms"][term] = entry
         data["domains"] = domains
 
         USER_GLOSSARY_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -10121,12 +10906,13 @@ async def set_glossary_term(term: str = Form(""),
             return JSONResponse({"error": str(e)}, 500)
         clear_glossary_cache(lang)
 
-    log.info(f"[glossary] {domain_name}/{lang}: {term!r} -> {translation!r}"
+    log.info(f"[glossary] {domain_name}/{lang}: {term!r} -> {entry!r}"
              + (f" (was {previous!r})" if previous else ""))
     return {
         "ok": True,
         "term": term,
-        "translation": translation,
+        "translation": final_dst,
+        "say": final_say,
         "target_lang": lang,
         "domain": domain_name,
         "replaced": previous,
@@ -10152,9 +10938,45 @@ async def delete_glossary():
 
 @app.get("/api/job/{job_id}")
 async def get_job(job_id: str):
+    """One job, enriched with cost-so-far and a wall-clock ETA (CLD-273).
+
+    The design's MCP page promises `get_status` returns "cost so far, ETA".
+    Both numbers ride the ROUTE rather than new tools, so the CLI, the MCP
+    server and the UI all read the same arithmetic: cost is this job's
+    billed minutes priced as a meter delta (same marginal math as
+    /api/estimate), ETA scales the measured realtime factor by the progress
+    still ahead. Gates state (`review_gates`, `pending_gate`,
+    `gates_cleared`) is already on the job dict itself.
+    """
     if job_id not in jobs:
         return JSONResponse({"error": "Not found"}, 404)
-    return jobs[job_id]
+    job = jobs[job_id]
+    out = dict(job)
+
+    minutes = app_billing.job_minutes(job)
+    if minutes > 0:
+        since = time.time() - 30 * 86400
+        others = [j for j in jobs.values() if j.get("id") != job_id]
+        used = app_billing.summarize(others, since=since)["minutes"]
+        # marginal_cost returns the full band breakdown; the wire field is
+        # the one number every client prints.
+        out["cost_so_far_usd"] = float(
+            app_billing.marginal_cost(used, minutes).get("cost") or 0.0)
+    else:
+        out["cost_so_far_usd"] = 0.0
+
+    eta = 0
+    if (job.get("status") or "") in _BUSY_STATUSES:
+        duration = _finite_seconds(job.get("duration"))
+        langs = job.get("target_langs")
+        n = len(langs) if isinstance(langs, (list, tuple)) and langs else 1
+        measured = app_estimate.realtime_factor(jobs.values())
+        factor = (measured if measured is not None
+                  else float(cfg.eta_realtime_factor))
+        remaining = max(0.0, 1.0 - float(job.get("progress") or 0) / 100.0)
+        eta = int(app_estimate.eta_seconds(duration, n, factor) * remaining)
+    out["eta_seconds"] = eta
+    return out
 
 
 @app.post("/api/dub/{job_id}/cancel")
@@ -10753,6 +11575,714 @@ async def beta_reuse_purge(stage: str = Form(""), job_id: str = Form("")):
     log.info(f"[artifacts] purged {removed} row(s) "
              f"(stage={stage or 'all'}, job={job_id or 'all'})")
     return {"ok": True, "removed": removed}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Review gates: final-QC checklist + review notes (CLD-264 / CLD-270)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Row states: "pass" (checked, fine), "warn" (checked, needs a look),
+# "unavailable" (could not be computed — module not present yet, artifact
+# missing, or the check is not enforced). Only "warn" rows count toward
+# warn_count, which is also the final_qc gate's flagged_only findings.
+
+def _qc_row(row_id: str, label: str, state: str, value: str,
+            detail: str = "") -> dict:
+    return {"id": row_id, "label": label, "state": state,
+            "value": value, "detail": detail}
+
+
+def _qc_loudness_row(loudnorm, target_i: float, target_tp: float) -> dict:
+    from pipeline.quality import loudness_quality
+    ld = loudness_quality(loudnorm)
+    if not ld.get("available"):
+        return _qc_row("loudness", "Loudness", "unavailable", "not measured",
+                       "No loudnorm measurement yet — assemble the dub first.")
+    out_i, tp = ld.get("output_i"), ld.get("true_peak")
+    problems = []
+    if out_i is not None and abs(out_i - target_i) > 1.0:
+        problems.append(f"integrated {out_i:g} LUFS is more than 1 LU from "
+                        f"the {target_i:g} target")
+    if tp is not None and tp > target_tp:
+        problems.append(f"true peak {tp:g} dBTP is above the "
+                        f"{target_tp:g} ceiling")
+    if tp is not None and tp > 0:
+        problems.append("true peak above 0 dBTP — clipping")
+    value = (f"{out_i:g} LUFS" if out_i is not None else "?") + \
+            (f" · peak {tp:g} dBTP" if tp is not None else "")
+    if problems:
+        return _qc_row("loudness", "Loudness", "warn", value,
+                       "; ".join(problems))
+    return _qc_row("loudness", "Loudness", "pass", value,
+                   f"Within ±1 LU of {target_i:g} LUFS, "
+                   f"peak under {target_tp:g} dBTP")
+
+
+def _qc_subtitles_row(job: dict, segments: list) -> dict:
+    # pipeline/subtitles.py lands with the subtitle workbench task; until
+    # then (or on any failure) this row degrades to "unavailable" rather
+    # than claiming a pass it never checked.
+    try:
+        from pipeline import subtitles as _subs
+    except ImportError:
+        return _qc_row("subtitles", "Subtitles", "unavailable", "not computed",
+                       "Subtitle checks arrive with the subtitle module.")
+    try:
+        cues = _subs.build_cues(segments, job.get("subtitle_overrides"))
+        violations = _subs.validate_cues(cues, _subtitle_limits())
+    except Exception as e:
+        return _qc_row("subtitles", "Subtitles", "unavailable", "not computed",
+                       f"Subtitle validation failed: {e}")
+    if violations:
+        return _qc_row("subtitles", "Subtitles", "warn",
+                       f"{len(violations)} violation(s) in {len(cues)} cues",
+                       "Line length / CPS / gap limits — see the Subtitles tab.")
+    return _qc_row("subtitles", "Subtitles", "pass",
+                   f"{len(cues)} cues clean", "All cues inside the limits.")
+
+
+def _qc_sync_row(placements: list) -> tuple:
+    """(row, offsync idx list). ±5% stretch is the design's tolerance."""
+    if not placements:
+        return (_qc_row("sync", "Sync", "unavailable", "not computed",
+                        "No placement data yet — assemble the dub first."), [])
+    total, off = 0, []
+    for i, p in enumerate(placements):
+        try:
+            src = float(p.get("src_end", 0)) - float(p.get("src_start", 0))
+            dub_s, dub_e = p.get("dub_start"), p.get("dub_end")
+            if src <= 0 or dub_s is None or dub_e is None:
+                continue
+            total += 1
+            stretch = (float(dub_e) - float(dub_s)) / src
+            if abs(stretch - 1.0) > 0.05:
+                off.append(p.get("idx", i))
+        except (TypeError, ValueError):
+            continue
+    if not total:
+        return (_qc_row("sync", "Sync", "unavailable", "not computed",
+                        "Placement rows carried no usable timings."), [])
+    if off:
+        return (_qc_row("sync", "Sync", "warn",
+                        f"{len(off)} of {total} segments outside ±5%",
+                        "Segments stretched or drifted beyond the tolerance — "
+                        "see the Sync tab."), off)
+    return (_qc_row("sync", "Sync", "pass", f"{total} segments inside ±5%",
+                    "Every placed segment within the stretch tolerance."), off)
+
+
+def _qc_glossary_row(job: dict, segments: list) -> dict:
+    from pipeline.flags import glossary_terms, _contains_phrase
+    terms = glossary_terms(_read_user_glossary(), job.get("target_lang") or "")
+    matched, honored = 0, 0
+    for term, mapped in terms.items():
+        if not term.strip() or not mapped.strip():
+            continue
+        hit = miss = False
+        for seg in segments:
+            if not _contains_phrase(seg.get("text") or "", term):
+                continue
+            hit = True
+            if not _contains_phrase(seg.get("translated_text") or "", mapped):
+                miss = True
+        if hit:
+            matched += 1
+            if not miss:
+                honored += 1
+    if not matched:
+        return _qc_row("glossary", "Glossary", "pass", "no terms triggered",
+                       "No glossary term appears in this source.")
+    state = "pass" if honored == matched else "warn"
+    return _qc_row("glossary", "Glossary", state,
+                   f"{honored}/{matched} terms honored",
+                   "" if state == "pass" else
+                   "A decided-on term was not used — see translation flags.")
+
+
+def _qc_consent_row(job: dict, segments: list) -> dict:
+    # voice_consent_policy and the consent records land with the consent
+    # task; getattr keeps this row honest either way.
+    policy = getattr(cfg, "voice_consent_policy", "off")
+    if policy == "off":
+        return _qc_row("consent", "Voice consent", "unavailable",
+                       "not enforced",
+                       "Consent policy is off — enable it in Settings.")
+    consent = job.get("voice_consent") or {}
+    speakers = sorted({s.get("speaker") for s in segments if s.get("speaker")})
+    missing = [sp for sp in speakers if not consent.get(sp)]
+    if missing:
+        return _qc_row("consent", "Voice consent", "warn",
+                       f"{len(missing)} of {len(speakers)} unattested",
+                       "No consent record for: " + ", ".join(missing))
+    return _qc_row("consent", "Voice consent", "pass",
+                   f"{len(speakers)} speaker(s) attested", "")
+
+
+def _build_qc_checklist(job_id: str) -> dict:
+    """The one final-QC document: what /qc serves the workbench, and what
+    the final_qc gate's flagged_only mode counts. Assembled from persisted
+    artifacts only — nothing is recomputed or stored."""
+    job = jobs[job_id]
+    segments, seg_stage, placements, loudnorm = _quality_inputs(job_id)
+    target_i = float(getattr(cfg, "loudness_target", -16.0))
+    target_tp = float(getattr(cfg, "loudness_true_peak", -1.5))
+
+    sync_row, offsync_idxs = _qc_sync_row(placements)
+    rows = [
+        _qc_loudness_row(loudnorm, target_i, target_tp),
+        _qc_subtitles_row(job, segments),
+        sync_row,
+        _qc_glossary_row(job, segments),
+        _qc_consent_row(job, segments),
+    ]
+    warn_count = sum(1 for r in rows if r["state"] == "warn")
+
+    work = OUTPUT_DIR / job_id
+    deliverables = [
+        f"/outputs/{job_id}/{name}"
+        for name in ("dubbed_video.mp4", "subtitles.srt", "subtitles.vtt")
+        if (work / name).exists()
+    ]
+    return {
+        "job_id": job_id,
+        "rows": rows,
+        "warn_count": warn_count,
+        "loudness_target": target_i,
+        "loudness_true_peak": target_tp,
+        "segments_from": seg_stage,
+        "pending_gate": job.get("pending_gate"),
+        "review_notes": job.get("review_notes") or [],
+        "pending_fixes": {
+            "offsync_segments": offsync_idxs,
+        },
+        "on_approve": {
+            # Approve = /continue: it clears the final_qc gate and marks the
+            # job complete — nothing is resynthesized by the approval itself.
+            "resynth_segments": 0,
+            "est_cost": 0.0,
+            "deliverables": deliverables,
+            "webhooks": len(app_webhooks.hooks_for("job.completed")),
+        },
+    }
+
+
+@app.get("/api/dub/{job_id}/qc")
+async def get_qc_checklist(job_id: str):
+    """Final-QC checklist — render-ready rows, no client re-derivation.
+
+    Every row degrades to state="unavailable" rather than failing the whole
+    document; a checklist with one uncomputable row is still a checklist.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    return await asyncio.to_thread(_build_qc_checklist, job_id)
+
+
+_REVIEW_NOTES_CAP = 100
+
+
+@app.post("/api/dub/{job_id}/review_notes")
+async def add_review_note(job_id: str, text: str = Form("")):
+    """Append one reviewer note to the job (kept with it, capped at 100).
+
+    Author is "local" until real members exist (CLD-247).
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    text = (text or "").strip()
+    if not text:
+        return JSONResponse({"error": "Note text is empty"}, 400)
+    if len(text) > 4000:
+        return JSONResponse({"error": "Note is too long (4000 chars max)"}, 400)
+    job = jobs[job_id]
+    notes = job.get("review_notes")
+    if not isinstance(notes, list):
+        notes = []
+    notes.append({"text": text, "at": time.time(), "author": "local"})
+    job["review_notes"] = notes[-_REVIEW_NOTES_CAP:]
+    save_job(job)
+    return {"ok": True, "count": len(job["review_notes"]),
+            "notes": job["review_notes"]}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Review workbench: subtitles, sync-fit plan, cost of edits
+#  (CLD-269 / CLD-268 / CLD-271 — task #14; keep this section together)
+# ═══════════════════════════════════════════════════════════════════════
+
+# Sync tolerance: |stretch − 1| beyond this is "off-sync" (the design's ±5%,
+# same figure the QC sync row uses).
+_SYNC_DRIFT_TOL = 0.05
+# Bound on a per-segment pad_ms override — 2 s of early start is already far
+# beyond anything the pad-slack mechanism can usefully spend.
+_SYNC_PAD_MS_MAX = 2000
+
+
+def _sync_fit_overrides(job: dict) -> Optional[dict]:
+    """The per-segment fit plan `_stage_assemble` hands the assembler.
+
+    Merges the stored auto-fit expansion with the reviewer's explicit
+    per-segment entries — explicit wins per field, because a hand-set value
+    is a decision and the auto-fit is a suggestion.
+    """
+    so = job.get("sync_overrides") or {}
+    merged: dict = {}
+    for source in (so.get("auto_fit") or {}, so.get("per_segment") or {}):
+        if not isinstance(source, dict):
+            continue
+        for k, v in source.items():
+            if not isinstance(v, dict):
+                continue
+            try:
+                idx = int(k)
+            except (TypeError, ValueError):
+                continue
+            entry = merged.setdefault(idx, {})
+            for field in ("max_stretch", "pad_ms"):
+                if v.get(field) is not None:
+                    entry[field] = v[field]
+    return {k: v for k, v in merged.items() if v} or None
+
+
+def _write_subtitle_files(job: dict, work: Path, segments: list) -> None:
+    """Write subtitles.srt + subtitles.vtt from cues — display overrides and
+    placed timings applied. The one writer both the assemble stage and every
+    subtitle edit route go through, so the downloads never disagree."""
+    from pipeline import subtitles as _subs
+    cues = _subs.build_cues(segments, job.get("subtitle_overrides"))
+    _subs.write_srt_cues(cues, str(work / "subtitles.srt"))
+    _subs.write_vtt_cues(cues, str(work / "subtitles.vtt"))
+
+
+def _subtitle_segments(job_id: str) -> tuple:
+    """(segments, stage) from the newest checkpoint that has any."""
+    for stage in CHECKPOINT_ORDER_DESC:
+        cp = _load_checkpoint(job_id, stage)
+        if cp and cp.get("segments"):
+            return cp["segments"], stage
+    return [], None
+
+
+def _subtitle_doc(job_id: str) -> dict:
+    """The render-ready cue document GET /subtitles serves and every subtitle
+    POST returns fresh — one shape, no client re-derivation."""
+    from pipeline import subtitles as _subs
+    job = jobs[job_id]
+    segments, seg_stage = _subtitle_segments(job_id)
+    limits = _subtitle_limits()
+    cues = _subs.build_cues(segments, job.get("subtitle_overrides"))
+    annotated = _subs.annotate_cues(cues, limits)
+    work = OUTPUT_DIR / job_id
+    return {
+        "job_id": job_id,
+        "segments_from": seg_stage,
+        "cues": annotated,
+        "limits": limits,
+        "violation_count": sum(len(c["violations"]) for c in annotated),
+        "overrides": job.get("subtitle_overrides") or {},
+        "srt_url": (f"/outputs/{job_id}/subtitles.srt"
+                    if (work / "subtitles.srt").exists() else None),
+        "vtt_url": (f"/outputs/{job_id}/subtitles.vtt"
+                    if (work / "subtitles.vtt").exists() else None),
+    }
+
+
+@app.get("/api/dub/{job_id}/subtitles")
+async def get_subtitles(job_id: str):
+    """Cue list with per-cue metrics and violations, plus the active limits."""
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    doc = await asyncio.to_thread(_subtitle_doc, job_id)
+    if not doc["cues"] and doc["segments_from"] is None:
+        return JSONResponse(
+            {"error": "No checkpoints with segments — nothing to subtitle yet"},
+            404)
+    return doc
+
+
+@app.post("/api/dub/{job_id}/subtitles/edit")
+async def edit_subtitles(job_id: str, edits: str = Form(...)):
+    """Per-cue display/timing overrides: {"<idx>": {display_text?,
+    start_delta?, end_delta?}}.
+
+    Overrides change what is SHOWN, never what was spoken —
+    `translated_text` is untouched, so no audio is invalidated and nothing
+    is resynthesized (the §4.2 decision: the map lives on the job, not in
+    checkpoints). A null entry (or empty object) removes that cue's
+    override; deltas are bounded ±500 ms. Rewrites .srt + .vtt and returns
+    the fresh cue document.
+    """
+    from pipeline import subtitles as _subs
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    try:
+        edit_map = json.loads(edits)
+        if not isinstance(edit_map, dict):
+            raise ValueError("edits must be a JSON object")
+    except Exception as e:
+        return JSONResponse({"error": f"Invalid edits JSON: {e}"}, 400)
+
+    job = jobs[job_id]
+    overrides = dict(job.get("subtitle_overrides") or {})
+    for k, v in edit_map.items():
+        try:
+            idx = int(k)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": f"Cue index must be an integer, got {k!r}"}, 400)
+        if v is None or v == {}:
+            overrides.pop(str(idx), None)
+            continue
+        if not isinstance(v, dict):
+            return JSONResponse(
+                {"error": f"Edit for cue {idx} must be an object or null"}, 400)
+        entry = dict(overrides.get(str(idx)) or {})
+        if "display_text" in v:
+            dt = v["display_text"]
+            if dt is None or (isinstance(dt, str) and not dt.strip()):
+                entry.pop("display_text", None)
+            elif not isinstance(dt, str):
+                return JSONResponse(
+                    {"error": f"display_text for cue {idx} must be a string"},
+                    400)
+            elif len(dt) > 1000:
+                return JSONResponse(
+                    {"error": f"display_text for cue {idx} is too long "
+                              f"(1000 chars max)"}, 400)
+            else:
+                entry["display_text"] = dt.strip()
+        for key in ("start_delta", "end_delta"):
+            if key not in v:
+                continue
+            if v[key] is None:
+                entry.pop(key, None)
+                continue
+            try:
+                d = float(v[key])
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"{key} for cue {idx} must be a number"}, 400)
+            if abs(d) > _subs.MAX_TIME_DELTA + 1e-9:
+                return JSONResponse(
+                    {"error": f"{key} for cue {idx} out of range "
+                              f"(±{_subs.MAX_TIME_DELTA:g} s)"}, 400)
+            if abs(d) < 1e-9:
+                entry.pop(key, None)
+            else:
+                entry[key] = round(d, 3)
+        if entry:
+            overrides[str(idx)] = entry
+        else:
+            overrides.pop(str(idx), None)
+
+    job["subtitle_overrides"] = overrides
+    save_job(job)
+    segments, _stage = await asyncio.to_thread(_subtitle_segments, job_id)
+    if segments:
+        try:
+            await asyncio.to_thread(
+                _write_subtitle_files, job, OUTPUT_DIR / job_id, segments)
+        except Exception as e:
+            log.warning(f"[subtitles] file rewrite failed for {job_id}: {e}")
+    return await asyncio.to_thread(_subtitle_doc, job_id)
+
+
+@app.post("/api/dub/{job_id}/subtitles/autofix")
+async def autofix_subtitles(job_id: str):
+    """Apply the mechanical §4.3 fixes as overrides; never worsens.
+
+    The fix set is post-validated against the merged override map and only
+    persisted when the violation count strictly decreases — otherwise
+    nothing changes and `applied` is 0.
+    """
+    from pipeline import subtitles as _subs
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    job = jobs[job_id]
+    limits = _subtitle_limits()
+    segments, seg_stage = await asyncio.to_thread(_subtitle_segments, job_id)
+    if not segments:
+        return JSONResponse(
+            {"error": "No checkpoints with segments — nothing to subtitle yet"},
+            404)
+
+    current = job.get("subtitle_overrides") or {}
+    cues = _subs.build_cues(segments, current)
+    before = len(_subs.validate_cues(cues, limits))
+    fixes = _subs.autofix_cues(cues, limits)
+
+    applied = 0
+    if fixes:
+        merged = dict(current)
+        for idx, fix in fixes.items():
+            entry = dict(merged.get(str(idx)) or {})
+            if "display_text" in fix:
+                entry["display_text"] = fix["display_text"]
+            if "end_delta" in fix:
+                # Fold the incremental fix into any stored delta, keeping the
+                # total inside the ±500 ms bound.
+                total = float(entry.get("end_delta") or 0.0) + fix["end_delta"]
+                entry["end_delta"] = round(
+                    max(-_subs.MAX_TIME_DELTA,
+                        min(_subs.MAX_TIME_DELTA, total)), 3)
+            merged[str(idx)] = entry
+        # The bound-clamp above can shrink a fix, so re-check the real merged
+        # result before persisting anything.
+        after = len(_subs.validate_cues(
+            _subs.build_cues(segments, merged), limits))
+        if after < before:
+            job["subtitle_overrides"] = merged
+            save_job(job)
+            applied = len(fixes)
+            try:
+                await asyncio.to_thread(
+                    _write_subtitle_files, job, OUTPUT_DIR / job_id, segments)
+            except Exception as e:
+                log.warning(f"[subtitles] file rewrite failed for {job_id}: {e}")
+
+    doc = await asyncio.to_thread(_subtitle_doc, job_id)
+    doc["applied"] = applied
+    doc["fixed_cues"] = sorted(fixes) if applied else []
+    return doc
+
+
+@app.get("/api/dub/{job_id}/sync_plan")
+async def get_sync_plan(job_id: str):
+    """The per-segment drift table the Sync tab renders, plus the stored
+    plan. Same placement rows the POST's auto-fit and the /qc sync row read
+    — the table, the plan and the re-assembly never disagree."""
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    job = jobs[job_id]
+    placements = await asyncio.to_thread(
+        _load_placements, OUTPUT_DIR / job_id)
+    segments, _seg_stage = await asyncio.to_thread(_subtitle_segments, job_id)
+    text_by_idx = {s.get("idx"): (s.get("translated_text") or s.get("text")
+                                  or "") for s in segments}
+    rows = []
+    for i, p in enumerate(placements):
+        try:
+            src_s = float(p.get("src_start", 0))
+            src_e = float(p.get("src_end", 0))
+            dub_s, dub_e = p.get("dub_start"), p.get("dub_end")
+            if src_e - src_s <= 0 or dub_s is None or dub_e is None:
+                continue
+            stretch = (float(dub_e) - float(dub_s)) / (src_e - src_s)
+            idx = p.get("idx", i)
+            rows.append({
+                "idx": idx,
+                "src_start": round(src_s, 2),
+                "src_dur": round(src_e - src_s, 2),
+                "dub_dur": round(float(dub_e) - float(dub_s), 2),
+                "stretch": round(stretch, 3),
+                "drift_ms": round(abs(float(dub_s) - src_s) * 1000.0, 1),
+                "off": abs(stretch - 1.0) > _SYNC_DRIFT_TOL,
+                "text": text_by_idx.get(idx, "")[:160],
+            })
+        except (TypeError, ValueError):
+            continue
+    return {
+        "job_id": job_id,
+        "rows": rows,
+        "tolerance": _SYNC_DRIFT_TOL,
+        "off_count": sum(1 for r in rows if r["off"]),
+        "sync_overrides": job.get("sync_overrides") or {},
+    }
+
+
+@app.post("/api/dub/{job_id}/sync_plan")
+async def set_sync_plan(job_id: str, request: Request):
+    """Store the sync-fit plan: per-segment stretch/pad overrides + auto-fit.
+
+    {"per_segment": {"<idx>": {"max_stretch"?: 1.0–2.5, "pad_ms"?: 0–2000}},
+     "auto_fit_cap"?: 1.0–2.5}
+
+    Auto-fit is computed HERE, server-side, from the recorded placements —
+    the table, the stored plan and the re-assembly all read the same rows.
+    A placement inside the ±5% tolerance gets no override; one that cannot
+    close under the cap is left alone rather than half-fixed. Nothing is
+    re-assembled by this call: apply the plan with
+    POST /api/dub/{id}/retry_stage/assemble.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
+    except Exception as e:
+        return JSONResponse({"error": f"Invalid JSON body: {e}"}, 400)
+
+    per_segment = body.get("per_segment") or {}
+    if not isinstance(per_segment, dict):
+        return JSONResponse({"error": "per_segment must be an object"}, 400)
+    cleaned: dict = {}
+    for k, v in per_segment.items():
+        try:
+            idx = int(k)
+        except (TypeError, ValueError):
+            return JSONResponse(
+                {"error": f"Segment index must be an integer, got {k!r}"}, 400)
+        if not isinstance(v, dict):
+            return JSONResponse(
+                {"error": f"Override for segment {idx} must be an object"}, 400)
+        entry: dict = {}
+        if v.get("max_stretch") is not None:
+            try:
+                ms = float(v["max_stretch"])
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"max_stretch for segment {idx} must be a "
+                              f"number"}, 400)
+            if not 1.0 <= ms <= 2.5:
+                return JSONResponse(
+                    {"error": f"max_stretch for segment {idx} out of range "
+                              f"(1.0–2.5)"}, 400)
+            entry["max_stretch"] = round(ms, 3)
+        if v.get("pad_ms") is not None:
+            try:
+                pm = int(v["pad_ms"])
+            except (TypeError, ValueError):
+                return JSONResponse(
+                    {"error": f"pad_ms for segment {idx} must be an integer"},
+                    400)
+            if not 0 <= pm <= _SYNC_PAD_MS_MAX:
+                return JSONResponse(
+                    {"error": f"pad_ms for segment {idx} out of range "
+                              f"(0–{_SYNC_PAD_MS_MAX})"}, 400)
+            if pm:
+                entry["pad_ms"] = pm
+        if entry:
+            cleaned[str(idx)] = entry
+
+    cap = body.get("auto_fit_cap")
+    if cap is not None:
+        try:
+            cap = float(cap)
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "auto_fit_cap must be a number"}, 400)
+        if not 1.0 <= cap <= 2.5:
+            return JSONResponse(
+                {"error": "auto_fit_cap out of range (1.0–2.5)"}, 400)
+
+    auto_fit: dict = {}
+    if cap is not None:
+        from pipeline.assembler import _max_stretch_setting
+        base = _max_stretch_setting()
+        placements = await asyncio.to_thread(
+            _load_placements, OUTPUT_DIR / job_id)
+        for i, p in enumerate(placements):
+            try:
+                src = float(p.get("src_end", 0)) - float(p.get("src_start", 0))
+                dub_s, dub_e = p.get("dub_start"), p.get("dub_end")
+                if src <= 0 or dub_s is None or dub_e is None:
+                    continue
+                stretch = (float(dub_e) - float(dub_s)) / src
+            except (TypeError, ValueError):
+                continue
+            if stretch <= 1.0 + _SYNC_DRIFT_TOL:
+                continue  # inside tolerance — no override (CLD-268 acceptance)
+            # The recorded stretch says how far the segment overran its slot;
+            # scaling the current ceiling by it estimates the compression that
+            # would close it. An overestimate is harmless — the assembler only
+            # ever applies what the slot actually needs.
+            needed = round(stretch * base, 3)
+            if needed <= cap + 1e-9:
+                auto_fit[str(p.get("idx", i))] = {
+                    "max_stretch": min(needed, round(cap, 3))}
+
+    job = jobs[job_id]
+    job["sync_overrides"] = {
+        "per_segment": cleaned,
+        "auto_fit_cap": cap,
+        "auto_fit": auto_fit,
+    }
+    save_job(job)
+    merged = _sync_fit_overrides(job) or {}
+    return {
+        "ok": True,
+        "sync_overrides": job["sync_overrides"],
+        "will_change": sorted(merged),
+        "segments_planned": len(merged),
+        "next": f"POST /api/dub/{job_id}/retry_stage/assemble re-assembles "
+                f"with this plan",
+    }
+
+
+@app.post("/api/dub/{job_id}/estimate_edits")
+async def estimate_edit_cost(job_id: str, request: Request):
+    """What a set of edits would cost to apply (CLD-271).
+
+    Seconds counted by app/estimate_edits.py (union of touched segments —
+    a segment is never billed twice); priced with billing.marginal_cost on
+    the month's real usage, so the quote matches the meter. Before TTS,
+    everything is free — nothing has been synthesized yet.
+    """
+    from app import estimate_edits as app_estimate_edits
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    try:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise ValueError("body must be a JSON object")
+    except Exception as e:
+        return JSONResponse({"error": f"Invalid JSON body: {e}"}, 400)
+    edits = body.get("edits")
+    if not isinstance(edits, list):
+        return JSONResponse({"error": "edits must be a list"}, 400)
+
+    job = jobs[job_id]
+    tts_cp = await asyncio.to_thread(_load_checkpoint, job_id, "tts_done")
+    pre_tts = (tts_cp is None
+               or job.get("status") in ("awaiting_transcript_review",
+                                        "awaiting_translation_review"))
+
+    segments = (tts_cp.get("segments") if tts_cp else None) or []
+    if not segments:
+        segments, _stage = await asyncio.to_thread(_subtitle_segments, job_id)
+    try:
+        seconds, idxs, breakdown = app_estimate_edits.edit_seconds(
+            segments, edits)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, 400)
+
+    disclaimer = (
+        "Estimate only. Minutes are measured from real segments; the cost "
+        "applies the design's published hosted rates. This server bills "
+        "nobody."
+    )
+    if pre_tts:
+        return {
+            "job_id": job_id,
+            "free": True,
+            "free_reason": app_estimate_edits.FREE_REASON_PRE_TTS,
+            "resynth_seconds": 0.0,
+            "resynth_minutes": 0.0,
+            "est_cost_usd": 0.0,
+            "idxs": idxs,
+            "breakdown": breakdown,
+            "estimate": True,
+            "disclaimer": disclaimer,
+        }
+
+    since = time.time() - 30 * 86400
+    used = app_billing.summarize(list(jobs.values()), since=since)["minutes"]
+    minutes = seconds / 60.0
+    priced = app_billing.marginal_cost(used, minutes)
+    return {
+        "job_id": job_id,
+        "free": False,
+        "resynth_seconds": seconds,
+        "resynth_minutes": round(minutes, 2),
+        "est_cost_usd": priced["cost"],
+        "rate": priced["rate"],
+        "bands": priced["bands"],
+        "used_minutes": priced["used_minutes"],
+        "idxs": idxs,
+        "breakdown": breakdown,
+        "estimate": True,
+        "disclaimer": disclaimer,
+    }
 
 
 if __name__ == "__main__":

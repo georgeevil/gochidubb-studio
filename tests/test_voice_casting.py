@@ -351,10 +351,13 @@ def test_designed_clips_hide_from_the_user_voice_picker():
 def test_the_casting_gate_waits_until_there_is_translated_text_to_preview():
     """It sits after translate, not after diarize. The references exist by
     the earlier point, but a preview has to speak the lines the dub will
-    speak — at the diarize gate the text is still in the source language."""
-    assert server._wizard_pause_after("diarize", {"wizard_mode": "review_voices"}) is None
-    status, _detail, checkpoint = server._wizard_pause_after(
-        "translate", {"wizard_mode": "review_voices"})
+    speak — at the diarize gate the text is still in the source language.
+    (The wizard modes now resolve through app/review_gates.py; the legacy
+    review_voices mapping must keep the same boundary.)"""
+    assert server._evaluate_gate(
+        "diarize", {"wizard_mode": "review_voices"}, {}, "j-cast") is None
+    status, _detail, checkpoint = server._evaluate_gate(
+        "translate", {"wizard_mode": "review_voices"}, {}, "j-cast")
     assert (status, checkpoint) == ("awaiting_voice_review", "translation_done")
 
 

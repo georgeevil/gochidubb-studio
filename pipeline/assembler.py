@@ -104,8 +104,12 @@ def _parse_loudnorm_stderr(text: str) -> dict:
         return {}
 
 
-def _normalize_loudness_inplace(wav_path: str):
+def _normalize_loudness_inplace(wav_path: str, target_i=None, target_tp=None):
     """Apply ffmpeg loudnorm + anti-screech chain to wav_path in place.
+
+    `target_i`/`target_tp` override the integrated-loudness / true-peak
+    targets; None falls back to the module constants LN_I/LN_TP, so
+    standalone callers keep the historic behaviour unchanged.
 
     VoxCPM occasionally produces brief inter-segment pops/clicks and spiky
     transients that sound like "screech" or "digital crunch" to the ear.
@@ -124,7 +128,9 @@ def _normalize_loudness_inplace(wav_path: str):
     Returns the measurement dict on success ({} when the stderr block could
     not be parsed — non-fatal) or None when normalization itself failed.
     """
-    ln = f"loudnorm=I={LN_I}:TP={LN_TP}:LRA={LN_LRA}:print_format=json"
+    ti = LN_I if target_i is None else float(target_i)
+    tp = LN_TP if target_tp is None else float(target_tp)
+    ln = f"loudnorm=I={ti}:TP={tp}:LRA={LN_LRA}:print_format=json"
     try:
         tmp = wav_path + ".ln.wav"
         # Filter chain: declick → DC-block/rumble-cut → limit → normalize
@@ -196,7 +202,7 @@ _DEFAULT_MAX_STRETCH = 1.4
 
 
 def plan_segment_fit(seg_start, next_start, tts_dur, current_end,
-                     max_stretch=_DEFAULT_MAX_STRETCH):
+                     max_stretch=_DEFAULT_MAX_STRETCH, pad_slack=0.0):
     """Where a segment goes and how hard to compress it: (start, speed).
 
     VoxCPM has no speaking-rate control, so a segment comes out however long
@@ -220,8 +226,18 @@ def plan_segment_fit(seg_start, next_start, tts_dur, current_end,
 
     `speed` is 1.0 when no stretching is needed; it is never below 1.0,
     because stretching short audio out to fill a slot only adds dead air.
+
+    `pad_slack` lets the segment start up to that many seconds EARLY,
+    spending inter-segment silence to pay back "-8% early" drift instead of
+    compressing harder. The early start is bounded by the previous placed
+    segment's end + MIN_SEGMENT_GAP exactly as a late start already is, so
+    it can never overlap what came before — and the budget grows by however
+    much earlier the segment actually starts.
     """
     start = seg_start
+    if pad_slack > 0:
+        earliest = current_end + MIN_SEGMENT_GAP if current_end > 0 else 0.0
+        start = max(seg_start - pad_slack, earliest, 0.0)
     if current_end > 0 and start < current_end + MIN_SEGMENT_GAP:
         start = current_end + MIN_SEGMENT_GAP
 
@@ -229,6 +245,15 @@ def plan_segment_fit(seg_start, next_start, tts_dur, current_end,
     if room <= 0.2 or tts_dur <= room * 1.02:
         return start, 1.0
     return start, min(tts_dur / room, max(max_stretch, 1.0))
+
+
+def _seg_idx(seg, position):
+    """A segment's stable idx (fit_overrides key), falling back to its list
+    position for segments that never got one."""
+    try:
+        return int(seg.get("idx", position))
+    except (TypeError, ValueError):
+        return position
 
 
 def _max_stretch_setting() -> float:
@@ -243,7 +268,9 @@ def _max_stretch_setting() -> float:
 
 
 def assemble_dubbed_audio(segments, total_duration, output_path,
-                          sample_rate=48000, apply_loudnorm=True):
+                          sample_rate=48000, apply_loudnorm=True,
+                          loudness_target=None, loudness_true_peak=None,
+                          fit_overrides=None):
     """Place each TTS segment at its original timestamp (numpy-based mix).
 
     Handling of overlong TTS segments (Russian/Spanish are often 20-30%
@@ -253,6 +280,16 @@ def assemble_dubbed_audio(segments, total_duration, output_path,
       segment's slot — slight overlap sounds FAR better than the chipmunk
       effect from aggressive pitch-shift.
     - Total audio may exceed total_duration; caller should NOT use -shortest.
+
+    `loudness_target`/`loudness_true_peak` are handed to
+    _normalize_loudness_inplace (None = the module defaults LN_I/LN_TP).
+
+    `fit_overrides` is an optional per-segment sync-fit plan keyed by the
+    segment's `idx`: {"max_stretch": float, "pad_ms": int}. `max_stretch`
+    replaces the global cfg ceiling for that one segment (same 1.0–2.5
+    clamp); `pad_ms` becomes plan_segment_fit's pad_slack. The +0.07
+    emotion-tag bonus applies on top of the per-segment value exactly as it
+    does on top of the global one.
 
     Returns an info dict: {"output_path", "valid_count", "stretched_count",
     "loudnorm"} — loudnorm is the ffmpeg measurement parsed from
@@ -286,6 +323,16 @@ def assemble_dubbed_audio(segments, total_duration, output_path,
     current_end = 0.0  # track cumulative end time to push next segments forward if needed
     base_max_stretch = _max_stretch_setting()
 
+    # Per-segment fit plan, keys normalized to int (JSON round-trips them
+    # as strings). Unknown keys are simply never looked up.
+    overrides = {}
+    for k, v in (fit_overrides or {}).items():
+        try:
+            if isinstance(v, dict):
+                overrides[int(k)] = v
+        except (TypeError, ValueError):
+            continue
+
     # Where the next segment wants to start speaking. A segment's real budget
     # runs up to that point, not merely to its own `end` — the pause after
     # someone stops talking is fair game, and it is usually where an overrun
@@ -310,11 +357,25 @@ def assemble_dubbed_audio(segments, total_duration, output_path,
             # a slightly more aggressive stretch to compensate.
             text = (seg.get("translated_text") or "").lstrip()
             has_emotion = text.startswith("(") and ")" in text[:30]
-            max_stretch = base_max_stretch + (0.07 if has_emotion else 0.0)
+
+            # Sync-fit override for this one segment, if the review plan set
+            # one: its own stretch ceiling (same clamp as the global), and
+            # pad_ms of allowed early start.
+            ov = overrides.get(_seg_idx(seg, seg_i), {})
+            seg_max = base_max_stretch
+            pad_slack = 0.0
+            try:
+                if ov.get("max_stretch") is not None:
+                    seg_max = min(max(float(ov["max_stretch"]), 1.0), 2.5)
+                if ov.get("pad_ms"):
+                    pad_slack = max(0.0, float(ov["pad_ms"]) / 1000.0)
+            except (TypeError, ValueError):
+                pass
+            max_stretch = seg_max + (0.07 if has_emotion else 0.0)
 
             start, speed = plan_segment_fit(
                 seg["start"], next_starts[seg_i], tts_dur, current_end,
-                max_stretch,
+                max_stretch, pad_slack,
             )
 
             stretched_path = audio_path
@@ -419,7 +480,8 @@ def assemble_dubbed_audio(segments, total_duration, output_path,
     # Global loudness normalization so YouTube/TV playback matches broadcast levels
     loudnorm_info = None
     if apply_loudnorm and valid_count > 0:
-        loudnorm_info = _normalize_loudness_inplace(output_path)
+        loudnorm_info = _normalize_loudness_inplace(
+            output_path, target_i=loudness_target, target_tp=loudness_true_peak)
 
     return {
         "output_path": output_path,

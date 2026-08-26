@@ -114,6 +114,23 @@ def _print_job(j: dict, *, short: bool = False) -> None:
 # ─────────────────────────────────────────────────────────────────────
 # Subcommand handlers — each is async, takes args namespace
 # ─────────────────────────────────────────────────────────────────────
+def parse_review_gates(spec: str) -> dict:
+    """"translation=on,subtitles=flagged_only" -> {gate: mode}. Validation
+    of names/modes stays server-side (one authority); this only parses."""
+    gates = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(
+                f"--review-gates: {part!r} is not gate=mode "
+                f"(e.g. translation=on,subtitles=flagged_only)")
+        k, v = part.split("=", 1)
+        gates[k.strip()] = v.strip()
+    return gates
+
+
 async def cmd_dub(c: GoChiDUBBClient, a) -> None:
     scheduled_at = None
     if a.at:
@@ -128,6 +145,8 @@ async def cmd_dub(c: GoChiDUBBClient, a) -> None:
         context_hint=a.context or "", wizard_mode=a.wizard_mode,
         mode=a.mode, scheduled_at=scheduled_at,
         voxcpm_cfg=a.voxcpm_cfg, voxcpm_steps=a.voxcpm_steps,
+        review_gates=parse_review_gates(a.review_gates) if a.review_gates
+        else None,
     )
     job_id = res.get("job_id")
     _print_json(res)
@@ -139,10 +158,15 @@ async def cmd_dub(c: GoChiDUBBClient, a) -> None:
     if a.wait and job_id:
         print(f"[wait] polling job {job_id}…", file=sys.stderr)
         final = await c.wait_for_job(job_id, timeout=a.wait_timeout)
-        if final.get("status") == "complete":
+        status = final.get("status") or ""
+        if status == "complete":
             print(f"[done] {c.output_url(job_id)}")
+        elif status.startswith("awaiting_"):
+            # A parked gate is the job doing what it was told, not a failure.
+            print(f"[gate] {status} (gate={final.get('pending_gate', '?')}) — "
+                  f"review it, then: gochidubb continue {job_id}")
         else:
-            print(f"[fail] status={final.get('status')} err={final.get('error', '?')}",
+            print(f"[fail] status={status} err={final.get('error', '?')}",
                   file=sys.stderr)
             sys.exit(2)
 
@@ -218,6 +242,15 @@ async def cmd_status(c: GoChiDUBBClient, a) -> None:
         _print_json(j)
     else:
         _print_job(j)
+        cost = j.get("cost_so_far_usd")
+        if isinstance(cost, (int, float)) and cost:
+            print(f"     cost: ${cost:.2f} so far (estimate)")
+        if j.get("eta_seconds"):
+            print(f"      eta: ~{int(j['eta_seconds']) // 60}m"
+                  f"{int(j['eta_seconds']) % 60:02d}s")
+        if j.get("pending_gate"):
+            print(f"     gate: {j['pending_gate']} — review, then "
+                  f"`continue {a.job_id}`")
         if j.get("status") == "complete":
             print(f"      url: {c.output_url(a.job_id)}")
         pub = j.get("publish")
@@ -380,12 +413,60 @@ async def cmd_cast(c: GoChiDUBBClient, a) -> None:
 
 
 async def cmd_continue(c: GoChiDUBBClient, a) -> None:
-    """Resume a job parked at a review gate."""
+    """Resume a job parked at a review gate. Clears exactly one gate; when
+    another gate shares the same boundary the job re-parks there instead of
+    running a stage."""
     res = await c.continue_job(a.job_id)
     if a.json:
         _print_json(res)
+    elif res.get("now_awaiting"):
+        print(f"gate cleared — now awaiting {res['now_awaiting']} "
+              f"(status {res.get('status', '?')})")
     else:
         print(f"resuming {a.job_id} from {res.get('resuming_from', '?')}")
+
+
+async def cmd_retry_stage(c: GoChiDUBBClient, a) -> None:
+    overrides = json.loads(a.overrides) if a.overrides else None
+    res = await c.retry_stage(a.job_id, a.stage,
+                              stop_after=a.stop_after or "",
+                              overrides=overrides)
+    _print_json(res)
+
+
+async def cmd_flags(c: GoChiDUBBClient, a) -> None:
+    data = await c.get_flags(a.job_id, max_flags=a.max_flags)
+    if a.json:
+        _print_json(data)
+        return
+    flags = data.get("flags") or []
+    print(f"flags — job {a.job_id}: {len(flags)} of "
+          f"{data.get('n_segments', '?')} segments flagged")
+    for f in flags:
+        print(f"  #{f.get('idx', '?'):<4} [{f.get('reason', '?')}] "
+              f"{f.get('source_span', '')!r} -> {f.get('target_span', '')!r}")
+        if f.get("detail"):
+            print(f"        {f['detail']}")
+
+
+async def cmd_edit_translations(c: GoChiDUBBClient, a) -> None:
+    try:
+        edits = json.loads(a.edits)
+        if not isinstance(edits, dict):
+            raise ValueError("edits must be a JSON object")
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(2)
+    _print_json(await c.edit_translations(a.job_id, edits))
+
+
+async def cmd_glossary_term(c: GoChiDUBBClient, a) -> None:
+    if not a.translation and not a.say:
+        print("error: give --translation, --say, or both", file=sys.stderr)
+        sys.exit(2)
+    _print_json(await c.add_glossary_term(
+        a.term, translation=a.translation or "", target_lang=a.lang,
+        domain=a.domain or "", say=a.say or ""))
 
 
 async def cmd_quality(c: GoChiDUBBClient, a) -> None:
@@ -597,6 +678,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--at", metavar="WHEN",
                    help="Schedule start: unix epoch or ISO datetime "
                         "(naive = local time), e.g. 2026-08-05T02:00")
+    s.add_argument("--review-gates", metavar="SPEC", default="",
+                   help="Per-stage pause config, superseding --wizard-mode: "
+                        "gate=mode pairs over transcript/translation/"
+                        "voice_cast/subtitles/final_qc, e.g. "
+                        "translation=on,subtitles=flagged_only")
     _add_common_dub_opts(s)
     s.set_defaults(handler=cmd_dub)
 
@@ -681,6 +767,42 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("job_id")
     s.add_argument("--json", action="store_true")
     s.set_defaults(handler=cmd_continue)
+
+    s = sub.add_parser("retry-stage",
+                       help="Re-run one pipeline stage (and everything after)")
+    s.add_argument("job_id")
+    s.add_argument("stage", help="download|extract|transcribe|diarize|"
+                                 "translate|tts|assemble|merge")
+    s.add_argument("--stop-after", default="",
+                   help="Halt after this later stage instead of running to "
+                        "the end")
+    s.add_argument("--overrides", default="",
+                   help='JSON of settings for this run, e.g. '
+                        '\'{"review_gates": {"final_qc": "on"}}\'')
+    s.set_defaults(handler=cmd_retry_stage)
+
+    s = sub.add_parser("flags",
+                       help="Translated spans worth review before synthesis")
+    s.add_argument("job_id")
+    s.add_argument("--max-flags", type=int, default=5)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(handler=cmd_flags)
+
+    s = sub.add_parser("edit-translations",
+                       help="Rewrite translated lines in the saved checkpoint")
+    s.add_argument("job_id")
+    s.add_argument("edits", help='JSON idx->text, e.g. \'{"41": "nueva línea"}\'')
+    s.set_defaults(handler=cmd_edit_translations)
+
+    s = sub.add_parser("glossary-term",
+                       help="Teach the glossary a rendering and/or a "
+                            "'say it like' respelling")
+    s.add_argument("term")
+    s.add_argument("--lang", required=True, help="Target language code")
+    s.add_argument("--translation", help="How to render the term")
+    s.add_argument("--say", help='How to pronounce it, e.g. "goh-chee"')
+    s.add_argument("--domain", help="Glossary domain (default: creator-review)")
+    s.set_defaults(handler=cmd_glossary_term)
 
     s = sub.add_parser("quality", help="Per-stage quality scores + actionable verdicts")
     s.add_argument("job_id")

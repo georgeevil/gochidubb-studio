@@ -117,7 +117,10 @@ def _write(records: List[Dict[str, Any]]) -> None:
 
 def public(rec: Dict[str, Any]) -> Dict[str, Any]:
     """The safe projection of a key: everything except hash and salt."""
-    return {k: v for k, v in rec.items() if k not in ("hash", "salt")}
+    out = {k: v for k, v in rec.items() if k not in ("hash", "salt")}
+    # Keys minted before the environment split were all live-prefixed.
+    out.setdefault("environment", "live")
+    return out
 
 
 def list_keys() -> List[Dict[str, Any]]:

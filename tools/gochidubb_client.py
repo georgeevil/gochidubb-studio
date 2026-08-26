@@ -11,6 +11,7 @@ this client does not start it.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 from pathlib import Path
@@ -113,8 +114,15 @@ class GoChiDUBBClient:
         scheduled_at: Optional[float] = None,
         voxcpm_cfg: float = 0.0,
         voxcpm_steps: int = 0,
+        review_gates: Optional[dict] = None,
     ) -> dict:
         """Submit a single-language dub. Returns dict with `job_id`.
+
+        review_gates: per-stage pause config, e.g. {"translation": "on",
+        "subtitles": "flagged_only"} over gates transcript / translation /
+        voice_cast / subtitles / final_qc. Sending it supersedes
+        wizard_mode. Each armed gate parks the job at an awaiting_* status
+        until /continue.
 
         mode: 'dub' (full pipeline) or 'reupload' (download + remux only —
         used for music videos where dubbing makes no sense).
@@ -144,6 +152,8 @@ class GoChiDUBBClient:
             form["model"] = model
         if scheduled_at:
             form["scheduled_at"] = str(float(scheduled_at))
+        if review_gates:
+            form["review_gates"] = json.dumps(review_gates)
         return await self._request("POST", "/api/dub", data=form, files=files)
 
     async def submit_compare(
@@ -338,6 +348,45 @@ class GoChiDUBBClient:
         Same engine as `python tools/audit_job.py <id>`."""
         return await self._request("GET", f"/api/dub/{job_id}/audit")
 
+    # ── review workbench (CLD-273 parity) ────────────────────────────
+    async def retry_stage(self, job_id: str, stage: str, *,
+                          stop_after: str = "",
+                          overrides: Optional[dict] = None) -> dict:
+        """Re-run one pipeline stage (and everything after it) from the
+        previous stage's checkpoint. `overrides` is whitelisted server-side
+        (STAGE_RETRY_OPTIONS says what each stage accepts); `stop_after`
+        halts before a later, more expensive stage."""
+        form = {"overrides": json.dumps(overrides or {}),
+                "stop_after": stop_after or ""}
+        return await self._request(
+            "POST", f"/api/dub/{job_id}/retry_stage/{stage}", data=form)
+
+    async def get_flags(self, job_id: str, *, max_flags: int = 5) -> dict:
+        """The handful of translated spans worth a human's attention.
+        Recomputed per call, so it reflects edits already applied."""
+        return await self._request(
+            "GET", f"/api/dub/{job_id}/flags",
+            params={"max_flags": int(max_flags)})
+
+    async def edit_translations(self, job_id: str, edits: dict) -> dict:
+        """Rewrite translated_text for segments in the saved checkpoint.
+        `edits` maps segment idx (int or str) to the new line. Follow with
+        continue_job() to proceed."""
+        return await self._request(
+            "POST", f"/api/dub/{job_id}/edit_translations",
+            data={"edits": json.dumps({str(k): v for k, v in edits.items()})})
+
+    async def add_glossary_term(self, term: str, *, translation: str = "",
+                                target_lang: str = "", domain: str = "",
+                                say: str = "") -> dict:
+        """Teach the glossary one term: a rendering (`translation`), a
+        pronunciation respelling (`say`), or both. Applies to every later
+        translation for that language, across jobs."""
+        return await self._request(
+            "POST", "/api/glossary/term",
+            data={"term": term, "translation": translation,
+                  "target_lang": target_lang, "domain": domain, "say": say})
+
     # ── voice casting ────────────────────────────────────────────────
     async def get_voice_casting(self, job_id: str) -> dict:
         """Who speaks in this job, how they are cast, and what else they
@@ -477,6 +526,11 @@ class GoChiDUBBClient:
 
         Raises GoChiDUBBError on timeout. Status 'error' is NOT raised — the
         caller inspects `result["status"]` and `result["error"]`.
+
+        A job parked at a review gate (any `awaiting_*` status) also
+        returns: it is waiting on a HUMAN (or an agent calling /continue),
+        and polling it to timeout would just report the wait as a failure.
+        Check `result["pending_gate"]` to see which gate wants attention.
         """
         start = time.monotonic()
         last: dict = {}
@@ -486,7 +540,8 @@ class GoChiDUBBClient:
             except GoChiDUBBError:
                 # Job might not be flushed to disk yet; keep trying briefly
                 pass
-            if last.get("status") in _TERMINAL:
+            status = last.get("status") or ""
+            if status in _TERMINAL or status.startswith("awaiting_"):
                 return last
             await asyncio.sleep(poll)
         raise GoChiDUBBError(
@@ -500,11 +555,15 @@ class GoChiDUBBClient:
         poll: float = 3.0,
     ) -> list[dict]:
         """Poll a batch (quick_test or showcase) until all child jobs are
-        terminal. Returns list of final job dicts."""
+        terminal — or parked at a review gate, which needs a human, not a
+        longer wait. Returns list of final job dicts."""
         start = time.monotonic()
         while time.monotonic() - start < timeout:
             jobs = await self.list_jobs(batch_id=batch_id, limit=10)
-            if jobs and all(j.get("status") in _TERMINAL for j in jobs):
+            if jobs and all(
+                    (j.get("status") or "") in _TERMINAL
+                    or (j.get("status") or "").startswith("awaiting_")
+                    for j in jobs):
                 return jobs
             await asyncio.sleep(poll)
         raise GoChiDUBBError(f"Timeout after {timeout}s waiting for batch {batch_id}")

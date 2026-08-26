@@ -939,7 +939,8 @@ def stage_alerts(health: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def review_queue(jobs: Iterable[Dict[str, Any]],
                  keys: Iterable[Dict[str, Any]] = (), *,
-                 now: Optional[float] = None) -> List[Dict[str, Any]]:
+                 now: Optional[float] = None,
+                 presets: Iterable[Dict[str, Any]] = ()) -> List[Dict[str, Any]]:
     """The design's abuse queue, over signals this server can actually see.
 
     Three detector families, all real:
@@ -948,8 +949,11 @@ def review_queue(jobs: Iterable[Dict[str, Any]],
       median. On a hosted deployment this is the shape of a leaked key; on a
       local one it is still the shape of a script that got away.
     * **Unattested voice references.** Jobs that cloned from an uploaded
-      sample. There is no consent record anywhere in this codebase, so the
-      item says that — it is a list of clones to look at, not an accusation.
+      sample without a consent attestation (``job["voice_consent"]``,
+      written by POST /api/dub/{id}/consent). Clones that carry one are not
+      listed — they were checked, and passed. `presets`, when given
+      (scan_file_presets().values()), adds the library-preset attestation
+      count to the same item.
     * **Credential hygiene.** The same checks the accounts screen runs.
 
     Deliberately absent: DMCA and copyright. A claim queue needs somewhere

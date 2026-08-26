@@ -214,6 +214,94 @@ class TestPlanSegmentFit:
             max_stretch=1.4)
         assert speed == pytest.approx(1.4)
 
+
+class TestPlanSegmentFitPadSlack:
+    """pad_slack (CLD-268): spend inter-segment silence on an early start
+    instead of compressing harder — bounded so it can never overlap."""
+
+    def test_starts_early_by_up_to_the_slack(self):
+        start, _ = plan_segment_fit(
+            seg_start=10.0, next_start=15.0, tts_dur=1.0, current_end=5.0,
+            pad_slack=0.5)
+        assert start == pytest.approx(9.5)
+
+    def test_early_start_is_bounded_by_the_previous_segment(self):
+        start, _ = plan_segment_fit(
+            seg_start=10.0, next_start=15.0, tts_dur=1.0, current_end=9.8,
+            pad_slack=0.5)
+        assert start == pytest.approx(9.8 + MIN_SEGMENT_GAP)
+
+    def test_early_start_never_goes_negative(self):
+        start, _ = plan_segment_fit(
+            seg_start=0.2, next_start=5.0, tts_dur=1.0, current_end=0.0,
+            pad_slack=0.5)
+        assert start == 0.0
+
+    def test_slack_grows_the_budget_and_softens_the_compression(self):
+        no_pad = plan_segment_fit(
+            seg_start=10.0, next_start=12.0, tts_dur=2.5, current_end=5.0)
+        padded = plan_segment_fit(
+            seg_start=10.0, next_start=12.0, tts_dur=2.5, current_end=5.0,
+            pad_slack=0.5)
+        assert padded[0] < no_pad[0]
+        assert padded[1] < no_pad[1]
+
+    def test_zero_slack_is_the_old_behavior(self):
+        for kwargs in (
+            dict(seg_start=5.0, next_start=10.0, tts_dur=3.0, current_end=4.0),
+            dict(seg_start=1.0, next_start=5.0, tts_dur=6.0, current_end=0.0),
+            dict(seg_start=5.0, next_start=12.0, tts_dur=1.0, current_end=6.0),
+        ):
+            assert (plan_segment_fit(**kwargs)
+                    == plan_segment_fit(pad_slack=0.0, **kwargs))
+
+    def test_never_overlaps_the_previous_segment(self):
+        for slack in (0.0, 0.3, 1.0, 5.0):
+            start, _ = plan_segment_fit(
+                seg_start=10.0, next_start=15.0, tts_dur=1.0,
+                current_end=9.95, pad_slack=slack)
+            assert start >= 9.95 + MIN_SEGMENT_GAP - 1e-9
+
+
+class TestAssembleFitOverrides:
+    """assemble_dubbed_audio honours the per-segment sync-fit plan."""
+
+    def _segments(self, wav):
+        return [
+            {"idx": 0, "start": 1.0, "end": 1.4, "audio_path": wav,
+             "translated_text": "one"},
+            {"idx": 1, "start": 5.0, "end": 5.4, "audio_path": wav,
+             "translated_text": "two"},
+        ]
+
+    def test_pad_ms_places_the_segment_early(self, temp_audio_file, tmp_path):
+        from pipeline.assembler import assemble_dubbed_audio
+        segs = self._segments(temp_audio_file)
+        assemble_dubbed_audio(
+            segs, 10.0, str(tmp_path / "mix.wav"), apply_loudnorm=False,
+            fit_overrides={1: {"pad_ms": 300}})
+        assert segs[1]["placed_start"] == pytest.approx(4.7, abs=0.01)
+
+    def test_string_keys_work_like_json_round_tripped_ones(
+            self, temp_audio_file, tmp_path):
+        from pipeline.assembler import assemble_dubbed_audio
+        segs = self._segments(temp_audio_file)
+        assemble_dubbed_audio(
+            segs, 10.0, str(tmp_path / "mix.wav"), apply_loudnorm=False,
+            fit_overrides={"1": {"pad_ms": 300}})
+        assert segs[1]["placed_start"] == pytest.approx(4.7, abs=0.01)
+
+    def test_no_overrides_changes_nothing(self, temp_audio_file, tmp_path):
+        from pipeline.assembler import assemble_dubbed_audio
+        plain = self._segments(temp_audio_file)
+        assemble_dubbed_audio(plain, 10.0, str(tmp_path / "a.wav"),
+                              apply_loudnorm=False)
+        overridden = self._segments(temp_audio_file)
+        assemble_dubbed_audio(overridden, 10.0, str(tmp_path / "b.wav"),
+                              apply_loudnorm=False, fit_overrides={})
+        assert ([s.get("placed_start") for s in plain]
+                == [s.get("placed_start") for s in overridden])
+
     def test_does_not_compress_into_a_vanished_slot(self):
         """Past the next segment's start there is no room to budget against.
 
