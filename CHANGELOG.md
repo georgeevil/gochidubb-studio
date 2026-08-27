@@ -51,6 +51,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a clean venv at 1016/1016.
 
 ### Fixed
+- **Renaming the install directory stopped every download, with an error that
+  named a file which plainly existed.** A venv's console scripts hard-code the
+  interpreter's absolute path in their `#!` line, so moving or renaming the
+  directory leaves `venv/bin/yt-dlp` present and executable but pointing at a
+  python that is gone. `shutil.which` handed it back, exec failed, and the
+  kernel's `ENOENT` — which names the missing *interpreter* — was reported by
+  `subprocess` against the *script*: `No such file or directory:
+  '.../venv/bin/yt-dlp'`, for a file the user could see and `ls`. Candidates
+  are now screened for a live interpreter, and a stale script falls through to
+  `python -m yt_dlp`, which a rename cannot break. The check only rejects what
+  it can prove dead: `#!/usr/bin/env python` resolves through `PATH` at exec
+  time, and real binaries and unreadable files are still tried.
+
 - **Multi-language dubs failed the moment they left the queue.**
   `/api/quick_test` put `lip_sync` into the pipeline arguments, and the queue
   worker splats those into `run_pipeline(job_id, **args)` — which has no such

@@ -14,6 +14,32 @@ from pipeline import rescue
 log = logging.getLogger("gochidubb.downloader")
 
 
+def _shebang_is_live(path: str) -> bool:
+    """False when `path` is a script whose #! interpreter no longer exists.
+
+    Moving or renaming a venv's directory leaves every console script in
+    `venv/bin` pointing at the interpreter's old absolute path. The script
+    itself is still there and still executable, so `shutil.which` hands it
+    back happily — but exec'ing it fails, and the kernel's ENOENT names the
+    *interpreter*, which subprocess then reports against the script path:
+    "[Errno 2] No such file or directory: '.../venv/bin/yt-dlp'", for a file
+    that plainly exists. Treat such a script as not found so the caller can
+    fall back to `python -m yt_dlp`, which is unaffected.
+    """
+    try:
+        with open(path, "rb") as fh:
+            if fh.read(2) != b"#!":
+                return True  # a real binary, or unreadable as text — not our case
+            line = fh.readline().decode("utf-8", "replace").strip()
+    except OSError:
+        return True  # can't tell; let the caller try it
+    interp = shlex.split(line)[0] if line else ""
+    # `#!/usr/bin/env python` resolves through PATH at exec time, not here.
+    if not interp or os.path.basename(interp) == "env":
+        return True
+    return os.path.exists(interp)
+
+
 def _find_ytdlp() -> str:
     """Find yt-dlp executable across platforms."""
     exe_dir = os.path.dirname(sys.executable)
@@ -35,10 +61,10 @@ def _find_ytdlp() -> str:
     for c in candidates:
         # shutil.which accepts full paths
         found = shutil.which(c)
-        if found:
+        if found and _shebang_is_live(found):
             return found
         # also accept if it's just a direct file
-        if os.path.isfile(c):
+        if os.path.isfile(c) and _shebang_is_live(c):
             return c
 
     # Last resort: use Python module invocation
