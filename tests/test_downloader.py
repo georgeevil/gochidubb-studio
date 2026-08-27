@@ -1,5 +1,6 @@
 """Tests for pipeline/downloader.py — yt-dlp discovery, metadata, cookies."""
 import shlex
+import sys
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +13,7 @@ from pipeline.downloader import (
     _find_ytdlp,
     _is_403,
     _parse_probe_json,
+    _shebang_is_live,
     classify_download_failure,
     curate_metadata,
     download_video,
@@ -66,6 +68,44 @@ class TestFindYtdlp:
         # All isfile calls return True, so first candidate matches
         result = _find_ytdlp()
         assert result is not None
+
+
+class TestShebangIsLive:
+    """A moved venv leaves console scripts pointing at a python that is gone."""
+
+    def _script(self, tmp_path, name, first_line):
+        p = tmp_path / name
+        p.write_text(f"{first_line}\nimport sys\n")
+        p.chmod(0o755)
+        return str(p)
+
+    def test_stale_interpreter_is_dead(self, tmp_path):
+        script = self._script(tmp_path, "yt-dlp", "#!/gone/venv/bin/python3.11")
+        assert _shebang_is_live(script) is False
+
+    def test_live_interpreter(self, tmp_path):
+        script = self._script(tmp_path, "yt-dlp", f"#!{sys.executable}")
+        assert _shebang_is_live(script) is True
+
+    def test_env_shebang_resolves_at_exec_time(self, tmp_path):
+        script = self._script(tmp_path, "yt-dlp", "#!/usr/bin/env python3")
+        assert _shebang_is_live(script) is True
+
+    def test_binary_has_no_shebang(self, tmp_path):
+        p = tmp_path / "yt-dlp"
+        p.write_bytes(b"\x7fELF\x02\x01\x01\x00")
+        assert _shebang_is_live(str(p)) is True
+
+    def test_missing_file_is_left_to_the_caller(self, tmp_path):
+        assert _shebang_is_live(str(tmp_path / "nope")) is True
+
+    def test_find_ytdlp_skips_a_stale_script(self, tmp_path):
+        """The whole point: a broken venv script must not win over the fallback."""
+        stale = self._script(tmp_path, "yt-dlp", "#!/gone/venv/bin/python3.11")
+        with patch("sys.platform", "linux"), \
+             patch("shutil.which", side_effect=lambda c: stale if c == "yt-dlp" else None), \
+             patch("os.path.isfile", return_value=False):
+            assert _find_ytdlp() is None
 
 
 # ── curate_metadata ──────────────────────────────────────────────────
