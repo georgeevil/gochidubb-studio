@@ -131,6 +131,7 @@ class GoChiDUBBClient:
         voxcpm_cfg: float = 0.0,
         voxcpm_steps: int = 0,
         review_gates: Optional[dict] = None,
+        stop_after: str = "",
         prompt: Optional[str] = None,
     ) -> dict:
         """Submit a single-language dub. Returns dict with `job_id`.
@@ -143,6 +144,12 @@ class GoChiDUBBClient:
         voice_cast / subtitles / final_qc. Sending it supersedes
         wizard_mode. Each armed gate parks the job at an awaiting_* status
         until /continue.
+
+        stop_after: run the pipeline only through this stage (download,
+        extract, transcribe, diarize, translate, tts, assemble, merge) and
+        finish there in status 'paused'. Unlike a review gate this waits for
+        nobody — the artifacts are on disk and /continue resumes the rest
+        later, if you want it.
 
         mode: 'dub' (full pipeline) or 'reupload' (download + remux only —
         used for music videos where dubbing makes no sense).
@@ -174,6 +181,8 @@ class GoChiDUBBClient:
             form["scheduled_at"] = str(float(scheduled_at))
         if review_gates:
             form["review_gates"] = json.dumps(review_gates)
+        if stop_after:
+            form["stop_after"] = stop_after
         return await self._request("POST", "/api/dub", data=form, files=files,
                                    headers=self._prompt_headers(prompt))
 

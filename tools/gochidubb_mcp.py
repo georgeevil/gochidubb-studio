@@ -103,6 +103,7 @@ async def gochidubb_dub(
     voxcpm_cfg: float = 0.0,
     voxcpm_steps: int = 0,
     review_gates: Optional[dict] = None,
+    stop_after: str = "",
     prompt: str = "",
     wait: bool = False,
     wait_timeout: float = 1800.0,
@@ -123,6 +124,11 @@ async def gochidubb_dub(
         wizard_mode: 'auto', or one of 'review_translation',
             'review_transcript', 'review_voices' — pause the job for human
             review at that checkpoint.
+        stop_after: Run only through this stage — download, extract,
+            transcribe, diarize, translate, tts, assemble, merge — and finish
+            there in status 'paused', artifacts kept. Unlike a review gate
+            nothing waits for approval; use it when the transcript (or the
+            subtitles) is the product and the dub is not.
         mode: 'dub' (full pipeline) or 'reupload' (download + remux only —
             for music videos where dubbing makes no sense).
         scheduled_at: unix epoch seconds; a future timestamp parks the job
@@ -160,7 +166,7 @@ async def gochidubb_dub(
         context_hint=context_hint, wizard_mode=wizard_mode,
         mode=mode, scheduled_at=scheduled_at,
         voxcpm_cfg=voxcpm_cfg, voxcpm_steps=voxcpm_steps,
-        review_gates=review_gates, prompt=prompt,
+        review_gates=review_gates, stop_after=stop_after, prompt=prompt,
     )
     job_id = res.get("job_id")
     if wait and job_id and not res.get("scheduled_at"):
