@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **History can act on many jobs at once without losing its place.** The
+  publish-inbox filter used to live inside the scrolling list, so toggling it
+  scrolled you away from what you were looking at; it now sits in the pane
+  header as a prop the list receives. Selecting rows raises a bulk-action bar
+  that is sticky rather than fixed: it casts a shadow only once rows are
+  actually passing underneath it, because a bar with a permanent shadow reads
+  as a second header. Escape clears the selection, the same exit the bar's own
+  close button offers, and the select-all box reports `indeterminate` for a
+  partial selection instead of pretending it is on or off.
+
+  This change was found uncommitted in the working tree of the main checkout,
+  with no branch and no owner, and is packaged here exactly as found; the
+  running server has been serving it from that working copy since it was
+  written, and the page rendered without console errors.
+
 - **A job can be told to run only part of the pipeline.** The driver has always
   been able to stop early — `run_pipeline_stages` takes `stop_after`, and its
   tail lands the job on `paused` with its checkpoint named — but only
