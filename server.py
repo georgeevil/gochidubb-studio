@@ -3759,6 +3759,15 @@ async def run_pipeline_stages(
         update(status="error")
 
 
+def _earlier_stage(a: str, b: str) -> str:
+    """The earlier of two stage ids; "" means "no ceiling" and loses to any id."""
+    if not a:
+        return b
+    if not b:
+        return a
+    return a if _stage_index(a) <= _stage_index(b) else b
+
+
 async def run_pipeline(
     job_id: str,
     source: str,
@@ -3783,6 +3792,10 @@ async def run_pipeline(
     # Resolved {gate: mode} dict from the submit route; None = resolve here
     # from wizard_mode (legacy enqueue sites, batch/showcase fan-outs).
     review_gates: Optional[dict] = None,
+    # Stage id to halt after; "" runs to the end. Trailing kwarg on purpose —
+    # the queue passes args as a dict, but the legacy positional tuple path
+    # in _job_queue_worker must keep working.
+    stop_after: str = "",
 ):
     """Main dubbing pipeline entry point.
 
@@ -3821,9 +3834,13 @@ async def run_pipeline(
     # Reupload mode walks only the download stage; the driver's tail then
     # finalizes dubbed_video.mp4 from the source (see _finalize_reupload).
     stage_ids = stages_for_mode(job["mode"])
-    stop_after = stage_ids[-1] if len(stage_ids) < len(STAGE_ORDER) else ""
+    mode_stop = stage_ids[-1] if len(stage_ids) < len(STAGE_ORDER) else ""
+    # A requested stop and the mode's own last stage are both ceilings, so
+    # the earlier one wins: asking a reupload job to run through 'translate'
+    # cannot make it translate, and it must not silently run past download.
+    job["stop_after"] = final_stop = _earlier_stage(stop_after, mode_stop)
     await run_pipeline_stages(
-        job_id, ctx, start_stage=stage_ids[0], stop_after=stop_after)
+        job_id, ctx, start_stage=stage_ids[0], stop_after=final_stop)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -4811,6 +4828,7 @@ async def start_dub(
     wizard_mode: str = Form("auto"),  # "auto" | "review_translation"
                                       # | "review_transcript" | "review_voices"
     review_gates: str = Form(""),  # JSON {gate: mode}; wins over wizard_mode
+    stop_after: str = Form(""),  # stage id to halt after; "" = run to the end
     auto_denoise: bool = Form(False),
     lip_sync: bool = Form(False),  # if True, auto-run Wav2Lip after pipeline completes
     mode: str = Form("dub"),  # "dub" | "reupload" (3E: reupload = no dubbing)
@@ -4831,6 +4849,16 @@ async def start_dub(
     explicit_gates, _gate_err = _parse_review_gates_form(review_gates)
     if _gate_err:
         return JSONResponse({"error": _gate_err}, 400)
+
+    # A partial run: the driver already knows how to stop after a stage and
+    # land on 'paused' (run_pipeline_stages' tail) — this is the submit side
+    # of it. Unlike a review gate, nothing waits on an approval: the job ends
+    # there with its artifacts on disk, and /continue picks it up later if
+    # the rest turns out to be worth running.
+    if stop_after and stop_after not in STAGE_ORDER:
+        return JSONResponse(
+            {"error": f"Unknown stop_after '{stop_after}'. "
+                      f"Stages: {', '.join(STAGE_ORDER)}"}, 400)
 
     # Validate translation model exists in Ollama - fall back gracefully
     # otherwise. Reupload jobs never translate, so they skip the check —
@@ -4952,6 +4980,7 @@ async def start_dub(
         "voxcpm_cfg": voxcpm_cfg,
         "voxcpm_steps": voxcpm_steps,
         "review_gates": resolved_gates,
+        "stop_after": stop_after,
     }
 
     jobs[job_id] = {
@@ -4975,6 +5004,7 @@ async def start_dub(
         "wizard_mode": wizard_mode,
         "review_gates": resolved_gates,
         "gates_cleared": [],
+        "stop_after": stop_after,
         "lip_sync": bool(lip_sync),
         "mode": mode,
         "created": time.time(),
@@ -5018,6 +5048,7 @@ async def start_batch_dub(
     voice_preset: str = Form("auto"),
     tts_speed: str = Form("balanced"),
     wizard_mode: str = Form("auto"),  # Usually "auto" for batch — no pauses
+    stop_after: str = Form(""),  # stage id to halt every job after; "" = full run
     auto_denoise: bool = Form(False),
     batch_label: str = Form(""),  # optional: "BJJ Course Week 1" for summary
     scheduled_at: float = Form(0.0),  # unix epoch seconds; 0 = start immediately
@@ -5042,6 +5073,11 @@ async def start_batch_dub(
         voxcpm_cfg, voxcpm_steps)
     if _vox_err:
         return JSONResponse({"error": _vox_err}, 400)
+
+    if stop_after and stop_after not in STAGE_ORDER:
+        return JSONResponse(
+            {"error": f"Unknown stop_after '{stop_after}'. "
+                      f"Stages: {', '.join(STAGE_ORDER)}"}, 400)
 
     # Validate Ollama model once (not per-job)
     _ok, _installed = await check_ollama()
@@ -5151,6 +5187,7 @@ async def start_batch_dub(
                 "voice_preset": voice_preset, "tts_speed": tts_speed,
                 "wizard_mode": wizard_mode, "auto_denoise": auto_denoise,
                 "voxcpm_cfg": voxcpm_cfg, "voxcpm_steps": voxcpm_steps,
+                "stop_after": stop_after,
             } if is_scheduled else None),
         }
         save_job(jobs[jid])
@@ -5163,6 +5200,7 @@ async def start_batch_dub(
             "voice_preset": voice_preset, "tts_speed": tts_speed,
             "wizard_mode": wizard_mode, "auto_denoise": auto_denoise,
             "voxcpm_cfg": voxcpm_cfg, "voxcpm_steps": voxcpm_steps,
+            "stop_after": stop_after,
         })
         job_ids.append(jid)
 
@@ -5210,6 +5248,7 @@ async def start_batch_dub(
                 "voice_preset": voice_preset, "tts_speed": tts_speed,
                 "wizard_mode": wizard_mode, "auto_denoise": auto_denoise,
                 "voxcpm_cfg": voxcpm_cfg, "voxcpm_steps": voxcpm_steps,
+                "stop_after": stop_after,
             } if is_scheduled else None),
         }
         save_job(jobs[jid])
@@ -5222,6 +5261,7 @@ async def start_batch_dub(
             "voice_preset": voice_preset, "tts_speed": tts_speed,
             "wizard_mode": wizard_mode, "auto_denoise": auto_denoise,
             "voxcpm_cfg": voxcpm_cfg, "voxcpm_steps": voxcpm_steps,
+            "stop_after": stop_after,
         })
         job_ids.append(jid)
 
@@ -10047,6 +10087,7 @@ async def continue_pipeline(
                 "voxcpm_cfg": float(job.get("voxcpm_cfg") or 0.0),
                 "voxcpm_steps": int(job.get("voxcpm_steps") or 0),
                 "review_gates": dict(gates) if isinstance(gates, dict) else None,
+                "stop_after": job.get("stop_after") or "",
             })
             log.info(f"[continue] Job {job_id} had no checkpoint (restart "
                      f"orphan) — requeued from the start")

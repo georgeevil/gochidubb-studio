@@ -147,6 +147,7 @@ async def cmd_dub(c: GoChiDUBBClient, a) -> None:
         voxcpm_cfg=a.voxcpm_cfg, voxcpm_steps=a.voxcpm_steps,
         review_gates=parse_review_gates(a.review_gates) if a.review_gates
         else None,
+        stop_after=a.stop_after or "",
     )
     job_id = res.get("job_id")
     _print_json(res)
@@ -683,6 +684,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "gate=mode pairs over transcript/translation/"
                         "voice_cast/subtitles/final_qc, e.g. "
                         "translation=on,subtitles=flagged_only")
+    s.add_argument("--stop-after", metavar="STAGE", default="",
+                   help="Run only through this stage and finish there "
+                        "(download/extract/transcribe/diarize/translate/"
+                        "tts/assemble/merge). The job ends 'paused' with its "
+                        "artifacts kept — nothing waits for an approval, and "
+                        "`continue` resumes it if you want the rest.")
     _add_common_dub_opts(s)
     s.set_defaults(handler=cmd_dub)
 

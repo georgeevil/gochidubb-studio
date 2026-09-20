@@ -124,6 +124,20 @@ const STAGES = [
   { id: 'master',     label: 'Master',     hint: 'Mix & merge' },
 ];
 
+// Where a run may be told to stop — these are the PIPELINE stage ids
+// (server.STAGE_ORDER), not the six presentation stages above. A partial run
+// ends in status 'paused' with its artifacts kept and nothing waiting on a
+// human, which is the difference between this and a review gate.
+const RUN_UNTIL = [
+  { id: '',           label: 'The whole dub — download to final mix' },
+  { id: 'extract',    label: 'Audio only — extract and stop' },
+  { id: 'transcribe', label: 'Transcript — no speaker labels' },
+  { id: 'diarize',    label: 'Transcript + speakers — no translation' },
+  { id: 'translate',  label: 'Translated subtitles — no voices' },
+  { id: 'tts',        label: 'Synthesized voices — no video' },
+  { id: 'assemble',   label: 'Assembled audio — no final mux' },
+];
+
 const stageForStatus = (status) => {
   switch (status) {
     case 'queued': case 'scheduled': case 'downloading': case 'extracting': case 'resuming':
@@ -499,10 +513,12 @@ function Field({ label, hint, children }) {
   );
 }
 
-function Select({ value, onChange, children }) {
+function Select({ value, onChange, children, disabled = false }) {
   return (
-    <select value={value} onChange={e => onChange(e.target.value)} className="field" style={{
-      cursor: 'pointer', appearance: 'none', paddingRight: 28,
+    <select value={value} onChange={e => onChange(e.target.value)} className="field"
+            disabled={disabled} style={{
+      cursor: disabled ? 'not-allowed' : 'pointer',
+      opacity: disabled ? 0.5 : 1, appearance: 'none', paddingRight: 28,
       backgroundImage: "url(\"data:image/svg+xml,%3Csvg width='10' height='10' viewBox='0 0 10 10' fill='none'%3E%3Cpath d='M2 4l3 3 3-3' stroke='%235a5a63' stroke-width='1.2'/%3E%3C/svg%3E\")",
       backgroundRepeat: 'no-repeat', backgroundPosition: 'right 10px center',
     }}>{children}</select>
@@ -1048,6 +1064,7 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
   // still maps onto the gate it used to mean.
   const [wizardMode, setWizardMode] = useState(
     () => _lsGet('wizardMode', _lsGet('wizardReview', false) ? 'review_translation' : 'auto'));
+  const [stopAfter, setStopAfter] = useState(() => _lsGet('stopAfter', ''));
   // Per-job VoxCPM overrides. 0 = "auto", i.e. follow Settings -> Voice & TTS.
   const [voxCfg, setVoxCfg] = useState(() => _lsGet('voxCfg', 0));
   const [voxSteps, setVoxSteps] = useState(() => _lsGet('voxSteps', 0));
@@ -1160,6 +1177,7 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
   useEffect(() => { _lsSet('lipSync', lipSync); }, [lipSync]);
   useEffect(() => { _lsSet('llmRegroup', llmRegroup); }, [llmRegroup]);
   useEffect(() => { _lsSet('wizardMode', wizardMode); }, [wizardMode]);
+  useEffect(() => { _lsSet('stopAfter', stopAfter); }, [stopAfter]);
   useEffect(() => { _lsSet('voxCfg', voxCfg); }, [voxCfg]);
   useEffect(() => { _lsSet('voxSteps', voxSteps); }, [voxSteps]);
   useEffect(() => { _lsSet('qtTrim', qtTrimSeconds); }, [qtTrimSeconds]);
@@ -1189,7 +1207,11 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
     fd.append('tts_speed', ttsSpeed);
     fd.append('voxcpm_cfg', String(voxCfg));
     fd.append('voxcpm_steps', String(voxSteps));
-    fd.append('wizard_mode', wizardMode);
+    // A stop point and a review gate both answer "where should this end?".
+    // Sending both would park the job at the gate first and wait for an
+    // approval the user did not ask for, so the stop point wins outright.
+    fd.append('wizard_mode', stopAfter ? 'auto' : wizardMode);
+    if (stopAfter) fd.append('stop_after', stopAfter);
     fd.append('auto_denoise', autoDenoise);
     fd.append('llm_regroup', llmRegroup);
     fd.append('lip_sync', lipSync);
@@ -1224,6 +1246,7 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
     fd.append('voxcpm_cfg', String(voxCfg));
     fd.append('voxcpm_steps', String(voxSteps));
     fd.append('wizard_mode', 'auto');
+    if (stopAfter) fd.append('stop_after', stopAfter);
     fd.append('auto_denoise', autoDenoise);
     fd.append('llm_regroup', llmRegroup);
     fd.append('batch_label', batchLabel || `Batch ${new Date().toLocaleString()}`);
@@ -1570,12 +1593,31 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
                  hint="Both gates sit in front of synthesis, which is by far the
                        longest stage — a 1602-segment dub spent 12 hours in it.
                        Anything caught here is caught before that.">
-            <Select value={wizardMode} onChange={setWizardMode}>
+            <Select value={wizardMode} onChange={setWizardMode}
+                    disabled={!!stopAfter}>
               <option value="auto">Don't pause — run straight through</option>
               <option value="review_translation">After translation — edit the lines</option>
               <option value="review_voices">After translation — cast a voice per speaker</option>
             </Select>
           </Field>
+        </div>
+        <div style={{ marginTop: 12 }}>
+          <Field label="Run until"
+                 hint="A review gate pauses and waits to be approved; this just
+                       ends the job there, artifacts kept, nothing queued behind
+                       it. Use it when the transcript is the product and the dub
+                       is not — you can still Continue the rest later.">
+            <Select value={stopAfter} onChange={setStopAfter}>
+              {RUN_UNTIL.map(o => (
+                <option key={o.id} value={o.id}>{o.label}</option>
+              ))}
+            </Select>
+          </Field>
+          {stopAfter ? (
+            <div className="mono" style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 6 }}>
+              Stops after '{stopAfter}' · review gates off for this run
+            </div>
+          ) : null}
         </div>
 
         {/* Per-job VoxCPM tuning. The same two knobs live in Settings ->

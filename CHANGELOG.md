@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A job can be told to run only part of the pipeline.** The driver has always
+  been able to stop early — `run_pipeline_stages` takes `stop_after`, and its
+  tail lands the job on `paused` with its checkpoint named — but only
+  `/api/job/{id}/retry_stage` could ask for it. The single way to end a *new*
+  job before the dub was a review gate, which answers a different question: a
+  gate waits for a human, and approving it runs everything after. When the
+  transcript is the product and the dub is not, that is a footgun — an
+  approval click sends hours of speaker-diarized Spanish into a translate
+  stage nobody wanted.
+
+  `stop_after` is now a submit-time field on `/api/dub` and `/api/dub/batch`
+  (an unknown stage is a 400 naming the valid ones), on the client, on the MCP
+  `gochidubb_dub` tool, and as `--stop-after` on the CLI's `dub` — the same
+  word `retry-stage` already uses for the same thing. New dub's **Advanced**
+  block gets a **Run until** select that disables "Pause for review" while it
+  is set: a stop point and a gate are two answers to one question, so the stop
+  point wins and the run goes out with gates off.
+
+  It survives the paths that would otherwise quietly widen it — the scheduler's
+  `_pending_args` and `/continue`'s restart-orphan re-enqueue both carry it, so
+  a server restart cannot promote a partial run into a full dub. `mode` and
+  `stop_after` are both ceilings and the earlier one wins, so asking a
+  `reupload` job to run through `translate` still cannot make it translate.
+
 - **Per-job VoxCPM guidance and inference steps.** Settings → Voice & TTS set
   these globally, and per-job control stopped at the fast/balanced/quality
   tier. But tuning is per-job by nature — one hard source (heavy accent, noisy
