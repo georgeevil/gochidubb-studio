@@ -107,6 +107,32 @@ class TestShebangIsLive:
              patch("os.path.isfile", return_value=False):
             assert _find_ytdlp() is None
 
+    def _apostrophe_venv_script(self, tmp_path):
+        """A live script whose interpreter path holds a quote character.
+
+        pip writes the raw interpreter path into the shebang whenever it has
+        no space in it, so a venv under a directory like George's-projects
+        produces exactly this. The kernel splits a #! line on whitespace and
+        nothing else, so it runs fine; a shell-quoting parser chokes on it.
+        """
+        interp = tmp_path / "George's-venv" / "bin" / "python"
+        interp.parent.mkdir(parents=True)
+        interp.touch()
+        return self._script(tmp_path, "yt-dlp", f"#!{interp}")
+
+    def test_apostrophe_in_interpreter_path_is_live(self, tmp_path):
+        script = self._apostrophe_venv_script(tmp_path)
+        assert _shebang_is_live(script) is True
+
+    def test_find_ytdlp_returns_a_script_with_an_apostrophe_path(self, tmp_path):
+        """Regression: shlex raised ValueError here and _find_ytdlp propagated
+        it, so neither the script nor the `python -m yt_dlp` fallback was used."""
+        script = self._apostrophe_venv_script(tmp_path)
+        with patch("sys.platform", "linux"), \
+             patch("shutil.which", side_effect=lambda c: script if c == "yt-dlp" else None), \
+             patch("os.path.isfile", return_value=False):
+            assert _find_ytdlp() == script
+
 
 # ── curate_metadata ──────────────────────────────────────────────────
 

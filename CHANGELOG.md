@@ -75,6 +75,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a clean venv at 1016/1016.
 
 ### Fixed
+- **An apostrophe in the install path crashed yt-dlp resolution outright.** The
+  live-interpreter check that PR #45 added to `_find_ytdlp` read each
+  candidate's `#!` line through `shlex.split`, which applies shell quoting
+  rules. The kernel applies none: `execve` splits a shebang on whitespace and
+  treats every other character as part of the path. pip writes the raw
+  interpreter path into the shebang whenever it contains no space, so a venv
+  under a directory such as `George's-projects` produces a console script the
+  kernel runs happily and `shlex` refuses to parse — `ValueError: No closing
+  quotation`. That exception escaped `_find_ytdlp`, so the resolver neither
+  returned the working script nor fell through to `python -m yt_dlp`; every
+  download failed at the point of choosing a downloader. The check now splits
+  the line on whitespace only, matching what `execve` does, and a test pins a
+  script under a `George's-venv` directory as live and resolvable.
+
 - **Renaming the install directory stopped every download, with an error that
   named a file which plainly existed.** A venv's console scripts hard-code the
   interpreter's absolute path in their `#!` line, so moving or renaming the
