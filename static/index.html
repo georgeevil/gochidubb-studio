@@ -5442,13 +5442,14 @@ function ResultView({ jobs, selectedJobId, voicePresets, system, onRefresh, onPi
 // HISTORY VIEW (placeholder)
 // ═══════════════════════════════════════════════════════════════════
 function HistoryView({ jobs, system, voicePresets, publishPending = [],
+                       publishOnly = false,
                        onJumpProcessing, onJumpReview, onJumpResult, onRefresh }) {
   // Which job's stage breakdown is expanded. Errored jobs are the main
   // reason to open this — the panel says which stage died and offers a
   // retry from exactly there.
   const [openId, setOpenId] = useState(null);
-  // Publish inbox: filter the list down to jobs waiting for approval.
-  const [publishOnly, setPublishOnly] = useState(false);
+  // Publish inbox: the toggle now lives in the pane header next to the title,
+  // outside this scroller, so the filter state comes in as a prop.
   const pendingIds = useMemo(() => new Set(publishPending.map(p => p.job_id)), [publishPending]);
   const shown = publishOnly ? jobs.filter(j => pendingIds.has(j.id)) : jobs;
 
@@ -5528,6 +5529,31 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
     setSelected(allSelected ? new Set() : new Set(visible.map(j => j.id)));
     setAnchor(null); setConfirming(false);
   };
+  const clearSelection = () => { setSelected(new Set()); setAnchor(null); setConfirming(false); };
+
+  // The bar only exists while something is selected, so Escape is the way out
+  // that costs no aim — the same gesture the ✕ on the bar performs.
+  useEffect(() => {
+    if (selected.size === 0) return;
+    const h = (e) => { if (e.key === 'Escape') clearSelection(); };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [selected.size]);
+
+  // A partial selection is neither on nor off, and `indeterminate` is only
+  // reachable from the DOM node.
+  const allCheckRef = useRef(null);
+  useEffect(() => {
+    if (allCheckRef.current) {
+      allCheckRef.current.indeterminate = selected.size > 0 && !allSelected;
+    }
+  }, [selected.size, allSelected]);
+
+  // The bar is sticky, not fixed, so it has no shadow of its own at rest —
+  // it only casts one once rows are actually passing underneath it. Sticky
+  // engages exactly at scrollTop > 0, which is cheaper to read than an
+  // IntersectionObserver on a sentinel.
+  const [stuck, setStuck] = useState(false);
 
   const doDelete = async () => {
     setBusy(true); setNote('');
@@ -5550,90 +5576,88 @@ function HistoryView({ jobs, system, voicePresets, publishPending = [],
     }
   };
   return (
-    <div className="scroll" style={{ flex: 1, padding: 'var(--pad)', background: 'var(--bg)' }}>
-      <div style={{ display: 'flex', alignItems: 'baseline', gap: 14, marginBottom: 20, flexWrap: 'wrap' }}>
-        <div className="serif" style={{ fontSize: 'clamp(22px, 6vw, 32px)' }}>History · {jobs.length} jobs</div>
-        {publishPending.length > 0 && (
-          <button className="chip" onClick={() => setPublishOnly(o => !o)} style={{
-            color: 'var(--warn)', cursor: 'pointer',
-            borderColor: 'oklch(0.78 0.15 60 / 0.3)',
-            background: publishOnly ? 'oklch(0.78 0.15 60 / 0.15)' : 'oklch(0.78 0.15 60 / 0.06)',
-          }}>
-            {publishPending.length} awaiting publish approval {publishOnly ? '· show all' : ''}
-          </button>
-        )}
-      </div>
-      {publishOnly && shown.length === 0 && (
-        <div style={{ color: 'var(--ink-3)', fontSize: 12, marginBottom: 12 }}>
-          Pending publishes exist but their jobs are not in the visible list.
-        </div>
-      )}
-      {/* Selection toolbar. Always present so "Select all" is discoverable
-          without first hunting for a checkbox. */}
-      {visible.length > 0 && (
+    // The pane's scroller, and nothing else: it owns no header of its own, so
+    // there is nothing for the header block above it to overlap with.
+    // No padding-top on purpose. A sticky child's `top: 0` resolves against
+    // the scroller's padding edge, so 40px here parked the stuck bar 40px
+    // down the scrollport and let a row show through above it. The gap over
+    // the first row is the header block's padding-bottom instead.
+    <div className="scroll" onScroll={e => setStuck(e.currentTarget.scrollTop > 0)}
+         style={{ flex: '1 1 auto', minHeight: 0,
+                  padding: '0 var(--pad) var(--pad)', background: 'var(--bg)' }}>
+      {/* Bulk-action bar. First child of the scroller and sticky rather than
+          fixed, so it stays in flow and cannot come to rest on top of a row.
+          It appears only once something is selected — the row checkboxes are
+          how a selection starts, and "Select all N shown" is how it widens. */}
+      {selected.size > 0 && (
         <div ref={confirmRef} style={{
-          display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10,
+          display: 'flex', alignItems: 'center', gap: 16, rowGap: 6,
           flexWrap: 'wrap', fontSize: 12,
-          // Sticky so a confirmation raised from a row 40 items down is on
-          // screen rather than somewhere above it. Opaque, and bled out over
-          // the scroll container's padding, so rows pass underneath it
-          // instead of through it.
-          position: 'sticky', top: 0, zIndex: 5,
+          position: 'sticky', top: 0, zIndex: 10,
           background: 'var(--bg)',
-          padding: confirming ? '8px 10px' : '6px 10px',
-          margin: '0 -10px 10px',
-          borderRadius: 'var(--r-md)',
-          border: '1px solid ' + (confirming ? 'oklch(0.7 0.2 25 / 0.35)' : 'transparent'),
+          borderBottom: '1px solid var(--line-2)',
+          // Only while stuck: at rest there is nothing underneath to lift off.
+          boxShadow: stuck ? '0 6px 12px rgba(0,0,0,.45)' : 'none',
+          // 11px left = the row's 1px border plus its 10px padding, so this
+          // checkbox lands in the same column as every row checkbox.
+          padding: confirming ? '12px 11px' : '10px 11px',
+          marginBottom: 10,
         }}>
           <label style={{ display: 'flex', alignItems: 'center', gap: 7, cursor: 'pointer',
                           color: 'var(--ink-2)' }}>
-            <input type="checkbox" checked={allSelected} onChange={selectAll}
+            <input ref={allCheckRef} type="checkbox" checked={allSelected} onChange={selectAll}
                    style={{ accentColor: 'var(--accent)', width: 14, height: 14, cursor: 'pointer' }}/>
             {allSelected ? 'Clear selection' : `Select all ${visible.length} shown`}
           </label>
-          {selected.size > 0 && (
+          <span className="mono" style={{ color: 'var(--ink-3)', fontSize: 11 }}>
+            {selected.size} selected
+          </span>
+          {!confirming ? (
+            <button className="btn" onClick={() => setConfirming(true)} disabled={busy}
+                    style={{ color: 'var(--err)', borderColor: 'oklch(0.7 0.2 25 / 0.35)' }}>
+              Delete {selected.size}
+            </button>
+          ) : (
             <>
-              <span className="mono" style={{ color: 'var(--ink-3)', fontSize: 11 }}>
-                {selected.size} selected
+              <span style={{ color: 'var(--err)' }}>
+                {selected.size === 1
+                  ? `Delete “${(() => {
+                      const one = visible.find(v => selected.has(v.id));
+                      const name = (one && (one.title || one.source_label || one.id)) || 'this job';
+                      return name.length > 60 ? name.slice(0, 60) + '…' : name;
+                    })()}” and its files?`
+                  : `Delete ${selected.size} jobs and their files?`}
+                {' '}This cannot be undone.
               </span>
-              {!confirming ? (
-                <button className="btn" onClick={() => setConfirming(true)} disabled={busy}
-                        style={{ color: 'var(--err)', borderColor: 'oklch(0.7 0.2 25 / 0.35)' }}>
-                  Delete {selected.size}
-                </button>
-              ) : (
-                <>
-                  <span style={{ color: 'var(--err)' }}>
-                    {selected.size === 1
-                      ? `Delete “${(() => {
-                          const one = visible.find(v => selected.has(v.id));
-                          const name = (one && (one.title || one.source_label || one.id)) || 'this job';
-                          return name.length > 60 ? name.slice(0, 60) + '…' : name;
-                        })()}” and its files?`
-                      : `Delete ${selected.size} jobs and their files?`}
-                    {' '}This cannot be undone.
-                  </span>
-                  <button className="btn" onClick={doDelete} disabled={busy}
-                          style={{ background: 'oklch(0.7 0.2 25 / 0.15)', color: 'var(--err)',
-                                   borderColor: 'oklch(0.7 0.2 25 / 0.35)' }}>
-                    {busy ? 'Deleting…' : 'Yes, delete'}
-                  </button>
-                  <button className="btn btn-ghost" onClick={() => setConfirming(false)} disabled={busy}>
-                    Cancel
-                  </button>
-                </>
-              )}
-              {liveSelected > 0 && (
-                <span style={{ color: 'var(--warn)', fontSize: 11 }}>
-                  {liveSelected} still running — {liveSelected === 1 ? 'it' : 'they'} will be skipped
-                </span>
-              )}
+              <button className="btn" onClick={doDelete} disabled={busy}
+                      style={{ background: 'oklch(0.7 0.2 25 / 0.15)', color: 'var(--err)',
+                               borderColor: 'oklch(0.7 0.2 25 / 0.35)' }}>
+                {busy ? 'Deleting…' : 'Yes, delete'}
+              </button>
+              <button className="btn btn-ghost" onClick={() => setConfirming(false)} disabled={busy}>
+                Cancel
+              </button>
             </>
+          )}
+          {liveSelected > 0 && (
+            <span style={{ color: 'var(--warn)', fontSize: 11 }}>
+              {liveSelected} still running — {liveSelected === 1 ? 'it' : 'they'} will be skipped
+            </span>
           )}
           <div style={{ flex: 1 }}/>
           <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-4)' }}>
             shift-click a checkbox to select a range
           </span>
+          <button className="btn btn-ghost" onClick={clearSelection} disabled={busy}
+                  title="Clear selection (Esc)" aria-label="Clear selection"
+                  style={{ padding: '2px 7px', fontSize: 12, color: 'var(--ink-3)' }}>
+            ✕
+          </button>
+        </div>
+      )}
+      {publishOnly && shown.length === 0 && (
+        <div style={{ color: 'var(--ink-3)', fontSize: 12, marginBottom: 12 }}>
+          Pending publishes exist but their jobs are not in the visible list.
         </div>
       )}
       {note && (
@@ -7718,12 +7742,39 @@ function JobsView({ tab, setTab, jobs, system, voicePresets, publishPending, run
     { id: 'review',  label: 'Review',  badge: awaitingReviewCount > 0 ? String(awaitingReviewCount) : null },
     { id: 'batches', label: 'Batches' },
   ];
+  // Publish-inbox filter. It belongs to the header rather than to the list,
+  // because its chip sits beside the title above the scroller.
+  const [publishOnly, setPublishOnly] = useState(false);
   return (
     <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
-      <ViewTabs tabs={tabs} active={tab} onPick={setTab}/>
+      {/* Header block: title row + tab row, in normal flow and opaque. It is
+          flex:0 0 auto and the scroller below is flex:1 1 auto with
+          min-height:0 — that pair is what keeps the list from running up
+          underneath the tabs instead of stopping at them. */}
+      <div style={{ flex: '0 0 auto', background: 'var(--bg)',
+                    borderBottom: '1px solid var(--line)', paddingBottom: 18 }}>
+        {tab === 'all' && (
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 14,
+                        flexWrap: 'wrap', padding: '26px var(--pad) 0' }}>
+            <div className="serif" style={{ fontSize: 'clamp(22px, 6vw, 32px)' }}>
+              History · {jobs.length} jobs
+            </div>
+            {publishPending.length > 0 && (
+              <button className="chip" onClick={() => setPublishOnly(o => !o)} style={{
+                color: 'var(--warn)', cursor: 'pointer',
+                borderColor: 'oklch(0.78 0.15 60 / 0.3)',
+                background: publishOnly ? 'oklch(0.78 0.15 60 / 0.15)' : 'oklch(0.78 0.15 60 / 0.06)',
+              }}>
+                {publishPending.length} awaiting publish approval {publishOnly ? '· show all' : ''}
+              </button>
+            )}
+          </div>
+        )}
+        <ViewTabs tabs={tabs} active={tab} onPick={setTab}/>
+      </div>
       {tab === 'all' && (
         <HistoryView jobs={jobs} system={system} voicePresets={voicePresets}
-          publishPending={publishPending}
+          publishPending={publishPending} publishOnly={publishOnly}
           onJumpProcessing={() => setTab('live')}
           onJumpReview={(id) => { onPickReviewJob(id); setTab('review'); }}
           onJumpResult={onJumpResult} onRefresh={onRefresh}/>
