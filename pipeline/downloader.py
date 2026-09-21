@@ -33,7 +33,10 @@ def _shebang_is_live(path: str) -> bool:
             line = fh.readline().decode("utf-8", "replace").strip()
     except OSError:
         return True  # can't tell; let the caller try it
-    interp = shlex.split(line)[0] if line else ""
+    # execve splits a #! line on whitespace only — no shell, no quoting — so
+    # an apostrophe in the venv's path (a dir named George's-projects) is just
+    # a character. shlex would raise "No closing quotation" on it instead.
+    interp = line.split()[0] if line else ""
     # `#!/usr/bin/env python` resolves through PATH at exec time, not here.
     if not interp or os.path.basename(interp) == "env":
         return True
