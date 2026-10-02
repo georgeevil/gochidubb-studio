@@ -188,6 +188,7 @@ from pipeline.transcriber import transcribe
 from pipeline.diarizer import (
     diarize_speakers, assign_speakers_to_segments,
     extract_speaker_audio, extract_fallback_reference, effective_hf_token,
+    DIARIZATION_MODELS,
 )
 from pipeline.translator import (
     translate_segments, check_ollama, ollama_pull_stream,
@@ -2059,7 +2060,12 @@ def _stage_index(stage_id: str) -> int:
 # then _finalize_reupload() produces outputs/<id>/dubbed_video.mp4 (copy or
 # -c copy remux of the source) so publish/download/export keep working
 # unchanged. Everything else (transcribe → merge) never runs.
-JOB_MODES = ("dub", "reupload")
+# "transcribe" — the transcript IS the product (e.g. meeting minutes): walks
+# download → extract → transcribe → diarize and finishes 'complete' there.
+# No background separation, no review gates, no translation model needed;
+# GET /api/dub/{id}/transcript exports the result.
+JOB_MODES = ("dub", "reupload", "transcribe")
+TRANSCRIBE_MODE_STAGES = ("download", "extract", "transcribe", "diarize")
 
 
 def normalize_job_mode(mode) -> Optional[str]:
@@ -2074,8 +2080,11 @@ def normalize_job_mode(mode) -> Optional[str]:
 
 def stages_for_mode(mode: str) -> list:
     """Pipeline stage ids the runner walks for a job mode. Pure."""
-    if (str(mode or "dub").strip().lower()) == "reupload":
+    m = str(mode or "dub").strip().lower()
+    if m == "reupload":
         return ["download"]
+    if m == "transcribe":
+        return list(TRANSCRIBE_MODE_STAGES)
     return list(STAGE_ORDER)
 
 
@@ -2307,6 +2316,12 @@ async def _stage_extract(job, work, ctx, update, perf):
     ctx["bg_audio_path"] = bg_audio_path
     update(progress=15)
 
+    # The pre-VAD audio, on the video's own timeline. Diarization and speaker
+    # embeddings read this one: segment times are remapped onto this
+    # timeline, so cutting them out of the VAD-concatenated file would land
+    # every cut after the first removed silence on the wrong speech.
+    ctx["audio_16k_timeline"] = audio_16k
+
     # VAD filtering — strip long silence/music before Whisper.
     # silero-vad is optional (graceful fallback to full audio).
     if cfg.vad_enabled:
@@ -2364,9 +2379,12 @@ async def _stage_transcribe(job, work, ctx, update, perf):
             await asyncio.sleep(5)
 
     _watchdog_task = asyncio.create_task(_trans_watchdog())
+    asr_info: dict = {}
     try:
         segments, detected_lang = await _blocking(
             transcribe, ctx["audio_16k"], source_lang, whisper_model,
+            initial_prompt=(ctx.get("initial_prompt") or None),
+            info=asr_info,
         )
     finally:
         _done_flag["done"] = True
@@ -2401,9 +2419,14 @@ async def _stage_transcribe(job, work, ctx, update, perf):
     ctx["effective_src"] = effective_src
     ctx["source_lang_detected"] = detected_lang
     ctx["whisper_model"] = whisper_model
+    # Which engine and weights actually produced this transcript — lands in
+    # the checkpoint, so an exported transcript can say what made it.
+    ctx["asr"] = {"backend": asr_info.get("backend") or "faster-whisper",
+                  "model": asr_info.get("model") or whisper_model}
     perf.update(
         segments=len(segments), whisper_model=whisper_model,
         realtime_x=round(duration / took, 2), lang=detected_lang,
+        asr_backend=ctx["asr"]["backend"],
     )
     update(
         source_lang_detected=detected_lang,
@@ -2422,7 +2445,11 @@ async def _stage_diarize(job, work, ctx, update, perf):
     fallback reference (Case C) and the run continues.
     """
     segments = [dict(s) for s in ctx["segments"]]
-    audio_16k = ctx["audio_16k"]
+    # Segments are on the video's timeline (_stage_transcribe undid the VAD
+    # compression), so speaker turns and reference clips must be cut from
+    # audio on that same timeline — not the VAD-concatenated file.
+    audio_16k = _timeline_audio(ctx)
+    ctx.pop("diarization", None)
     effective_src = ctx.get("effective_src", "en")
     target_lang = ctx.get("target_lang", "ru")
     reference_audio = ctx.get("reference_audio", "")
@@ -2435,6 +2462,7 @@ async def _stage_diarize(job, work, ctx, update, perf):
     speaker_turns = []
     if skip:
         log.info("[diarize] Skipped by request — using single-speaker fallback")
+
         perf["skipped"] = True
     else:
         hf_token = effective_hf_token()
@@ -2447,6 +2475,8 @@ async def _stage_diarize(job, work, ctx, update, perf):
             speaker_turns = await _blocking(
                 diarize_speakers, audio_16k, hf_token=hf_token,
                 notices=notices,
+                min_speakers=_opt_speaker_count(ctx.get("min_speakers")),
+                max_speakers=_opt_speaker_count(ctx.get("max_speakers")),
             )
             segments = assign_speakers_to_segments(segments, speaker_turns)
             perf["speaker_turns"] = len(speaker_turns)
@@ -2470,6 +2500,12 @@ async def _stage_diarize(job, work, ctx, update, perf):
         if notices:
             perf["notices"] = notices
             diag.record_runtime_notices(notices, job_id=job.get("id", ""))
+        # Recorded so an exported transcript can name what split the
+        # speakers. _load_pipeline reports a fallback load as a notice.
+        if speaker_turns:
+            fell_back = any(n.get("code") == "pyannote.fallback_model"
+                            for n in notices if isinstance(n, dict))
+            ctx["diarization"] = {"model": DIARIZATION_MODELS[1 if fell_back else 0]}
 
     # Store raw transcript preview for UI
     ctx["transcript_raw"] = [
@@ -2587,6 +2623,28 @@ async def _stage_diarize(job, work, ctx, update, perf):
     ctx["speaker_transcripts"] = dict(speaker_transcripts)
     perf.update(speakers=n_speakers, segments=len(segments))
     update(speaker_count=n_speakers, segment_count=len(segments), progress=42)
+
+
+def _timeline_audio(ctx: dict) -> str:
+    """16 kHz audio on the video's timeline — the file segment times index.
+
+    ctx["audio_16k"] is the VAD-trimmed file when VAD removed anything
+    (vad_intervals set); its timeline is compressed. Older checkpoints have
+    no audio_16k_timeline and fall back to audio_16k, as before.
+    """
+    timeline = ctx.get("audio_16k_timeline")
+    if ctx.get("vad_intervals") and timeline and os.path.exists(timeline):
+        return timeline
+    return ctx.get("audio_16k") or ""
+
+
+def _opt_speaker_count(value) -> Optional[int]:
+    """A min/max speaker hint as an int ≥1, or None for "let pyannote decide"."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 1 else None
 
 
 def _is_untranslated(seg: dict) -> bool:
@@ -3524,6 +3582,12 @@ def _evaluate_gate(stage_id: str, ctx: dict, job: dict,
     """
     if stage_id not in app_review_gates.BOUNDARY_GATES:
         return None
+    # Transcribe-only jobs never pause: nothing downstream is being
+    # protected, and the transcript itself is what the user asked for. That
+    # includes the legacy quality backstop below, which would otherwise park
+    # a long meeting at awaiting_transcript_review with every gate off.
+    if job.get("mode") == "transcribe":
+        return None
     gates = ctx.get("review_gates")
     if not isinstance(gates, dict):
         # Legacy checkpoint / legacy queued job: derive from wizard_mode the
@@ -3610,6 +3674,12 @@ async def run_pipeline_stages(
     stop_i = _stage_index(stop_after) if stop_after else len(PIPELINE_STAGES) - 1
     if stop_i < 0:
         stop_i = len(PIPELINE_STAGES) - 1
+    is_transcribe = job.get("mode") == "transcribe"
+    if is_transcribe:
+        # Every entry point (submit, retry_stage, /continue) lands here, so
+        # the mode's ceiling is enforced once: a transcribe job never runs
+        # translate → merge, whatever stop_after it was handed.
+        stop_i = min(stop_i, _stage_index(TRANSCRIBE_MODE_STAGES[-1]))
 
     run_t0 = time.time()
     log.info(
@@ -3696,7 +3766,18 @@ async def run_pipeline_stages(
         # `merge`) must land on a terminal status. Without this the job keeps
         # the last stage's in-flight status — "diarizing" forever — which
         # reads as a hung job and blocks further stage retries.
-        if stop_i < len(PIPELINE_STAGES) - 1:
+        if is_transcribe and stop_i >= _stage_index("transcribe"):
+            # Transcribe mode: the transcript is the product, so reaching
+            # it is success. Same terminal status as a finished dub.
+            job.pop("pending_gate", None)
+            update(
+                status="complete", progress=100, stage_id=None,
+                completed_at=time.time(),
+                checkpoint_stage=PIPELINE_STAGES[stop_i]["checkpoint"],
+                transcript_url=f"/api/dub/{job_id}/transcript",
+                step_detail="Transcript ready",
+            )
+        elif stop_i < len(PIPELINE_STAGES) - 1:
             if job.get("mode") == "reupload":
                 # Reupload mode (3E): the download IS the product. Produce
                 # dubbed_video.mp4 from the source and finish as complete —
@@ -3796,6 +3877,11 @@ async def run_pipeline(
     # the queue passes args as a dict, but the legacy positional tuple path
     # in _job_queue_worker must keep working.
     stop_after: str = "",
+    # Diarization speaker-count hints (None/0 = let pyannote decide) and the
+    # whisper initial prompt (vocabulary hint: names, places, jargon).
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    initial_prompt: str = "",
 ):
     """Main dubbing pipeline entry point.
 
@@ -3807,6 +3893,15 @@ async def run_pipeline(
     job = jobs[job_id]
     job["wizard_mode"] = wizard_mode
     job["mode"] = normalize_job_mode(mode) or "dub"
+    if job["mode"] == "transcribe":
+        # Nothing is mixed back, so separating the background bed is a
+        # Demucs run for nothing; nothing is cloned, so no reference voice;
+        # and "main" speaker mode would fold every speaker into one, which
+        # is exactly what a transcript of a meeting must not do.
+        keep_bg = False
+        reference_audio = ""
+        speaker_mode = "all"
+        review_gates = {g: "off" for g in app_review_gates.GATES}
     gates = (dict(review_gates) if isinstance(review_gates, dict)
              else _resolved_review_gates(None, wizard_mode, job))
     job["review_gates"] = gates
@@ -3830,6 +3925,9 @@ async def run_pipeline(
         "auto_denoise": auto_denoise,
         "voxcpm_cfg": voxcpm_cfg,
         "voxcpm_steps": voxcpm_steps,
+        "min_speakers": _opt_speaker_count(min_speakers),
+        "max_speakers": _opt_speaker_count(max_speakers),
+        "initial_prompt": (initial_prompt or "").strip(),
     }
     # Reupload mode walks only the download stage; the driver's tail then
     # finalizes dubbed_video.mp4 from the source (see _finalize_reupload).
@@ -4831,15 +4929,36 @@ async def start_dub(
     stop_after: str = Form(""),  # stage id to halt after; "" = run to the end
     auto_denoise: bool = Form(False),
     lip_sync: bool = Form(False),  # if True, auto-run Wav2Lip after pipeline completes
-    mode: str = Form("dub"),  # "dub" | "reupload" (3E: reupload = no dubbing)
+    mode: str = Form("dub"),  # "dub" | "reupload" | "transcribe"
     scheduled_at: float = Form(0.0),  # unix epoch seconds; 0 = start immediately
     voxcpm_cfg: float = Form(0.0),    # 0 = use the global setting
     voxcpm_steps: int = Form(0),      # 0 = use the global setting
+    min_speakers: int = Form(0),      # diarization hint; 0 = let pyannote decide
+    max_speakers: int = Form(0),      # diarization hint; 0 = let pyannote decide
+    initial_prompt: str = Form(""),   # whisper vocabulary hint (names, places)
 ):
     mode = normalize_job_mode(mode)
     if mode is None:
         return JSONResponse(
             {"error": f"Unknown mode. Options: {list(JOB_MODES)}"}, 400)
+
+    if min_speakers < 0 or max_speakers < 0:
+        return JSONResponse(
+            {"error": "min_speakers/max_speakers must be ≥ 0 (0 = auto)"}, 400)
+    if min_speakers and max_speakers and min_speakers > max_speakers:
+        return JSONResponse(
+            {"error": f"min_speakers ({min_speakers}) is greater than "
+                      f"max_speakers ({max_speakers})"}, 400)
+    initial_prompt = (initial_prompt or "").strip()
+    if len(initial_prompt) > 2000:
+        return JSONResponse(
+            {"error": "initial_prompt is too long (2000 characters max) — "
+                      "whisper only reads the last ~220 tokens of it anyway"},
+            400)
+    if mode == "transcribe":
+        # See run_pipeline: no bed to keep, and every speaker matters.
+        keep_bg = False
+        speaker_mode = "all"
 
     voxcpm_cfg, voxcpm_steps, _vox_err = validate_voxcpm_overrides(
         voxcpm_cfg, voxcpm_steps)
@@ -4981,6 +5100,9 @@ async def start_dub(
         "voxcpm_steps": voxcpm_steps,
         "review_gates": resolved_gates,
         "stop_after": stop_after,
+        "min_speakers": min_speakers or None,
+        "max_speakers": max_speakers or None,
+        "initial_prompt": initial_prompt,
     }
 
     jobs[job_id] = {
@@ -5007,6 +5129,10 @@ async def start_dub(
         "stop_after": stop_after,
         "lip_sync": bool(lip_sync),
         "mode": mode,
+        **({"keep_bg": False} if mode == "transcribe" else {}),
+        **({"min_speakers": min_speakers} if min_speakers else {}),
+        **({"max_speakers": max_speakers} if max_speakers else {}),
+        **({"initial_prompt": initial_prompt} if initial_prompt else {}),
         "created": time.time(),
         "step_detail": ("Scheduled..." if is_scheduled else "Queued..."),
         "scheduled_at": scheduled_at if is_scheduled else 0,
@@ -8109,7 +8235,7 @@ _RETRY_OVERRIDE_KEYS = {
     "tts_speed", "auto_denoise", "wizard_mode", "reference_audio",
     "skip_diarization", "translate_failed_only", "tts_keep_existing",
     "voxcpm_cfg", "voxcpm_steps", "bg_volume", "bg_ducking",
-    "review_gates",
+    "review_gates", "min_speakers", "max_speakers", "initial_prompt",
 }
 
 # Retry overrides that are numbers handed straight to VoxCPM rather than
@@ -8690,6 +8816,9 @@ def _fresh_run_ctx(job: dict) -> dict:
         "auto_denoise": bool(job.get("auto_denoise", True)),
         "voxcpm_cfg": job.get("voxcpm_cfg", 0),
         "voxcpm_steps": job.get("voxcpm_steps", 0),
+        "min_speakers": job.get("min_speakers"),
+        "max_speakers": job.get("max_speakers"),
+        "initial_prompt": job.get("initial_prompt", ""),
     }
 
 
@@ -10088,6 +10217,9 @@ async def continue_pipeline(
                 "voxcpm_steps": int(job.get("voxcpm_steps") or 0),
                 "review_gates": dict(gates) if isinstance(gates, dict) else None,
                 "stop_after": job.get("stop_after") or "",
+                "min_speakers": job.get("min_speakers"),
+                "max_speakers": job.get("max_speakers"),
+                "initial_prompt": job.get("initial_prompt", ""),
             })
             log.info(f"[continue] Job {job_id} had no checkpoint (restart "
                      f"orphan) — requeued from the start")

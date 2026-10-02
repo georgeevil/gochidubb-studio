@@ -84,6 +84,8 @@ def transcribe(
     device: str = "cpu",
     compute_type: str = "int8",
     num_threads: Optional[int] = None,
+    initial_prompt: Optional[str] = None,
+    info: Optional[dict] = None,
 ) -> Tuple[List[Dict], Optional[str]]:
     """
     Transcribe audio using faster-whisper.
@@ -94,11 +96,16 @@ def transcribe(
         model_size: Whisper model size ('tiny', 'base', 'small', 'medium', 'large-v2', 'large-v3')
         device: 'cpu' or 'cuda' (use 'cpu' for Apple Silicon)
         compute_type: 'int8', 'int8_float16', 'float16', 'float32'
+        initial_prompt: Whisper initial prompt — a vocabulary hint (names,
+            places, jargon) that biases spelling in the first window.
+        info: optional dict filled with {"backend", "model"} actually used.
     
     Returns:
         Tuple of (segments list, detected_language)
     """
-    
+    if info is not None:
+        info.update(backend="faster-whisper", model=model_size)
+
     if not FASTER_WHISPER_AVAILABLE:
         raise ImportError(
             "faster-whisper is not installed. "
@@ -145,7 +152,7 @@ def transcribe(
             "no_speech_threshold": 0.6,
             "condition_on_previous_text": True,
             "prompt_reset_on_temperature": 0.5,
-            "initial_prompt": None,
+            "initial_prompt": initial_prompt or None,
             "prefix": None,
             "suppress_blank": True,
             "suppress_tokens": [-1],
