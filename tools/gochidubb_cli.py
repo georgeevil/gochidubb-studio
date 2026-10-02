@@ -172,6 +172,87 @@ async def cmd_dub(c: GoChiDUBBClient, a) -> None:
             sys.exit(2)
 
 
+async def cmd_transcribe(c: GoChiDUBBClient, a) -> None:
+    """Submit a transcribe-only job (download → diarize, no dub)."""
+    res = await c.submit_transcribe(
+        a.source, source_lang=a.source_lang, whisper_model=a.whisper,
+        min_speakers=a.min_speakers, max_speakers=a.max_speakers,
+        initial_prompt=a.prompt or "", auto_denoise=a.auto_denoise,
+    )
+    job_id = res.get("job_id")
+    _print_json(res)
+    if a.wait and job_id:
+        print(f"[wait] polling job {job_id}…", file=sys.stderr)
+        final = await c.wait_for_job(job_id, timeout=a.wait_timeout)
+        status = final.get("status") or ""
+        if status == "complete":
+            print(f"[done] gochidubb transcript {job_id} --format txt")
+        else:
+            print(f"[fail] status={status} err={final.get('error', '?')}",
+                  file=sys.stderr)
+            sys.exit(2)
+
+
+async def cmd_transcript(c: GoChiDUBBClient, a) -> None:
+    """Export a job's speaker-attributed transcript."""
+    data = await c.get_transcript(a.job_id, a.format)
+    text = (json.dumps(data, indent=2, ensure_ascii=False)
+            if a.format == "json" else data)
+    if a.output:
+        with open(a.output, "w", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+        print(f"wrote {a.output}", file=sys.stderr)
+    else:
+        print(text, end="" if text.endswith("\n") else "\n")
+
+
+async def cmd_voiceprints(c: GoChiDUBBClient, a) -> None:
+    """Enrolled voice profiles for speaker identification."""
+    if a.vp_cmd == "list":
+        profiles = await c.list_voiceprints(a.group)
+        if a.json:
+            _print_json(profiles)
+            return
+        for p in profiles:
+            print(f"{p['id']:<14} {p['group']:<14} {p['name']:<28} "
+                  f"{(p.get('role') or ''):<16} {p['embeddings_count']} sample(s)")
+    elif a.vp_cmd == "enroll":
+        _print_json(await c.enroll_voiceprint(
+            a.name, a.group, role=a.role, job_id=a.job, speaker=a.speaker,
+            audio_file=a.file))
+    elif a.vp_cmd == "edit":
+        _print_json(await c.update_voiceprint(
+            a.profile_id, name=a.name, role=a.role, group=a.group))
+    else:  # rm
+        _print_json(await c.delete_voiceprint(a.profile_id))
+
+
+async def cmd_speakers(c: GoChiDUBBClient, a) -> None:
+    """Identify / confirm who each diarized speaker is."""
+    if a.sp_cmd == "identify":
+        res = await c.identify_speakers(a.job_id, a.group,
+                                        threshold=a.threshold)
+        if a.json:
+            _print_json(res)
+            return
+        print(f"identify — job {a.job_id}, group {res.get('group')} "
+              f"({res.get('profiles', 0)} profile(s), threshold "
+              f"{res.get('threshold')})")
+        for row in res.get("speakers", []):
+            m = row.get("match")
+            what = (f"→ {m['name']} ({m['score']:.2f}) [{m['profile_id']}]"
+                    if m else f"no match ({row['skipped']})"
+                    if row.get("skipped") else "no match")
+            print(f"  {row['speaker']:<12} {row['talk_secs']:>8.1f}s  {what}")
+        print("suggestions only — confirm each with: gochidubb speakers "
+              f"confirm {a.job_id} SPEAKER --profile ID | --name … | --public")
+    else:  # confirm
+        _print_json(await c.confirm_speaker(
+            a.job_id, a.speaker, profile_id=a.profile, name=a.name,
+            role=a.role, public=a.public,
+            add_to_profile=not a.no_learn, clear=a.clear))
+
+
 async def cmd_compare(c: GoChiDUBBClient, a) -> None:
     res = await c.submit_compare(
         a.source, a.langs, trim_seconds=a.trim,
@@ -692,6 +773,84 @@ def build_parser() -> argparse.ArgumentParser:
                         "`continue` resumes it if you want the rest.")
     _add_common_dub_opts(s)
     s.set_defaults(handler=cmd_dub)
+
+    # transcribe-only
+    s = sub.add_parser("transcribe",
+                       help="Transcribe + diarize only (no dub); export with "
+                            "`transcript`")
+    s.add_argument("source", help="Video URL or local file path")
+    s.add_argument("--source-lang", default="auto",
+                   help="Spoken language code, or auto (default)")
+    s.add_argument("--whisper", default="large-v3",
+                   help="Whisper model (large-v3, large-v3-turbo, medium, "
+                        "or an mlx repo id on Apple Silicon)")
+    s.add_argument("--min-speakers", type=int, default=None,
+                   help="Diarization hint: at least this many speakers")
+    s.add_argument("--max-speakers", type=int, default=None,
+                   help="Diarization hint: at most this many speakers")
+    s.add_argument("--prompt", default="",
+                   help="Whisper vocabulary hint: names, places, jargon")
+    s.add_argument("--auto-denoise", action="store_true",
+                   help="FFT-denoise the audio before transcription")
+    s.add_argument("--wait", action="store_true")
+    s.add_argument("--wait-timeout", type=float, default=4 * 3600.0,
+                   help="Seconds before --wait gives up (default 4h)")
+    s.set_defaults(handler=cmd_transcribe)
+
+    s = sub.add_parser("transcript",
+                       help="Export a job's speaker-attributed transcript")
+    s.add_argument("job_id")
+    s.add_argument("--format", default="json",
+                   choices=["json", "srt", "vtt", "txt"])
+    s.add_argument("-o", "--output", help="Write to this file instead of stdout")
+    s.set_defaults(handler=cmd_transcript)
+
+    # speaker identification
+    s = sub.add_parser("voiceprints",
+                       help="Enrolled voice profiles (speaker identification)")
+    vp = s.add_subparsers(dest="vp_cmd", required=True)
+    t = vp.add_parser("list", help="List profiles")
+    t.add_argument("--group", help="Only this group (e.g. talamanca)")
+    t.add_argument("--json", action="store_true")
+    t = vp.add_parser("enroll", help="Enroll a voice from a job speaker or a file")
+    t.add_argument("name")
+    t.add_argument("--group", required=True)
+    t.add_argument("--role")
+    t.add_argument("--job", help="Job id whose diarized speaker to use")
+    t.add_argument("--speaker", help="Speaker id in that job, e.g. SPEAKER_03")
+    t.add_argument("--file", help="Or: a recording of this one voice")
+    t = vp.add_parser("edit", help="Rename / re-role / regroup a profile")
+    t.add_argument("profile_id")
+    t.add_argument("--name")
+    t.add_argument("--role")
+    t.add_argument("--group")
+    t = vp.add_parser("rm", help="Delete a profile")
+    t.add_argument("profile_id")
+    s.set_defaults(handler=cmd_voiceprints)
+
+    s = sub.add_parser("speakers", help="Identify / confirm diarized speakers")
+    sp = s.add_subparsers(dest="sp_cmd", required=True)
+    t = sp.add_parser("identify",
+                      help="Suggest enrolled profiles per speaker (never confirms)")
+    t.add_argument("job_id")
+    t.add_argument("--group", required=True)
+    t.add_argument("--threshold", type=float,
+                   help="Cosine threshold (default: server's voice_match_threshold)")
+    t.add_argument("--json", action="store_true")
+    t = sp.add_parser("confirm", help="Record who a speaker is")
+    t.add_argument("job_id")
+    t.add_argument("speaker")
+    g = t.add_mutually_exclusive_group(required=True)
+    g.add_argument("--profile", help="Enrolled profile id")
+    g.add_argument("--name", help="A name without a voice profile")
+    g.add_argument("--public", action="store_true",
+                   help='"Persona del público" (member of the public)')
+    g.add_argument("--clear", action="store_true",
+                   help="Withdraw this speaker's confirmation")
+    t.add_argument("--role")
+    t.add_argument("--no-learn", action="store_true",
+                   help="Do not add this speaker's voice to the profile")
+    s.set_defaults(handler=cmd_speakers)
 
     # compare (quick test)
     s = sub.add_parser("compare", help="N separate dubs side-by-side (Quick Test)")

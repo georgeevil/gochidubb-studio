@@ -188,6 +188,7 @@ from pipeline.transcriber import transcribe
 from pipeline.diarizer import (
     diarize_speakers, assign_speakers_to_segments,
     extract_speaker_audio, extract_fallback_reference, effective_hf_token,
+    DIARIZATION_MODELS,
 )
 from pipeline.translator import (
     translate_segments, check_ollama, ollama_pull_stream,
@@ -215,7 +216,8 @@ from app import (logbuf, artifact_store, reuse_runtime, reuse as app_reuse,
                  activity, apikeys as app_apikeys, webhooks as app_webhooks,
                  billing as app_billing, audit as app_audit,
                  estimate as app_estimate, admin as app_admin,
-                 review_gates as app_review_gates)
+                 review_gates as app_review_gates,
+                 voice_profiles as app_voice_profiles)
 
 
 # Force UTF-8 stdout for foreign-language transcripts on Windows cp1252 consoles
@@ -1639,6 +1641,8 @@ async def lifespan(app: FastAPI):
         activity.attach_store(BASE / "gochidubb.db")
     # Beta stage-reuse store, same file as the job store.
     artifact_store.init_store(BASE / "gochidubb.db")
+    # Enrolled voice profiles for speaker identification, same file again.
+    app_voice_profiles.init_store(BASE / "gochidubb.db")
     load_jobs_from_disk()
 
     # Initialize job queue + start serial worker. Using a single worker
@@ -1900,6 +1904,10 @@ def _scope_for(method: str, path: str) -> Optional[str]:
         return "webhooks:manage"
     if path.startswith(("/api/voice_presets", "/api/voices")):
         return "voices:write" if method in _WRITE_METHODS else None
+    if path.startswith("/api/voiceprints"):
+        # Enrolled voiceprints are biometric data about real people, so —
+        # unlike the preset catalogue — reading them is not open either.
+        return "voices:write" if method in _WRITE_METHODS else "jobs:read"
     if method in _WRITE_METHODS:
         return "dub:write" if path.startswith(_DUB_WRITE_PREFIXES) else None
     if method == "GET" and path.startswith(_JOBS_READ_PREFIXES):
@@ -2059,7 +2067,12 @@ def _stage_index(stage_id: str) -> int:
 # then _finalize_reupload() produces outputs/<id>/dubbed_video.mp4 (copy or
 # -c copy remux of the source) so publish/download/export keep working
 # unchanged. Everything else (transcribe → merge) never runs.
-JOB_MODES = ("dub", "reupload")
+# "transcribe" — the transcript IS the product (e.g. meeting minutes): walks
+# download → extract → transcribe → diarize and finishes 'complete' there.
+# No background separation, no review gates, no translation model needed;
+# GET /api/dub/{id}/transcript exports the result.
+JOB_MODES = ("dub", "reupload", "transcribe")
+TRANSCRIBE_MODE_STAGES = ("download", "extract", "transcribe", "diarize")
 
 
 def normalize_job_mode(mode) -> Optional[str]:
@@ -2074,8 +2087,11 @@ def normalize_job_mode(mode) -> Optional[str]:
 
 def stages_for_mode(mode: str) -> list:
     """Pipeline stage ids the runner walks for a job mode. Pure."""
-    if (str(mode or "dub").strip().lower()) == "reupload":
+    m = str(mode or "dub").strip().lower()
+    if m == "reupload":
         return ["download"]
+    if m == "transcribe":
+        return list(TRANSCRIBE_MODE_STAGES)
     return list(STAGE_ORDER)
 
 
@@ -2307,6 +2323,12 @@ async def _stage_extract(job, work, ctx, update, perf):
     ctx["bg_audio_path"] = bg_audio_path
     update(progress=15)
 
+    # The pre-VAD audio, on the video's own timeline. Diarization and speaker
+    # embeddings read this one: segment times are remapped onto this
+    # timeline, so cutting them out of the VAD-concatenated file would land
+    # every cut after the first removed silence on the wrong speech.
+    ctx["audio_16k_timeline"] = audio_16k
+
     # VAD filtering — strip long silence/music before Whisper.
     # silero-vad is optional (graceful fallback to full audio).
     if cfg.vad_enabled:
@@ -2364,9 +2386,12 @@ async def _stage_transcribe(job, work, ctx, update, perf):
             await asyncio.sleep(5)
 
     _watchdog_task = asyncio.create_task(_trans_watchdog())
+    asr_info: dict = {}
     try:
         segments, detected_lang = await _blocking(
             transcribe, ctx["audio_16k"], source_lang, whisper_model,
+            initial_prompt=(ctx.get("initial_prompt") or None),
+            info=asr_info,
         )
     finally:
         _done_flag["done"] = True
@@ -2401,9 +2426,14 @@ async def _stage_transcribe(job, work, ctx, update, perf):
     ctx["effective_src"] = effective_src
     ctx["source_lang_detected"] = detected_lang
     ctx["whisper_model"] = whisper_model
+    # Which engine and weights actually produced this transcript — lands in
+    # the checkpoint, so an exported transcript can say what made it.
+    ctx["asr"] = {"backend": asr_info.get("backend") or "faster-whisper",
+                  "model": asr_info.get("model") or whisper_model}
     perf.update(
         segments=len(segments), whisper_model=whisper_model,
         realtime_x=round(duration / took, 2), lang=detected_lang,
+        asr_backend=ctx["asr"]["backend"],
     )
     update(
         source_lang_detected=detected_lang,
@@ -2422,7 +2452,11 @@ async def _stage_diarize(job, work, ctx, update, perf):
     fallback reference (Case C) and the run continues.
     """
     segments = [dict(s) for s in ctx["segments"]]
-    audio_16k = ctx["audio_16k"]
+    # Segments are on the video's timeline (_stage_transcribe undid the VAD
+    # compression), so speaker turns and reference clips must be cut from
+    # audio on that same timeline — not the VAD-concatenated file.
+    audio_16k = _timeline_audio(ctx)
+    ctx.pop("diarization", None)
     effective_src = ctx.get("effective_src", "en")
     target_lang = ctx.get("target_lang", "ru")
     reference_audio = ctx.get("reference_audio", "")
@@ -2435,6 +2469,7 @@ async def _stage_diarize(job, work, ctx, update, perf):
     speaker_turns = []
     if skip:
         log.info("[diarize] Skipped by request — using single-speaker fallback")
+
         perf["skipped"] = True
     else:
         hf_token = effective_hf_token()
@@ -2447,6 +2482,8 @@ async def _stage_diarize(job, work, ctx, update, perf):
             speaker_turns = await _blocking(
                 diarize_speakers, audio_16k, hf_token=hf_token,
                 notices=notices,
+                min_speakers=_opt_speaker_count(ctx.get("min_speakers")),
+                max_speakers=_opt_speaker_count(ctx.get("max_speakers")),
             )
             segments = assign_speakers_to_segments(segments, speaker_turns)
             perf["speaker_turns"] = len(speaker_turns)
@@ -2470,6 +2507,12 @@ async def _stage_diarize(job, work, ctx, update, perf):
         if notices:
             perf["notices"] = notices
             diag.record_runtime_notices(notices, job_id=job.get("id", ""))
+        # Recorded so an exported transcript can name what split the
+        # speakers. _load_pipeline reports a fallback load as a notice.
+        if speaker_turns:
+            fell_back = any(n.get("code") == "pyannote.fallback_model"
+                            for n in notices if isinstance(n, dict))
+            ctx["diarization"] = {"model": DIARIZATION_MODELS[1 if fell_back else 0]}
 
     # Store raw transcript preview for UI
     ctx["transcript_raw"] = [
@@ -2587,6 +2630,28 @@ async def _stage_diarize(job, work, ctx, update, perf):
     ctx["speaker_transcripts"] = dict(speaker_transcripts)
     perf.update(speakers=n_speakers, segments=len(segments))
     update(speaker_count=n_speakers, segment_count=len(segments), progress=42)
+
+
+def _timeline_audio(ctx: dict) -> str:
+    """16 kHz audio on the video's timeline — the file segment times index.
+
+    ctx["audio_16k"] is the VAD-trimmed file when VAD removed anything
+    (vad_intervals set); its timeline is compressed. Older checkpoints have
+    no audio_16k_timeline and fall back to audio_16k, as before.
+    """
+    timeline = ctx.get("audio_16k_timeline")
+    if ctx.get("vad_intervals") and timeline and os.path.exists(timeline):
+        return timeline
+    return ctx.get("audio_16k") or ""
+
+
+def _opt_speaker_count(value) -> Optional[int]:
+    """A min/max speaker hint as an int ≥1, or None for "let pyannote decide"."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n >= 1 else None
 
 
 def _is_untranslated(seg: dict) -> bool:
@@ -3524,6 +3589,12 @@ def _evaluate_gate(stage_id: str, ctx: dict, job: dict,
     """
     if stage_id not in app_review_gates.BOUNDARY_GATES:
         return None
+    # Transcribe-only jobs never pause: nothing downstream is being
+    # protected, and the transcript itself is what the user asked for. That
+    # includes the legacy quality backstop below, which would otherwise park
+    # a long meeting at awaiting_transcript_review with every gate off.
+    if job.get("mode") == "transcribe":
+        return None
     gates = ctx.get("review_gates")
     if not isinstance(gates, dict):
         # Legacy checkpoint / legacy queued job: derive from wizard_mode the
@@ -3610,6 +3681,12 @@ async def run_pipeline_stages(
     stop_i = _stage_index(stop_after) if stop_after else len(PIPELINE_STAGES) - 1
     if stop_i < 0:
         stop_i = len(PIPELINE_STAGES) - 1
+    is_transcribe = job.get("mode") == "transcribe"
+    if is_transcribe:
+        # Every entry point (submit, retry_stage, /continue) lands here, so
+        # the mode's ceiling is enforced once: a transcribe job never runs
+        # translate → merge, whatever stop_after it was handed.
+        stop_i = min(stop_i, _stage_index(TRANSCRIBE_MODE_STAGES[-1]))
 
     run_t0 = time.time()
     log.info(
@@ -3696,7 +3773,18 @@ async def run_pipeline_stages(
         # `merge`) must land on a terminal status. Without this the job keeps
         # the last stage's in-flight status — "diarizing" forever — which
         # reads as a hung job and blocks further stage retries.
-        if stop_i < len(PIPELINE_STAGES) - 1:
+        if is_transcribe and stop_i >= _stage_index("transcribe"):
+            # Transcribe mode: the transcript is the product, so reaching
+            # it is success. Same terminal status as a finished dub.
+            job.pop("pending_gate", None)
+            update(
+                status="complete", progress=100, stage_id=None,
+                completed_at=time.time(),
+                checkpoint_stage=PIPELINE_STAGES[stop_i]["checkpoint"],
+                transcript_url=f"/api/dub/{job_id}/transcript",
+                step_detail="Transcript ready",
+            )
+        elif stop_i < len(PIPELINE_STAGES) - 1:
             if job.get("mode") == "reupload":
                 # Reupload mode (3E): the download IS the product. Produce
                 # dubbed_video.mp4 from the source and finish as complete —
@@ -3796,6 +3884,11 @@ async def run_pipeline(
     # the queue passes args as a dict, but the legacy positional tuple path
     # in _job_queue_worker must keep working.
     stop_after: str = "",
+    # Diarization speaker-count hints (None/0 = let pyannote decide) and the
+    # whisper initial prompt (vocabulary hint: names, places, jargon).
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    initial_prompt: str = "",
 ):
     """Main dubbing pipeline entry point.
 
@@ -3807,6 +3900,15 @@ async def run_pipeline(
     job = jobs[job_id]
     job["wizard_mode"] = wizard_mode
     job["mode"] = normalize_job_mode(mode) or "dub"
+    if job["mode"] == "transcribe":
+        # Nothing is mixed back, so separating the background bed is a
+        # Demucs run for nothing; nothing is cloned, so no reference voice;
+        # and "main" speaker mode would fold every speaker into one, which
+        # is exactly what a transcript of a meeting must not do.
+        keep_bg = False
+        reference_audio = ""
+        speaker_mode = "all"
+        review_gates = {g: "off" for g in app_review_gates.GATES}
     gates = (dict(review_gates) if isinstance(review_gates, dict)
              else _resolved_review_gates(None, wizard_mode, job))
     job["review_gates"] = gates
@@ -3830,6 +3932,9 @@ async def run_pipeline(
         "auto_denoise": auto_denoise,
         "voxcpm_cfg": voxcpm_cfg,
         "voxcpm_steps": voxcpm_steps,
+        "min_speakers": _opt_speaker_count(min_speakers),
+        "max_speakers": _opt_speaker_count(max_speakers),
+        "initial_prompt": (initial_prompt or "").strip(),
     }
     # Reupload mode walks only the download stage; the driver's tail then
     # finalizes dubbed_video.mp4 from the source (see _finalize_reupload).
@@ -4831,15 +4936,36 @@ async def start_dub(
     stop_after: str = Form(""),  # stage id to halt after; "" = run to the end
     auto_denoise: bool = Form(False),
     lip_sync: bool = Form(False),  # if True, auto-run Wav2Lip after pipeline completes
-    mode: str = Form("dub"),  # "dub" | "reupload" (3E: reupload = no dubbing)
+    mode: str = Form("dub"),  # "dub" | "reupload" | "transcribe"
     scheduled_at: float = Form(0.0),  # unix epoch seconds; 0 = start immediately
     voxcpm_cfg: float = Form(0.0),    # 0 = use the global setting
     voxcpm_steps: int = Form(0),      # 0 = use the global setting
+    min_speakers: int = Form(0),      # diarization hint; 0 = let pyannote decide
+    max_speakers: int = Form(0),      # diarization hint; 0 = let pyannote decide
+    initial_prompt: str = Form(""),   # whisper vocabulary hint (names, places)
 ):
     mode = normalize_job_mode(mode)
     if mode is None:
         return JSONResponse(
             {"error": f"Unknown mode. Options: {list(JOB_MODES)}"}, 400)
+
+    if min_speakers < 0 or max_speakers < 0:
+        return JSONResponse(
+            {"error": "min_speakers/max_speakers must be ≥ 0 (0 = auto)"}, 400)
+    if min_speakers and max_speakers and min_speakers > max_speakers:
+        return JSONResponse(
+            {"error": f"min_speakers ({min_speakers}) is greater than "
+                      f"max_speakers ({max_speakers})"}, 400)
+    initial_prompt = (initial_prompt or "").strip()
+    if len(initial_prompt) > 2000:
+        return JSONResponse(
+            {"error": "initial_prompt is too long (2000 characters max) — "
+                      "whisper only reads the last ~220 tokens of it anyway"},
+            400)
+    if mode == "transcribe":
+        # See run_pipeline: no bed to keep, and every speaker matters.
+        keep_bg = False
+        speaker_mode = "all"
 
     voxcpm_cfg, voxcpm_steps, _vox_err = validate_voxcpm_overrides(
         voxcpm_cfg, voxcpm_steps)
@@ -4981,6 +5107,9 @@ async def start_dub(
         "voxcpm_steps": voxcpm_steps,
         "review_gates": resolved_gates,
         "stop_after": stop_after,
+        "min_speakers": min_speakers or None,
+        "max_speakers": max_speakers or None,
+        "initial_prompt": initial_prompt,
     }
 
     jobs[job_id] = {
@@ -5007,6 +5136,10 @@ async def start_dub(
         "stop_after": stop_after,
         "lip_sync": bool(lip_sync),
         "mode": mode,
+        **({"keep_bg": False} if mode == "transcribe" else {}),
+        **({"min_speakers": min_speakers} if min_speakers else {}),
+        **({"max_speakers": max_speakers} if max_speakers else {}),
+        **({"initial_prompt": initial_prompt} if initial_prompt else {}),
         "created": time.time(),
         "step_detail": ("Scheduled..." if is_scheduled else "Queued..."),
         "scheduled_at": scheduled_at if is_scheduled else 0,
@@ -8109,7 +8242,7 @@ _RETRY_OVERRIDE_KEYS = {
     "tts_speed", "auto_denoise", "wizard_mode", "reference_audio",
     "skip_diarization", "translate_failed_only", "tts_keep_existing",
     "voxcpm_cfg", "voxcpm_steps", "bg_volume", "bg_ducking",
-    "review_gates",
+    "review_gates", "min_speakers", "max_speakers", "initial_prompt",
 }
 
 # Retry overrides that are numbers handed straight to VoxCPM rather than
@@ -8690,6 +8823,9 @@ def _fresh_run_ctx(job: dict) -> dict:
         "auto_denoise": bool(job.get("auto_denoise", True)),
         "voxcpm_cfg": job.get("voxcpm_cfg", 0),
         "voxcpm_steps": job.get("voxcpm_steps", 0),
+        "min_speakers": job.get("min_speakers"),
+        "max_speakers": job.get("max_speakers"),
+        "initial_prompt": job.get("initial_prompt", ""),
     }
 
 
@@ -9046,7 +9182,11 @@ def _speaker_edit_refusal(job: dict) -> Optional[str]:
     status = job.get("status") or ""
     if status in _BUSY_STATUSES:
         return f"Job is {status} — wait for it to pause before editing speakers"
-    if status not in _SPEAKER_EDIT_STATUSES:
+    # A finished transcribe-mode job synthesized nothing, so there is no
+    # audio a relabel could put in the wrong voice — and fixing speakers is
+    # the review step for a transcript.
+    transcript_done = status == "complete" and job.get("mode") == "transcribe"
+    if status not in _SPEAKER_EDIT_STATUSES and not transcript_done:
         return (f"Job is {status} — speakers can only be edited while parked "
                 f"at a pre-TTS review (or paused/errored)")
     if not _load_checkpoint(job.get("id") or "", "transcription_done"):
@@ -9163,6 +9303,14 @@ def _apply_speaker_ops(job: dict, ops: list) -> dict:
         elif op["op"] == "merge":
             cast.pop(op["from"], None)
             labels.pop(op["from"], None)
+            # The ghost's identity suggestion/confirmation goes with it; the
+            # merged cluster's voice changed, so `into` must be re-identified
+            # rather than keep a match computed on half its speech.
+            for key in ("speaker_matches", "speaker_confirmed"):
+                if isinstance(job.get(key), dict):
+                    job[key].pop(op["from"], None)
+                    if key == "speaker_matches":
+                        job[key].pop(op["into"], None)
     if labels:
         job["speaker_labels"] = labels
     if "speaker_voice_map" in job:
@@ -9251,6 +9399,378 @@ async def edit_speakers(job_id: str, request: _ScoutRequest):
     return {"ok": True, "job_id": job_id, "applied": counts,
             "speakers": _speaker_summary(job_id, job.get("speaker_labels")),
             "siblings": siblings}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Speaker identification — enrolled voice profiles (voiceprints)
+# ═══════════════════════════════════════════════════════════════════════
+# Diarization numbers the speakers; this puts candidate names on them. A
+# per-cluster embedding is compared with the enrolled profiles of one group
+# and the best match above cfg.voice_match_threshold is stored as a
+# *suggestion* (job["speaker_matches"]). Only /speakers/confirm writes an
+# identity (job["speaker_confirmed"]), and only a confirmed name is ever
+# rendered by the transcript export. Routes live under /api/voiceprints —
+# /api/voices is the TTS voice-preset catalogue.
+
+_SPEAKER_EMB_FILE = "speaker_embeddings.json"
+_PUBLIC_SPEAKER = {"profile_id": None, "name": "Persona del público",
+                   "role": "público"}
+
+
+def _voiceprint_error(e: Exception) -> JSONResponse:
+    """503 for "cannot run here" (pyannote / store missing); never a crash."""
+    from pipeline.voiceprint import VoiceprintUnavailable
+    if isinstance(e, (VoiceprintUnavailable, app_voice_profiles.StoreUnavailable)):
+        return JSONResponse({"error": str(e), "unavailable": True}, 503)
+    log.exception(f"[voiceprint] failed: {e}")
+    return JSONResponse({"error": f"Speaker identification failed: {e}"}, 500)
+
+
+def _transcript_checkpoint(job_id: str) -> Optional[dict]:
+    for stage in _TRANSCRIPT_CHECKPOINTS:
+        cp = _load_checkpoint(job_id, stage)
+        if cp and cp.get("segments"):
+            return cp
+    return None
+
+
+def _cluster_embedding(job_id: str, cp: dict, speaker: str,
+                       token: str) -> Optional[list]:
+    """Centroid embedding of one diarized speaker (blocking — run off-loop).
+
+    Cached in outputs/<id>/speaker_embeddings.json keyed by the exact clips
+    used, so identify → confirm does not embed twice, and a speaker edit
+    that changes the cluster's segments recomputes instead of reusing.
+    """
+    import hashlib
+    from pipeline import voiceprint as vp
+    clips = vp.select_clips(cp.get("segments") or [], speaker)
+    if not clips:
+        return None
+    sig = hashlib.sha1(json.dumps(
+        [[round(a, 2), round(b, 2)] for a, b in clips]).encode()).hexdigest()[:16]
+    cache_path = OUTPUT_DIR / job_id / _SPEAKER_EMB_FILE
+    cache: dict = {}
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    hit = cache.get(speaker)
+    if isinstance(hit, dict) and hit.get("sig") == sig and hit.get("vector"):
+        return hit["vector"]
+    audio = _timeline_audio(cp)
+    if not audio or not os.path.exists(audio):
+        raise FileNotFoundError(
+            "This job's 16 kHz audio is gone from its output folder — "
+            "re-run the Extract stage to identify speakers")
+    vec = vp.embed_clips(audio, clips, token)
+    if vec is None:
+        return None
+    cache[speaker] = {"sig": sig, "vector": [round(float(x), 6) for x in vec]}
+    try:
+        cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    except OSError as e:
+        log.debug(f"[voiceprint] embedding cache not written: {e}")
+    return cache[speaker]["vector"]
+
+
+def _clean_text(v, limit: int = 120) -> str:
+    return str(v or "").strip()[:limit]
+
+
+@app.get("/api/voiceprints")
+async def list_voiceprints(group: str = "", include_embeddings: bool = False):
+    """Enrolled voice profiles, optionally of one group.
+
+    Each: {id, name, role, group, embeddings_count, created_at, updated_at,
+    sources: [{job_id, speaker}]} — plus `embeddings` (the vectors) only
+    with include_embeddings=true.
+    """
+    try:
+        profiles = app_voice_profiles.list_profiles(
+            group or None, with_embeddings=include_embeddings)
+    except Exception as e:
+        return _voiceprint_error(e)
+    return {"profiles": profiles}
+
+
+@app.post("/api/voiceprints")
+async def enroll_voiceprint(request: _ScoutRequest):
+    """Enroll a voice profile.
+
+    JSON {name, role?, group, job_id, speaker}: the embedding is computed
+    from up to ~60 s of that diarized speaker's longest clean segments.
+    Or multipart: name, role?, group, plus `file` — a recording of that one
+    voice (any format ffmpeg reads; the first ~60 s are used).
+    """
+    if not app_voice_profiles.available():
+        return _voiceprint_error(app_voice_profiles.StoreUnavailable(
+            "voice profile store is not initialised"))
+    ctype = request.headers.get("content-type") or ""
+    upload = None
+    if ctype.startswith("multipart/"):
+        form = await request.form()
+        body = {k: form.get(k) for k in ("name", "role", "group")}
+        upload = form.get("file") or form.get("audio")
+        if upload is None or not getattr(upload, "filename", ""):
+            return JSONResponse({"error": "multipart enroll needs a `file`"}, 400)
+    else:
+        body = await _json_body(request)
+
+    name = _clean_text(body.get("name"))
+    group = app_voice_profiles.normalize_group(body.get("group"))
+    role = _clean_text(body.get("role")) or None
+    if not name or not group:
+        return JSONResponse({"error": "name and group are required"}, 400)
+
+    token = effective_hf_token()
+    source = None
+    try:
+        if upload is not None:
+            from pipeline.voiceprint import embed_file
+            ext = Path(upload.filename).suffix or ".wav"
+            raw = UPLOAD_DIR / f"voiceprint_{uuid.uuid4().hex[:8]}{ext}"
+            wav = raw.with_name(raw.stem + "_16k.wav")
+            try:
+                with open(raw, "wb") as f:
+                    shutil.copyfileobj(upload.file, f)
+                await _blocking(extract_audio, str(raw), str(wav))
+                vec = await _blocking(embed_file, str(wav), token)
+            finally:
+                for p in (raw, wav):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+        else:
+            job_id = str(body.get("job_id") or "").strip()
+            speaker = str(body.get("speaker") or "").strip()
+            if not job_id or not speaker:
+                return JSONResponse(
+                    {"error": "Send job_id + speaker, or upload a file"}, 400)
+            if job_id not in jobs:
+                return JSONResponse({"error": "Job not found"}, 404)
+            cp = _transcript_checkpoint(job_id)
+            if not cp:
+                return JSONResponse({"error": "That job has no transcript yet"}, 409)
+            from pipeline.voiceprint import MIN_CLUSTER_SECS, speaker_speech_secs
+            secs = speaker_speech_secs(cp["segments"]).get(speaker, 0.0)
+            if secs < MIN_CLUSTER_SECS:
+                return JSONResponse(
+                    {"error": f"{speaker} has {secs:.1f}s of speech in job "
+                              f"{job_id} — at least {MIN_CLUSTER_SECS:.0f}s "
+                              f"is needed for a usable voiceprint"}, 400)
+            vec = await _blocking(_cluster_embedding, job_id, cp, speaker, token)
+            source = {"job_id": job_id, "speaker": speaker}
+    except FileNotFoundError as e:
+        return JSONResponse({"error": str(e)}, 409)
+    except Exception as e:
+        return _voiceprint_error(e)
+    if vec is None:
+        return JSONResponse({"error": "No usable speech to build a voiceprint "
+                                      "from"}, 400)
+    profile = app_voice_profiles.create(name, group, vec, role=role,
+                                        source=source)
+    app_audit.record("voiceprint.enroll", target=profile["id"],
+                     detail=f"{group}: {name}")
+    return {"ok": True, "profile": profile}
+
+
+@app.patch("/api/voiceprints/{profile_id}")
+async def update_voiceprint(profile_id: str, request: _ScoutRequest):
+    """Rename / re-role / regroup a profile. Body {name?, role?, group?}."""
+    body = await _json_body(request)
+    kw = {}
+    for key in ("name", "role", "group"):
+        if key in body and body[key] is not None:
+            kw[key] = str(body[key])
+    if "name" in kw and not kw["name"].strip():
+        return JSONResponse({"error": "name cannot be empty"}, 400)
+    if "group" in kw and not app_voice_profiles.normalize_group(kw["group"]):
+        return JSONResponse({"error": "group cannot be empty"}, 400)
+    try:
+        profile = app_voice_profiles.update(profile_id, **kw)
+    except Exception as e:
+        return _voiceprint_error(e)
+    if profile is None:
+        return JSONResponse({"error": "Voice profile not found"}, 404)
+    return {"ok": True, "profile": profile}
+
+
+@app.delete("/api/voiceprints/{profile_id}")
+async def delete_voiceprint(profile_id: str):
+    try:
+        ok = app_voice_profiles.delete(profile_id)
+    except Exception as e:
+        return _voiceprint_error(e)
+    if not ok:
+        return JSONResponse({"error": "Voice profile not found"}, 404)
+    app_audit.record("voiceprint.delete", target=profile_id, detail="")
+    return {"ok": True, "deleted": profile_id}
+
+
+@app.post("/api/dub/{job_id}/speakers/identify")
+async def identify_speakers(job_id: str, request: _ScoutRequest):
+    """Suggest an enrolled profile for each diarized speaker.
+
+    Body {group, threshold?}. Clusters with under ~5 s of speech are skipped.
+    One profile is suggested for at most one cluster (greedy by score).
+    Matches at or above the threshold are stored as job["speaker_matches"]
+    — suggestions only; nothing is confirmed. Returns {job_id, group,
+    threshold, speakers: [{speaker, talk_secs, match|null, candidates[],
+    skipped|null}]}.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    job = jobs[job_id]
+    if (job.get("status") or "") in _BUSY_STATUSES:
+        return JSONResponse({"error": f"Job is {job.get('status')} — wait "
+                                      f"for it to finish"}, 409)
+    body = await _json_body(request)
+    group = app_voice_profiles.normalize_group(body.get("group"))
+    if not group:
+        return JSONResponse({"error": "group is required"}, 400)
+    try:
+        threshold = float(body.get("threshold", cfg.voice_match_threshold))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "threshold must be a number"}, 400)
+    if not 0.0 <= threshold <= 1.0:
+        return JSONResponse({"error": "threshold must be within 0–1"}, 400)
+    cp = _transcript_checkpoint(job_id)
+    if not cp:
+        return JSONResponse({"error": "No transcript yet — nothing to "
+                                      "identify"}, 409)
+    try:
+        profiles = app_voice_profiles.list_profiles(group, with_embeddings=True)
+    except Exception as e:
+        return _voiceprint_error(e)
+
+    from pipeline import voiceprint as vp
+    talk = vp.speaker_speech_secs(cp["segments"])
+    token = effective_hf_token()
+    vecs: dict = {}
+    rows = []
+    for spk in sorted(talk, key=lambda k: (-talk[k], k)):
+        row = {"speaker": spk, "talk_secs": round(talk[spk], 1),
+               "match": None, "candidates": [], "skipped": None}
+        rows.append(row)
+        if talk[spk] < vp.MIN_CLUSTER_SECS:
+            row["skipped"] = "too_little_speech"
+            continue
+        if not profiles:
+            continue
+        try:
+            vec = await _blocking(_cluster_embedding, job_id, cp, spk, token)
+        except FileNotFoundError as e:
+            return JSONResponse({"error": str(e)}, 409)
+        except Exception as e:
+            return _voiceprint_error(e)
+        if vec is None:
+            row["skipped"] = "no_clean_segments"
+            continue
+        vecs[spk] = vec
+        row["candidates"] = vp.score_profiles(vec, profiles)[:3]
+
+    matches = vp.assign_matches(vecs, profiles, threshold)
+    for row in rows:
+        row["match"] = matches.get(row["speaker"])
+    job["speaker_matches"] = matches
+    job["speaker_matches_meta"] = {"group": group, "threshold": threshold,
+                                   "at": time.time()}
+    save_job(job)
+    log.info(f"[voiceprint] job={job_id} group={group!r}: "
+             f"{len(matches)}/{len(vecs)} cluster(s) matched "
+             f"against {len(profiles)} profile(s)")
+    return {"job_id": job_id, "group": group, "threshold": threshold,
+            "profiles": len(profiles), "speakers": rows}
+
+
+@app.post("/api/dub/{job_id}/speakers/confirm")
+async def confirm_speaker(job_id: str, request: _ScoutRequest):
+    """A human's decision about who one diarized speaker is.
+
+    Body {speaker, profile_id?, name?, role?, public?: bool,
+    add_to_profile?: bool = true, clear?: bool}.
+      * profile_id — that enrolled person (name/role default to the
+        profile's); with add_to_profile the cluster's embedding is added to
+        the profile so later matching improves.
+      * public: true — "Persona del público" (role "público"), no profile.
+      * name without profile_id — a named speaker with no voiceprint.
+      * clear: true — withdraw the confirmation.
+    Stored as job["speaker_confirmed"][speaker] = {profile_id, name, role}.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    job = jobs[job_id]
+    body = await _json_body(request)
+    speaker = str(body.get("speaker") or "").strip()
+    if not speaker:
+        return JSONResponse({"error": "speaker is required"}, 400)
+    cp = _transcript_checkpoint(job_id)
+    if not cp:
+        return JSONResponse({"error": "No transcript yet"}, 409)
+    known = {s.get("speaker") or "SPEAKER_00" for s in cp["segments"]}
+    if speaker not in known:
+        return JSONResponse({"error": f"No speaker {speaker!r} in this job "
+                                      f"({', '.join(sorted(known))})"}, 400)
+
+    confirmed = dict(job.get("speaker_confirmed") or {})
+    if body.get("clear"):
+        confirmed.pop(speaker, None)
+        job["speaker_confirmed"] = confirmed
+        save_job(job)
+        return {"ok": True, "speaker": speaker, "confirmed": None}
+
+    profile = None
+    profile_updated = False
+    warning = None
+    profile_id = str(body.get("profile_id") or "").strip() or None
+    if body.get("public"):
+        entry = dict(_PUBLIC_SPEAKER)
+    elif profile_id:
+        try:
+            profile = app_voice_profiles.get(profile_id)
+        except Exception as e:
+            return _voiceprint_error(e)
+        if profile is None:
+            return JSONResponse({"error": "Voice profile not found"}, 404)
+        entry = {"profile_id": profile_id,
+                 "name": _clean_text(body.get("name")) or profile["name"],
+                 "role": _clean_text(body.get("role")) or profile.get("role")}
+    else:
+        name = _clean_text(body.get("name"))
+        if not name:
+            return JSONResponse(
+                {"error": "Send profile_id, name, or public: true"}, 400)
+        entry = {"profile_id": None, "name": name,
+                 "role": _clean_text(body.get("role")) or None}
+
+    if profile is not None and body.get("add_to_profile", True):
+        # Learning from the confirmation is a bonus: a missing pyannote or a
+        # deleted audio file must not cost the human their confirmation.
+        try:
+            vec = await _blocking(_cluster_embedding, job_id, cp, speaker,
+                                  effective_hf_token())
+            if vec is not None:
+                app_voice_profiles.add_embedding(
+                    profile_id, vec, {"job_id": job_id, "speaker": speaker})
+                profile_updated = True
+            else:
+                warning = "no clean speech to add to the profile"
+        except Exception as e:
+            warning = f"profile not updated: {e}"
+            log.warning(f"[voiceprint] job={job_id} {speaker}: {warning}")
+
+    confirmed[speaker] = entry
+    job["speaker_confirmed"] = confirmed
+    save_job(job)
+    app_audit.record("speaker.confirm", target=job_id,
+                     detail=f"{speaker} = {entry['name']}")
+    out = {"ok": True, "speaker": speaker, "confirmed": entry,
+           "profile_updated": profile_updated}
+    if warning:
+        out["warning"] = warning
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -9645,6 +10165,69 @@ async def list_job_files(job_id: str):
         # than silently omitting the row.
         "kept_background": bool(job.get("keep_bg", True)),
     }
+
+
+# Checkpoints a speaker-attributed transcript can be read from, preferred
+# first. transcription_done is the diarized, post-processed transcript and is
+# the one the speaker editor writes through; the later ones carry the same
+# segments (plus translations this export ignores); transcribe_done is the
+# pre-diarization fallback, every line then attributed to one speaker.
+_TRANSCRIPT_CHECKPOINTS = ("transcription_done", "translation_done",
+                           "tts_done", "transcribe_done")
+
+
+def _transcript_doc(job_id: str) -> Optional[dict]:
+    """The job's transcript document (pipeline/transcript.py), or None."""
+    job = jobs.get(job_id) or {}
+    for stage in _TRANSCRIPT_CHECKPOINTS:
+        cp = _load_checkpoint(job_id, stage)
+        if cp and cp.get("segments"):
+            from pipeline.transcript import build_transcript
+            return build_transcript(
+                job_id, cp,
+                source=job.get("source") or cp.get("source") or "",
+                duration=job.get("duration", cp.get("duration")),
+                labels=job.get("speaker_labels"),
+                matches=job.get("speaker_matches"),
+                confirmed=job.get("speaker_confirmed"),
+            )
+    return None
+
+
+@app.get("/api/dub/{job_id}/transcript")
+async def get_transcript(job_id: str, format: str = "json"):
+    """Speaker-attributed source-language transcript.
+
+    format=json (default) returns {job_id, source, duration, language, asr,
+    diarization, speakers[], segments[]} — see pipeline/transcript.py for
+    the exact shape. srt / vtt / txt render each line as "Name: text", where
+    Name is the human-confirmed name, else the speaker editor's label, else
+    the diarization id. Voice-profile matches are suggestions and never
+    become a rendered name until confirmed. Available as soon as the
+    transcription checkpoint exists — transcribe-mode jobs and dubs alike.
+    """
+    from pipeline.transcript import FORMATS, render
+    fmt = (format or "json").strip().lower()
+    if fmt not in FORMATS:
+        return JSONResponse(
+            {"error": f"Unknown format {format!r}. Options: {', '.join(FORMATS)}"},
+            400)
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    doc = _transcript_doc(job_id)
+    if doc is None:
+        return JSONResponse({"error": "No transcript yet — the transcribe "
+                                      "stage has not finished"}, 404)
+    if fmt == "json":
+        return doc
+    from fastapi.responses import PlainTextResponse
+    media = {"srt": "application/x-subrip", "vtt": "text/vtt",
+             "txt": "text/plain"}[fmt]
+    return PlainTextResponse(
+        content=render(doc, fmt), media_type=f"{media}; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="transcript_{job_id}.{fmt}"'},
+    )
 
 
 @app.get("/api/dub/{job_id}/transcripts.txt")
@@ -10088,6 +10671,9 @@ async def continue_pipeline(
                 "voxcpm_steps": int(job.get("voxcpm_steps") or 0),
                 "review_gates": dict(gates) if isinstance(gates, dict) else None,
                 "stop_after": job.get("stop_after") or "",
+                "min_speakers": job.get("min_speakers"),
+                "max_speakers": job.get("max_speakers"),
+                "initial_prompt": job.get("initial_prompt", ""),
             })
             log.info(f"[continue] Job {job_id} had no checkpoint (restart "
                      f"orphan) — requeued from the start")

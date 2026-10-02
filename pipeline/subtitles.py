@@ -317,16 +317,27 @@ def _fmt_time(seconds: float, decimal_sep: str) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}{decimal_sep}{ms:03d}"
 
 
+def srt_text(cues: List[dict]) -> str:
+    """Cues rendered as an SRT document (what write_srt_cues writes)."""
+    return "".join(
+        f"{n}\n{_fmt_time(c['start'], ',')} --> "
+        f"{_fmt_time(c['end'], ',')}\n{cue_text(c)}\n\n"
+        for n, c in enumerate(cues, 1))
+
+
+def vtt_text(cues: List[dict]) -> str:
+    """Cues rendered as a WebVTT document (what write_vtt_cues writes)."""
+    return "WEBVTT\n\n" + "".join(
+        f"{n}\n{_fmt_time(c['start'], '.')} --> "
+        f"{_fmt_time(c['end'], '.')}\n{cue_text(c)}\n\n"
+        for n, c in enumerate(cues, 1))
+
+
 def write_srt_cues(cues: List[dict], path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        for n, c in enumerate(cues, 1):
-            f.write(f"{n}\n{_fmt_time(c['start'], ',')} --> "
-                    f"{_fmt_time(c['end'], ',')}\n{cue_text(c)}\n\n")
+        f.write(srt_text(cues))
 
 
 def write_vtt_cues(cues: List[dict], path: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
-        f.write("WEBVTT\n\n")
-        for n, c in enumerate(cues, 1):
-            f.write(f"{n}\n{_fmt_time(c['start'], '.')} --> "
-                    f"{_fmt_time(c['end'], '.')}\n{cue_text(c)}\n\n")
+        f.write(vtt_text(cues))

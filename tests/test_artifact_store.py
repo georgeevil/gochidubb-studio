@@ -315,6 +315,34 @@ class TestFingerprintForContext:
         two = reuse_runtime.fingerprint_for("transcribe", {**base, "model": "qwen"}, self.Cfg())
         assert one == two and one is not None
 
+    def test_initial_prompt_and_backend_affect_transcribe(self, tmp_path):
+        """A vocabulary hint or a different ASR engine changes the words."""
+        a = tmp_path / "a.wav"
+        a.write_bytes(b"audio")
+        base = {"audio_16k": str(a), "whisper_model": "m", "source_lang": "es"}
+        plain = reuse_runtime.fingerprint_for("transcribe", base, self.Cfg())
+        hinted = reuse_runtime.fingerprint_for(
+            "transcribe", {**base, "initial_prompt": "Talamanca"}, self.Cfg())
+        assert plain != hinted
+
+        class FW(self.Cfg):
+            asr_backend = "faster-whisper"
+
+        class MLX(self.Cfg):
+            asr_backend = "mlx"
+
+        assert (reuse_runtime.fingerprint_for("transcribe", base, FW())
+                != reuse_runtime.fingerprint_for("transcribe", base, MLX()))
+
+    def test_speaker_hints_affect_diarize(self, tmp_path):
+        a = tmp_path / "a.wav"
+        a.write_bytes(b"audio")
+        base = {"audio_16k": str(a), "speaker_mode": "all"}
+        auto = reuse_runtime.fingerprint_for("diarize", base, self.Cfg())
+        hinted = reuse_runtime.fingerprint_for(
+            "diarize", {**base, "min_speakers": 5, "max_speakers": 9}, self.Cfg())
+        assert auto != hinted
+
     def test_target_language_does_affect_translate(self, tmp_path):
         base = {"segments": [{"start": 0, "end": 1, "text": "Hola"}],
                 "model": "m", "context_hint": ""}

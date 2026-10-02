@@ -78,6 +78,18 @@ class GoChiDUBBClient:
             raise GoChiDUBBError(err)
         return data
 
+    async def _request_text(self, method: str, path: str, **kw) -> str:
+        """Like _request, for routes that answer with a text document."""
+        r = await self._http.request(method, f"{self.base_url}{path}", **kw)
+        if r.status_code >= 400:
+            try:
+                data = r.json()
+                err = data.get("error") or data.get("detail")
+            except Exception:
+                err = None
+            raise GoChiDUBBError(err or f"HTTP {r.status_code}")
+        return r.text
+
     @staticmethod
     def _prompt_headers(prompt: Optional[str]) -> Optional[dict]:
         """Per-request headers carrying the natural-language request behind a
@@ -151,8 +163,9 @@ class GoChiDUBBClient:
         nobody — the artifacts are on disk and /continue resumes the rest
         later, if you want it.
 
-        mode: 'dub' (full pipeline) or 'reupload' (download + remux only —
-        used for music videos where dubbing makes no sense).
+        mode: 'dub' (full pipeline), 'reupload' (download + remux only —
+        used for music videos where dubbing makes no sense) or 'transcribe'
+        (download → diarize only; see submit_transcribe).
         scheduled_at: unix epoch seconds; a future timestamp parks the job
         as status='scheduled' and the server starts it at that time.
         voxcpm_cfg / voxcpm_steps: per-job VoxCPM guidance and inference
@@ -185,6 +198,136 @@ class GoChiDUBBClient:
             form["stop_after"] = stop_after
         return await self._request("POST", "/api/dub", data=form, files=files,
                                    headers=self._prompt_headers(prompt))
+
+    async def submit_transcribe(
+        self,
+        source: str,
+        *,
+        source_lang: str = "auto",
+        whisper_model: str = "large-v3",
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
+        initial_prompt: str = "",
+        auto_denoise: bool = False,
+        prompt: Optional[str] = None,
+    ) -> dict:
+        """Submit a transcribe-only job (mode='transcribe'). Returns `job_id`.
+
+        Runs download → extract → transcribe → diarize and finishes
+        'complete' — no background separation, translation, review gates or
+        TTS. Fetch the result with get_transcript().
+
+        min_speakers / max_speakers: diarization hints (None = auto).
+        initial_prompt: whisper vocabulary hint — proper names, places,
+        jargon the recording uses ("Concejo Municipal de Talamanca, …").
+        """
+        files, form = self._source_fields(source)
+        form.update({
+            "mode": "transcribe",
+            "source_lang": source_lang,
+            "whisper_model": whisper_model,
+            "auto_denoise": str(bool(auto_denoise)).lower(),
+            "keep_bg": "false",
+        })
+        if min_speakers:
+            form["min_speakers"] = str(int(min_speakers))
+        if max_speakers:
+            form["max_speakers"] = str(int(max_speakers))
+        if initial_prompt:
+            form["initial_prompt"] = initial_prompt
+        return await self._request("POST", "/api/dub", data=form, files=files,
+                                   headers=self._prompt_headers(prompt))
+
+    async def get_transcript(self, job_id: str, fmt: str = "json"):
+        """Speaker-attributed transcript of a job.
+
+        fmt='json' returns the document as a dict ({job_id, source, duration,
+        language, asr, diarization, speakers[], segments[]}); 'srt', 'vtt'
+        and 'txt' return the rendered text ("Name: line").
+        """
+        params = {"format": fmt}
+        if fmt == "json":
+            return await self._request(
+                "GET", f"/api/dub/{job_id}/transcript", params=params)
+        return await self._request_text(
+            "GET", f"/api/dub/{job_id}/transcript", params=params)
+
+    # ── speaker identification (voice profiles) ──────────────────────
+    async def list_voiceprints(self, group: Optional[str] = None) -> list[dict]:
+        """Enrolled voice profiles (optionally of one group), no vectors."""
+        params = {"group": group} if group else None
+        d = await self._request("GET", "/api/voiceprints", params=params)
+        return d.get("profiles", []) if isinstance(d, dict) else []
+
+    async def enroll_voiceprint(self, name: str, group: str, *,
+                                role: Optional[str] = None,
+                                job_id: Optional[str] = None,
+                                speaker: Optional[str] = None,
+                                audio_file: Optional[str] = None) -> dict:
+        """Enroll a person's voice: from a diarized speaker of a job
+        (job_id + speaker) or from a recording of that one voice
+        (audio_file). Returns {ok, profile}."""
+        if audio_file:
+            p = Path(audio_file).expanduser().resolve()
+            if not p.exists():
+                raise GoChiDUBBError(f"Audio file not found: {p}")
+            form = {"name": name, "group": group}
+            if role:
+                form["role"] = role
+            with open(p, "rb") as f:
+                return await self._request(
+                    "POST", "/api/voiceprints", data=form,
+                    files={"file": (p.name, f, "application/octet-stream")})
+        if not (job_id and speaker):
+            raise GoChiDUBBError("enroll needs job_id + speaker, or audio_file")
+        body = {"name": name, "group": group, "job_id": job_id,
+                "speaker": speaker}
+        if role:
+            body["role"] = role
+        return await self._request("POST", "/api/voiceprints", json=body)
+
+    async def update_voiceprint(self, profile_id: str, *,
+                                name: Optional[str] = None,
+                                role: Optional[str] = None,
+                                group: Optional[str] = None) -> dict:
+        body = {k: v for k, v in (("name", name), ("role", role),
+                                  ("group", group)) if v is not None}
+        return await self._request("PATCH", f"/api/voiceprints/{profile_id}",
+                                   json=body)
+
+    async def delete_voiceprint(self, profile_id: str) -> dict:
+        return await self._request("DELETE", f"/api/voiceprints/{profile_id}")
+
+    async def identify_speakers(self, job_id: str, group: str, *,
+                                threshold: Optional[float] = None) -> dict:
+        """Suggest an enrolled profile per diarized speaker (never confirms)."""
+        body: dict = {"group": group}
+        if threshold is not None:
+            body["threshold"] = float(threshold)
+        return await self._request(
+            "POST", f"/api/dub/{job_id}/speakers/identify", json=body)
+
+    async def confirm_speaker(self, job_id: str, speaker: str, *,
+                              profile_id: Optional[str] = None,
+                              name: Optional[str] = None,
+                              role: Optional[str] = None,
+                              public: bool = False,
+                              add_to_profile: bool = True,
+                              clear: bool = False) -> dict:
+        """Record a human's decision about who `speaker` is."""
+        body: dict = {"speaker": speaker, "add_to_profile": bool(add_to_profile)}
+        if clear:
+            body["clear"] = True
+        if public:
+            body["public"] = True
+        if profile_id:
+            body["profile_id"] = profile_id
+        if name:
+            body["name"] = name
+        if role:
+            body["role"] = role
+        return await self._request(
+            "POST", f"/api/dub/{job_id}/speakers/confirm", json=body)
 
     async def submit_compare(
         self,

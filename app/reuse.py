@@ -71,13 +71,16 @@ STAGE_INPUTS = {
     # silently reuses VAD-trimmed audio the job asked not to have.
     "extract": ("source_fingerprint", "auto_denoise", "keep_bg",
                 "vad_enabled", "vad_threshold"),
-    "transcribe": ("audio_fingerprint", "whisper_model", "source_lang"),
+    # The initial prompt biases spelling and the backend is different code
+    # (faster-whisper vs mlx-whisper), so both change the transcript.
+    "transcribe": ("audio_fingerprint", "whisper_model", "source_lang",
+                   "initial_prompt", "asr_backend"),
     # reference_audio and skip_diarization change the output completely:
     # a job with an uploaded voice must not inherit speaker refs cut from the
     # video. same_language flips whether prompt_text is kept or cleared.
     "diarize": ("audio_fingerprint", "speaker_mode", "diarization_model",
                 "reference_audio_fingerprint", "skip_diarization",
-                "same_language"),
+                "same_language", "min_speakers", "max_speakers"),
     "translate": ("segments_fingerprint", "target_lang", "model",
                   "context_hint", "glossary_fingerprint"),
     # NOTE: with the default `auto` voice preset and no voice_style,

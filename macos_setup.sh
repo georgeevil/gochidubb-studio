@@ -35,6 +35,13 @@ pip install -r requirements.txt 2>/dev/null || echo "No requirements.txt found"
 pip install whisperx --no-deps
 pip install faster-whisper
 
+# 7b. Apple Silicon: GPU (Metal) Whisper via mlx-whisper. ASR_BACKEND=auto
+# (the default) picks it up automatically; it is skipped on Intel Macs.
+if [ "$(uname -m)" = "arm64" ]; then
+    echo "Installing mlx-whisper (Apple Silicon GPU transcription)..."
+    pip install -r requirements-mac.txt
+fi
+
 # 8. Set environment variables
 echo "export PYTORCH_ENABLE_MPS_FALLBACK=1" >> .env
 echo "export TORCHCODEC_USE_TORCHAUDIO=1" >> .env

@@ -50,13 +50,14 @@ STAGE_ARTIFACTS: Dict[str, Dict[str, Any]] = {
         "job_fields": [],
     },
     "transcribe": {
-        "ctx": ["segments", "source_lang_detected", "effective_src"],
+        "ctx": ["segments", "source_lang_detected", "effective_src", "asr"],
         "path_keys": [],
         "job_fields": ["segment_count", "source_lang_detected"],
     },
     "diarize": {
         "ctx": ["segments", "speaker_refs", "source_speaker_refs",
-                "speaker_transcripts", "speakers", "transcript_raw"],
+                "speaker_transcripts", "speakers", "transcript_raw",
+                "diarization"],
         "path_keys": [],
         "dict_path_keys": ["speaker_refs", "source_speaker_refs"],
         "extra_files": ["speaker_refs"],
@@ -126,6 +127,19 @@ def _rebase(value: str, old_dir: Path, new_dir: Path) -> str:
     return str(new_dir / rel)
 
 
+def _resolved_asr_backend(cfg) -> str:
+    """The ASR backend a transcribe run would use right now ("auto" resolved).
+
+    Resolved rather than read raw: with "auto", installing mlx-whisper
+    switches engines without any setting changing.
+    """
+    try:
+        from pipeline.transcriber import resolve_asr_backend
+        return resolve_asr_backend(getattr(cfg, "asr_backend", "auto"))
+    except Exception:
+        return str(getattr(cfg, "asr_backend", "auto") or "auto")
+
+
 def build_fingerprint_inputs(stage: str, ctx: Dict[str, Any],
                              cfg) -> Dict[str, Any]:
     """The determining inputs for one stage, read out of the live context.
@@ -166,6 +180,10 @@ def build_fingerprint_inputs(stage: str, ctx: Dict[str, Any],
         out["same_language"] = (
             (ctx.get("effective_src") or "")[:2].lower()
             == (ctx.get("target_lang") or "")[:2].lower())
+        out["initial_prompt"] = (ctx.get("initial_prompt") or "").strip()
+        out["asr_backend"] = _resolved_asr_backend(cfg)
+        out["min_speakers"] = ctx.get("min_speakers") or None
+        out["max_speakers"] = ctx.get("max_speakers") or None
     elif stage == "translate":
         out["segments_fingerprint"] = reuse.hash_segments(ctx.get("segments"))
         out["target_lang"] = ctx.get("target_lang") or ""
