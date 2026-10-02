@@ -95,6 +95,7 @@ FIELD_SPECS: dict = {
     "subtitle_max_cps":            (float, 5.0, 40.0),
     "subtitle_min_gap_ms":         (int, 0, 1000),
     "asr_backend":             (str, ("auto", "faster-whisper", "mlx")),
+    "voice_match_threshold":   (float, 0.0, 1.0),
 }
 
 _TRUTHY = ("1", "true", "yes", "on")
@@ -165,6 +166,12 @@ class UserConfig:
     # everywhere else. faster-whisper has no Metal backend, so on a Mac it
     # runs CPU int8 — mlx-whisper runs the same weights on the GPU.
     asr_backend: str = "auto"             # "auto" | "faster-whisper" | "mlx"
+
+    # ── Speaker identification (voice profiles) ───────────────────────
+    # Cosine similarity a diarized speaker's voice embedding must reach
+    # against an enrolled profile before it is *suggested* as that person.
+    # Suggestions are never auto-confirmed; a human confirms each one.
+    voice_match_threshold: float = 0.6
 
     # ── VAD ───────────────────────────────────────────────────────────
     vad_enabled: bool = True              # strip silence before Whisper
@@ -460,6 +467,7 @@ def _load_config() -> UserConfig:
         "OLLAMA_URL": "ollama_url",
         "WHISPER_MODEL": "whisper_model",
         "ASR_BACKEND": "asr_backend",
+        "GOCHIDUBB_VOICE_MATCH_THRESHOLD": "voice_match_threshold",
         "GOCHIDUBB_OPEN_BROWSER": "open_browser",
         "GOCHIDUBB_WARMUP": "warmup_on_start",
         "GOCHIDUBB_QA_SAME_LANGUAGE": "qa_same_language",

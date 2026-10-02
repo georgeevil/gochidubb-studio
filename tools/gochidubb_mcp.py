@@ -246,6 +246,100 @@ async def gochidubb_get_transcript(job_id: str, format: str = "json"):
 
 
 @mcp.tool()
+async def gochidubb_list_voiceprints(group: Optional[str] = None) -> list[dict]:
+    """Enrolled voice profiles used to identify speakers, optionally of one
+    group (e.g. 'talamanca'). Each: {id, name, role, group,
+    embeddings_count, sources}. Not the TTS voice presets — see
+    gochidubb_list_voices for those."""
+    c = await _get_client()
+    return await c.list_voiceprints(group)
+
+
+@mcp.tool()
+async def gochidubb_enroll_voiceprint(
+    name: str,
+    group: str,
+    role: Optional[str] = None,
+    job_id: Optional[str] = None,
+    speaker: Optional[str] = None,
+    audio_file: Optional[str] = None,
+) -> dict:
+    """Enroll a person's voice for speaker identification.
+
+    Either from a diarized speaker of a finished job (job_id + speaker, e.g.
+    'SPEAKER_03' — use ~60 s of their clean speech) or from audio_file, an
+    absolute path to a recording of only that person. Only enroll a voice
+    whose identity a human has verified. `group` scopes matching (one
+    council, one show)."""
+    c = await _get_client()
+    return await c.enroll_voiceprint(name, group, role=role, job_id=job_id,
+                                     speaker=speaker, audio_file=audio_file)
+
+
+@mcp.tool()
+async def gochidubb_update_voiceprint(
+    profile_id: str,
+    name: Optional[str] = None,
+    role: Optional[str] = None,
+    group: Optional[str] = None,
+) -> dict:
+    """Rename, re-role or regroup an enrolled voice profile."""
+    c = await _get_client()
+    return await c.update_voiceprint(profile_id, name=name, role=role,
+                                     group=group)
+
+
+@mcp.tool()
+async def gochidubb_delete_voiceprint(profile_id: str) -> dict:
+    """Delete an enrolled voice profile (its voiceprints are removed)."""
+    c = await _get_client()
+    return await c.delete_voiceprint(profile_id)
+
+
+@mcp.tool()
+async def gochidubb_identify_speakers(
+    job_id: str,
+    group: str,
+    threshold: Optional[float] = None,
+) -> dict:
+    """Suggest which enrolled person each diarized speaker of a job is.
+
+    Compares each speaker's voice with the profiles of `group`; a match at
+    or above `threshold` (cosine, default from server settings) is stored
+    as a SUGGESTION — one profile per speaker at most. Nothing is
+    confirmed: present the suggestions to a human and record their answer
+    with gochidubb_confirm_speaker. Returns {speakers: [{speaker,
+    talk_secs, match, candidates, skipped}]}."""
+    c = await _get_client()
+    return await c.identify_speakers(job_id, group, threshold=threshold)
+
+
+@mcp.tool()
+async def gochidubb_confirm_speaker(
+    job_id: str,
+    speaker: str,
+    profile_id: Optional[str] = None,
+    name: Optional[str] = None,
+    role: Optional[str] = None,
+    public: bool = False,
+    add_to_profile: bool = True,
+    clear: bool = False,
+) -> dict:
+    """Record a HUMAN's confirmation of who a diarized speaker is.
+
+    Only call this with an answer a person gave you — never to accept a
+    suggestion on your own. profile_id = that enrolled person (their voice
+    sample is added to the profile unless add_to_profile=False); public=True
+    = "Persona del público" (a member of the public, no profile); name
+    alone = a named speaker with no profile; clear=True withdraws it.
+    Confirmed names are what the transcript export prints."""
+    c = await _get_client()
+    return await c.confirm_speaker(job_id, speaker, profile_id=profile_id,
+                                   name=name, role=role, public=public,
+                                   add_to_profile=add_to_profile, clear=clear)
+
+
+@mcp.tool()
 async def gochidubb_compare(
     source: str,
     target_langs: list[str],

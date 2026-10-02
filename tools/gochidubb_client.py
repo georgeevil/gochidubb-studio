@@ -252,6 +252,83 @@ class GoChiDUBBClient:
         return await self._request_text(
             "GET", f"/api/dub/{job_id}/transcript", params=params)
 
+    # ── speaker identification (voice profiles) ──────────────────────
+    async def list_voiceprints(self, group: Optional[str] = None) -> list[dict]:
+        """Enrolled voice profiles (optionally of one group), no vectors."""
+        params = {"group": group} if group else None
+        d = await self._request("GET", "/api/voiceprints", params=params)
+        return d.get("profiles", []) if isinstance(d, dict) else []
+
+    async def enroll_voiceprint(self, name: str, group: str, *,
+                                role: Optional[str] = None,
+                                job_id: Optional[str] = None,
+                                speaker: Optional[str] = None,
+                                audio_file: Optional[str] = None) -> dict:
+        """Enroll a person's voice: from a diarized speaker of a job
+        (job_id + speaker) or from a recording of that one voice
+        (audio_file). Returns {ok, profile}."""
+        if audio_file:
+            p = Path(audio_file).expanduser().resolve()
+            if not p.exists():
+                raise GoChiDUBBError(f"Audio file not found: {p}")
+            form = {"name": name, "group": group}
+            if role:
+                form["role"] = role
+            with open(p, "rb") as f:
+                return await self._request(
+                    "POST", "/api/voiceprints", data=form,
+                    files={"file": (p.name, f, "application/octet-stream")})
+        if not (job_id and speaker):
+            raise GoChiDUBBError("enroll needs job_id + speaker, or audio_file")
+        body = {"name": name, "group": group, "job_id": job_id,
+                "speaker": speaker}
+        if role:
+            body["role"] = role
+        return await self._request("POST", "/api/voiceprints", json=body)
+
+    async def update_voiceprint(self, profile_id: str, *,
+                                name: Optional[str] = None,
+                                role: Optional[str] = None,
+                                group: Optional[str] = None) -> dict:
+        body = {k: v for k, v in (("name", name), ("role", role),
+                                  ("group", group)) if v is not None}
+        return await self._request("PATCH", f"/api/voiceprints/{profile_id}",
+                                   json=body)
+
+    async def delete_voiceprint(self, profile_id: str) -> dict:
+        return await self._request("DELETE", f"/api/voiceprints/{profile_id}")
+
+    async def identify_speakers(self, job_id: str, group: str, *,
+                                threshold: Optional[float] = None) -> dict:
+        """Suggest an enrolled profile per diarized speaker (never confirms)."""
+        body: dict = {"group": group}
+        if threshold is not None:
+            body["threshold"] = float(threshold)
+        return await self._request(
+            "POST", f"/api/dub/{job_id}/speakers/identify", json=body)
+
+    async def confirm_speaker(self, job_id: str, speaker: str, *,
+                              profile_id: Optional[str] = None,
+                              name: Optional[str] = None,
+                              role: Optional[str] = None,
+                              public: bool = False,
+                              add_to_profile: bool = True,
+                              clear: bool = False) -> dict:
+        """Record a human's decision about who `speaker` is."""
+        body: dict = {"speaker": speaker, "add_to_profile": bool(add_to_profile)}
+        if clear:
+            body["clear"] = True
+        if public:
+            body["public"] = True
+        if profile_id:
+            body["profile_id"] = profile_id
+        if name:
+            body["name"] = name
+        if role:
+            body["role"] = role
+        return await self._request(
+            "POST", f"/api/dub/{job_id}/speakers/confirm", json=body)
+
     async def submit_compare(
         self,
         source: str,

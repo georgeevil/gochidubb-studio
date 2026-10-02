@@ -191,6 +191,7 @@ def rig(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "cfg", _Cfg())
     monkeypatch.setattr(server, "save_job", lambda job: None)
     monkeypatch.setattr(server, "_save_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr(server.app_audit, "AUDIT_FILE", tmp_path / "audit.jsonl")
     ran = []
 
     def fake(stage):

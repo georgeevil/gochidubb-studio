@@ -216,7 +216,8 @@ from app import (logbuf, artifact_store, reuse_runtime, reuse as app_reuse,
                  activity, apikeys as app_apikeys, webhooks as app_webhooks,
                  billing as app_billing, audit as app_audit,
                  estimate as app_estimate, admin as app_admin,
-                 review_gates as app_review_gates)
+                 review_gates as app_review_gates,
+                 voice_profiles as app_voice_profiles)
 
 
 # Force UTF-8 stdout for foreign-language transcripts on Windows cp1252 consoles
@@ -1640,6 +1641,8 @@ async def lifespan(app: FastAPI):
         activity.attach_store(BASE / "gochidubb.db")
     # Beta stage-reuse store, same file as the job store.
     artifact_store.init_store(BASE / "gochidubb.db")
+    # Enrolled voice profiles for speaker identification, same file again.
+    app_voice_profiles.init_store(BASE / "gochidubb.db")
     load_jobs_from_disk()
 
     # Initialize job queue + start serial worker. Using a single worker
@@ -1901,6 +1904,10 @@ def _scope_for(method: str, path: str) -> Optional[str]:
         return "webhooks:manage"
     if path.startswith(("/api/voice_presets", "/api/voices")):
         return "voices:write" if method in _WRITE_METHODS else None
+    if path.startswith("/api/voiceprints"):
+        # Enrolled voiceprints are biometric data about real people, so —
+        # unlike the preset catalogue — reading them is not open either.
+        return "voices:write" if method in _WRITE_METHODS else "jobs:read"
     if method in _WRITE_METHODS:
         return "dub:write" if path.startswith(_DUB_WRITE_PREFIXES) else None
     if method == "GET" and path.startswith(_JOBS_READ_PREFIXES):
@@ -9296,6 +9303,14 @@ def _apply_speaker_ops(job: dict, ops: list) -> dict:
         elif op["op"] == "merge":
             cast.pop(op["from"], None)
             labels.pop(op["from"], None)
+            # The ghost's identity suggestion/confirmation goes with it; the
+            # merged cluster's voice changed, so `into` must be re-identified
+            # rather than keep a match computed on half its speech.
+            for key in ("speaker_matches", "speaker_confirmed"):
+                if isinstance(job.get(key), dict):
+                    job[key].pop(op["from"], None)
+                    if key == "speaker_matches":
+                        job[key].pop(op["into"], None)
     if labels:
         job["speaker_labels"] = labels
     if "speaker_voice_map" in job:
@@ -9384,6 +9399,378 @@ async def edit_speakers(job_id: str, request: _ScoutRequest):
     return {"ok": True, "job_id": job_id, "applied": counts,
             "speakers": _speaker_summary(job_id, job.get("speaker_labels")),
             "siblings": siblings}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Speaker identification — enrolled voice profiles (voiceprints)
+# ═══════════════════════════════════════════════════════════════════════
+# Diarization numbers the speakers; this puts candidate names on them. A
+# per-cluster embedding is compared with the enrolled profiles of one group
+# and the best match above cfg.voice_match_threshold is stored as a
+# *suggestion* (job["speaker_matches"]). Only /speakers/confirm writes an
+# identity (job["speaker_confirmed"]), and only a confirmed name is ever
+# rendered by the transcript export. Routes live under /api/voiceprints —
+# /api/voices is the TTS voice-preset catalogue.
+
+_SPEAKER_EMB_FILE = "speaker_embeddings.json"
+_PUBLIC_SPEAKER = {"profile_id": None, "name": "Persona del público",
+                   "role": "público"}
+
+
+def _voiceprint_error(e: Exception) -> JSONResponse:
+    """503 for "cannot run here" (pyannote / store missing); never a crash."""
+    from pipeline.voiceprint import VoiceprintUnavailable
+    if isinstance(e, (VoiceprintUnavailable, app_voice_profiles.StoreUnavailable)):
+        return JSONResponse({"error": str(e), "unavailable": True}, 503)
+    log.exception(f"[voiceprint] failed: {e}")
+    return JSONResponse({"error": f"Speaker identification failed: {e}"}, 500)
+
+
+def _transcript_checkpoint(job_id: str) -> Optional[dict]:
+    for stage in _TRANSCRIPT_CHECKPOINTS:
+        cp = _load_checkpoint(job_id, stage)
+        if cp and cp.get("segments"):
+            return cp
+    return None
+
+
+def _cluster_embedding(job_id: str, cp: dict, speaker: str,
+                       token: str) -> Optional[list]:
+    """Centroid embedding of one diarized speaker (blocking — run off-loop).
+
+    Cached in outputs/<id>/speaker_embeddings.json keyed by the exact clips
+    used, so identify → confirm does not embed twice, and a speaker edit
+    that changes the cluster's segments recomputes instead of reusing.
+    """
+    import hashlib
+    from pipeline import voiceprint as vp
+    clips = vp.select_clips(cp.get("segments") or [], speaker)
+    if not clips:
+        return None
+    sig = hashlib.sha1(json.dumps(
+        [[round(a, 2), round(b, 2)] for a, b in clips]).encode()).hexdigest()[:16]
+    cache_path = OUTPUT_DIR / job_id / _SPEAKER_EMB_FILE
+    cache: dict = {}
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    hit = cache.get(speaker)
+    if isinstance(hit, dict) and hit.get("sig") == sig and hit.get("vector"):
+        return hit["vector"]
+    audio = _timeline_audio(cp)
+    if not audio or not os.path.exists(audio):
+        raise FileNotFoundError(
+            "This job's 16 kHz audio is gone from its output folder — "
+            "re-run the Extract stage to identify speakers")
+    vec = vp.embed_clips(audio, clips, token)
+    if vec is None:
+        return None
+    cache[speaker] = {"sig": sig, "vector": [round(float(x), 6) for x in vec]}
+    try:
+        cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    except OSError as e:
+        log.debug(f"[voiceprint] embedding cache not written: {e}")
+    return cache[speaker]["vector"]
+
+
+def _clean_text(v, limit: int = 120) -> str:
+    return str(v or "").strip()[:limit]
+
+
+@app.get("/api/voiceprints")
+async def list_voiceprints(group: str = "", include_embeddings: bool = False):
+    """Enrolled voice profiles, optionally of one group.
+
+    Each: {id, name, role, group, embeddings_count, created_at, updated_at,
+    sources: [{job_id, speaker}]} — plus `embeddings` (the vectors) only
+    with include_embeddings=true.
+    """
+    try:
+        profiles = app_voice_profiles.list_profiles(
+            group or None, with_embeddings=include_embeddings)
+    except Exception as e:
+        return _voiceprint_error(e)
+    return {"profiles": profiles}
+
+
+@app.post("/api/voiceprints")
+async def enroll_voiceprint(request: _ScoutRequest):
+    """Enroll a voice profile.
+
+    JSON {name, role?, group, job_id, speaker}: the embedding is computed
+    from up to ~60 s of that diarized speaker's longest clean segments.
+    Or multipart: name, role?, group, plus `file` — a recording of that one
+    voice (any format ffmpeg reads; the first ~60 s are used).
+    """
+    if not app_voice_profiles.available():
+        return _voiceprint_error(app_voice_profiles.StoreUnavailable(
+            "voice profile store is not initialised"))
+    ctype = request.headers.get("content-type") or ""
+    upload = None
+    if ctype.startswith("multipart/"):
+        form = await request.form()
+        body = {k: form.get(k) for k in ("name", "role", "group")}
+        upload = form.get("file") or form.get("audio")
+        if upload is None or not getattr(upload, "filename", ""):
+            return JSONResponse({"error": "multipart enroll needs a `file`"}, 400)
+    else:
+        body = await _json_body(request)
+
+    name = _clean_text(body.get("name"))
+    group = app_voice_profiles.normalize_group(body.get("group"))
+    role = _clean_text(body.get("role")) or None
+    if not name or not group:
+        return JSONResponse({"error": "name and group are required"}, 400)
+
+    token = effective_hf_token()
+    source = None
+    try:
+        if upload is not None:
+            from pipeline.voiceprint import embed_file
+            ext = Path(upload.filename).suffix or ".wav"
+            raw = UPLOAD_DIR / f"voiceprint_{uuid.uuid4().hex[:8]}{ext}"
+            wav = raw.with_name(raw.stem + "_16k.wav")
+            try:
+                with open(raw, "wb") as f:
+                    shutil.copyfileobj(upload.file, f)
+                await _blocking(extract_audio, str(raw), str(wav))
+                vec = await _blocking(embed_file, str(wav), token)
+            finally:
+                for p in (raw, wav):
+                    try:
+                        p.unlink()
+                    except OSError:
+                        pass
+        else:
+            job_id = str(body.get("job_id") or "").strip()
+            speaker = str(body.get("speaker") or "").strip()
+            if not job_id or not speaker:
+                return JSONResponse(
+                    {"error": "Send job_id + speaker, or upload a file"}, 400)
+            if job_id not in jobs:
+                return JSONResponse({"error": "Job not found"}, 404)
+            cp = _transcript_checkpoint(job_id)
+            if not cp:
+                return JSONResponse({"error": "That job has no transcript yet"}, 409)
+            from pipeline.voiceprint import MIN_CLUSTER_SECS, speaker_speech_secs
+            secs = speaker_speech_secs(cp["segments"]).get(speaker, 0.0)
+            if secs < MIN_CLUSTER_SECS:
+                return JSONResponse(
+                    {"error": f"{speaker} has {secs:.1f}s of speech in job "
+                              f"{job_id} — at least {MIN_CLUSTER_SECS:.0f}s "
+                              f"is needed for a usable voiceprint"}, 400)
+            vec = await _blocking(_cluster_embedding, job_id, cp, speaker, token)
+            source = {"job_id": job_id, "speaker": speaker}
+    except FileNotFoundError as e:
+        return JSONResponse({"error": str(e)}, 409)
+    except Exception as e:
+        return _voiceprint_error(e)
+    if vec is None:
+        return JSONResponse({"error": "No usable speech to build a voiceprint "
+                                      "from"}, 400)
+    profile = app_voice_profiles.create(name, group, vec, role=role,
+                                        source=source)
+    app_audit.record("voiceprint.enroll", target=profile["id"],
+                     detail=f"{group}: {name}")
+    return {"ok": True, "profile": profile}
+
+
+@app.patch("/api/voiceprints/{profile_id}")
+async def update_voiceprint(profile_id: str, request: _ScoutRequest):
+    """Rename / re-role / regroup a profile. Body {name?, role?, group?}."""
+    body = await _json_body(request)
+    kw = {}
+    for key in ("name", "role", "group"):
+        if key in body and body[key] is not None:
+            kw[key] = str(body[key])
+    if "name" in kw and not kw["name"].strip():
+        return JSONResponse({"error": "name cannot be empty"}, 400)
+    if "group" in kw and not app_voice_profiles.normalize_group(kw["group"]):
+        return JSONResponse({"error": "group cannot be empty"}, 400)
+    try:
+        profile = app_voice_profiles.update(profile_id, **kw)
+    except Exception as e:
+        return _voiceprint_error(e)
+    if profile is None:
+        return JSONResponse({"error": "Voice profile not found"}, 404)
+    return {"ok": True, "profile": profile}
+
+
+@app.delete("/api/voiceprints/{profile_id}")
+async def delete_voiceprint(profile_id: str):
+    try:
+        ok = app_voice_profiles.delete(profile_id)
+    except Exception as e:
+        return _voiceprint_error(e)
+    if not ok:
+        return JSONResponse({"error": "Voice profile not found"}, 404)
+    app_audit.record("voiceprint.delete", target=profile_id, detail="")
+    return {"ok": True, "deleted": profile_id}
+
+
+@app.post("/api/dub/{job_id}/speakers/identify")
+async def identify_speakers(job_id: str, request: _ScoutRequest):
+    """Suggest an enrolled profile for each diarized speaker.
+
+    Body {group, threshold?}. Clusters with under ~5 s of speech are skipped.
+    One profile is suggested for at most one cluster (greedy by score).
+    Matches at or above the threshold are stored as job["speaker_matches"]
+    — suggestions only; nothing is confirmed. Returns {job_id, group,
+    threshold, speakers: [{speaker, talk_secs, match|null, candidates[],
+    skipped|null}]}.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    job = jobs[job_id]
+    if (job.get("status") or "") in _BUSY_STATUSES:
+        return JSONResponse({"error": f"Job is {job.get('status')} — wait "
+                                      f"for it to finish"}, 409)
+    body = await _json_body(request)
+    group = app_voice_profiles.normalize_group(body.get("group"))
+    if not group:
+        return JSONResponse({"error": "group is required"}, 400)
+    try:
+        threshold = float(body.get("threshold", cfg.voice_match_threshold))
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "threshold must be a number"}, 400)
+    if not 0.0 <= threshold <= 1.0:
+        return JSONResponse({"error": "threshold must be within 0–1"}, 400)
+    cp = _transcript_checkpoint(job_id)
+    if not cp:
+        return JSONResponse({"error": "No transcript yet — nothing to "
+                                      "identify"}, 409)
+    try:
+        profiles = app_voice_profiles.list_profiles(group, with_embeddings=True)
+    except Exception as e:
+        return _voiceprint_error(e)
+
+    from pipeline import voiceprint as vp
+    talk = vp.speaker_speech_secs(cp["segments"])
+    token = effective_hf_token()
+    vecs: dict = {}
+    rows = []
+    for spk in sorted(talk, key=lambda k: (-talk[k], k)):
+        row = {"speaker": spk, "talk_secs": round(talk[spk], 1),
+               "match": None, "candidates": [], "skipped": None}
+        rows.append(row)
+        if talk[spk] < vp.MIN_CLUSTER_SECS:
+            row["skipped"] = "too_little_speech"
+            continue
+        if not profiles:
+            continue
+        try:
+            vec = await _blocking(_cluster_embedding, job_id, cp, spk, token)
+        except FileNotFoundError as e:
+            return JSONResponse({"error": str(e)}, 409)
+        except Exception as e:
+            return _voiceprint_error(e)
+        if vec is None:
+            row["skipped"] = "no_clean_segments"
+            continue
+        vecs[spk] = vec
+        row["candidates"] = vp.score_profiles(vec, profiles)[:3]
+
+    matches = vp.assign_matches(vecs, profiles, threshold)
+    for row in rows:
+        row["match"] = matches.get(row["speaker"])
+    job["speaker_matches"] = matches
+    job["speaker_matches_meta"] = {"group": group, "threshold": threshold,
+                                   "at": time.time()}
+    save_job(job)
+    log.info(f"[voiceprint] job={job_id} group={group!r}: "
+             f"{len(matches)}/{len(vecs)} cluster(s) matched "
+             f"against {len(profiles)} profile(s)")
+    return {"job_id": job_id, "group": group, "threshold": threshold,
+            "profiles": len(profiles), "speakers": rows}
+
+
+@app.post("/api/dub/{job_id}/speakers/confirm")
+async def confirm_speaker(job_id: str, request: _ScoutRequest):
+    """A human's decision about who one diarized speaker is.
+
+    Body {speaker, profile_id?, name?, role?, public?: bool,
+    add_to_profile?: bool = true, clear?: bool}.
+      * profile_id — that enrolled person (name/role default to the
+        profile's); with add_to_profile the cluster's embedding is added to
+        the profile so later matching improves.
+      * public: true — "Persona del público" (role "público"), no profile.
+      * name without profile_id — a named speaker with no voiceprint.
+      * clear: true — withdraw the confirmation.
+    Stored as job["speaker_confirmed"][speaker] = {profile_id, name, role}.
+    """
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    job = jobs[job_id]
+    body = await _json_body(request)
+    speaker = str(body.get("speaker") or "").strip()
+    if not speaker:
+        return JSONResponse({"error": "speaker is required"}, 400)
+    cp = _transcript_checkpoint(job_id)
+    if not cp:
+        return JSONResponse({"error": "No transcript yet"}, 409)
+    known = {s.get("speaker") or "SPEAKER_00" for s in cp["segments"]}
+    if speaker not in known:
+        return JSONResponse({"error": f"No speaker {speaker!r} in this job "
+                                      f"({', '.join(sorted(known))})"}, 400)
+
+    confirmed = dict(job.get("speaker_confirmed") or {})
+    if body.get("clear"):
+        confirmed.pop(speaker, None)
+        job["speaker_confirmed"] = confirmed
+        save_job(job)
+        return {"ok": True, "speaker": speaker, "confirmed": None}
+
+    profile = None
+    profile_updated = False
+    warning = None
+    profile_id = str(body.get("profile_id") or "").strip() or None
+    if body.get("public"):
+        entry = dict(_PUBLIC_SPEAKER)
+    elif profile_id:
+        try:
+            profile = app_voice_profiles.get(profile_id)
+        except Exception as e:
+            return _voiceprint_error(e)
+        if profile is None:
+            return JSONResponse({"error": "Voice profile not found"}, 404)
+        entry = {"profile_id": profile_id,
+                 "name": _clean_text(body.get("name")) or profile["name"],
+                 "role": _clean_text(body.get("role")) or profile.get("role")}
+    else:
+        name = _clean_text(body.get("name"))
+        if not name:
+            return JSONResponse(
+                {"error": "Send profile_id, name, or public: true"}, 400)
+        entry = {"profile_id": None, "name": name,
+                 "role": _clean_text(body.get("role")) or None}
+
+    if profile is not None and body.get("add_to_profile", True):
+        # Learning from the confirmation is a bonus: a missing pyannote or a
+        # deleted audio file must not cost the human their confirmation.
+        try:
+            vec = await _blocking(_cluster_embedding, job_id, cp, speaker,
+                                  effective_hf_token())
+            if vec is not None:
+                app_voice_profiles.add_embedding(
+                    profile_id, vec, {"job_id": job_id, "speaker": speaker})
+                profile_updated = True
+            else:
+                warning = "no clean speech to add to the profile"
+        except Exception as e:
+            warning = f"profile not updated: {e}"
+            log.warning(f"[voiceprint] job={job_id} {speaker}: {warning}")
+
+    confirmed[speaker] = entry
+    job["speaker_confirmed"] = confirmed
+    save_job(job)
+    app_audit.record("speaker.confirm", target=job_id,
+                     detail=f"{speaker} = {entry['name']}")
+    out = {"ok": True, "speaker": speaker, "confirmed": entry,
+           "profile_updated": profile_updated}
+    if warning:
+        out["warning"] = warning
+    return out
 
 
 # ═══════════════════════════════════════════════════════════════════════
