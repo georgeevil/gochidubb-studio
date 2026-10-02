@@ -71,6 +71,29 @@ missing dependencies before submitting work. Common failures:
 | System health | `gochidubb_system_status` | `gochidubb system` |
 | Supported languages | `gochidubb_list_languages` | `gochidubb languages` |
 | Installed translation models | `gochidubb_list_models` | `gochidubb models` |
+| Transcribe only (no dub) | `gochidubb_transcribe` | `gochidubb transcribe <src> [--source-lang es --max-speakers N --prompt "names"]` |
+| Export transcript | `gochidubb_get_transcript` | `gochidubb transcript <jid> --format json\|srt\|vtt\|txt [-o file]` |
+| Voice profiles | `gochidubb_list_voiceprints` / `_enroll_voiceprint` / `_update_voiceprint` / `_delete_voiceprint` | `gochidubb voiceprints list\|enroll\|edit\|rm` |
+| Suggest who each speaker is | `gochidubb_identify_speakers` | `gochidubb speakers identify <jid> --group G` |
+| Record a human's answer | `gochidubb_confirm_speaker` | `gochidubb speakers confirm <jid> SPEAKER_03 --profile ID\|--name N\|--public` |
+
+## Transcripts and speaker names
+
+Use `mode=transcribe` (`gochidubb_transcribe`) when the user wants the words,
+not a dub — meetings, council sessions, interviews. It runs download →
+extract → transcribe → diarize and ends `complete`: no background separation,
+no translation model, no review gates. Pass `initial_prompt` with proper
+names/places the recording uses, and `min_speakers`/`max_speakers` when the
+headcount is known. Hours of audio take a while — submit, then poll.
+
+Speaker identification is suggest-then-confirm. `gochidubb_identify_speakers`
+compares each diarized speaker with the enrolled voice profiles of a group
+and stores a *suggestion* (`match`). Show the suggestions to the user and
+only call `gochidubb_confirm_speaker` with the answer **they** give — never
+confirm a match on your own; exported transcripts print confirmed names, so a
+wrong confirmation puts a wrong name on someone's words. `public=True` marks
+a member of the public ("Persona del público"). These need pyannote; a 503
+means it is not installed.
 
 ## Source argument — URL or local path
 

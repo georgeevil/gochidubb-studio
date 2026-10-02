@@ -135,7 +135,7 @@ Or paste into `~/.claude.json`:
 }
 ```
 
-The MCP server exposes **32 tools**: dub / compare / showcase / redub, job status and listing, voice casting (get / set / preview), continue / cancel / rescue / delete, per-stage retry, review flags, translation edits, glossary terms, quality report, artifact audit, publish workflow (stage / approve / cancel / inbox), trending scout, duplicate check, and system / languages / models / voices.
+The MCP server exposes **40 tools**: dub / compare / showcase / redub, transcribe-only + transcript export, speaker identification (voiceprints, identify, confirm), job status and listing, voice casting (get / set / preview), continue / cancel / rescue / delete, per-stage retry, review flags, translation edits, glossary terms, quality report, artifact audit, publish workflow (stage / approve / cancel / inbox), trending scout, duplicate check, and system / languages / models / voices.
 
 The repo ships a Claude Code skill at [`.claude/skills/gochidubb/SKILL.md`](.claude/skills/gochidubb/SKILL.md). Copy it to `~/.claude/skills/` and Claude knows when and how to drive the pipeline.
 
@@ -167,7 +167,39 @@ python tools/gochidubb_cli.py continue <job_id>
 python tools/gochidubb_cli.py rescue <job_id> ./video.mp4
 ```
 
-The full subcommand list: `dub, compare, showcase, redub, status, jobs, wait, showcase-status, showcase-rebuild, cast, continue, retry-stage, flags, edit-translations, glossary-term, quality, audit, publish, approve, publish-cancel, publish-inbox, scout, scout-dub, check-dup, cancel, rescue, delete, system, languages, models, voices`.
+The full subcommand list: `dub, transcribe, transcript, voiceprints, speakers, compare, showcase, redub, status, jobs, wait, showcase-status, showcase-rebuild, cast, continue, retry-stage, flags, edit-translations, glossary-term, quality, audit, publish, approve, publish-cancel, publish-inbox, scout, scout-dub, check-dup, cancel, rescue, delete, system, languages, models, voices`.
+
+### Transcribe-only + speaker identification
+
+When the transcript is the product (meetings, council sessions, interviews),
+`mode=transcribe` runs download → extract → transcribe → diarize and finishes
+`complete` — no background separation, no translation model, no review gates,
+no TTS. Optional hints: `min_speakers` / `max_speakers` (diarization) and
+`initial_prompt` (whisper vocabulary: names, places). On an Apple Silicon Mac,
+install `requirements-mac.txt` and ASR runs on the GPU via mlx-whisper.
+
+```bash
+python tools/gochidubb_cli.py transcribe https://youtu.be/abc --source-lang es \
+  --max-speakers 12 --prompt "Concejo Municipal de Talamanca" --wait
+python tools/gochidubb_cli.py transcript <job_id> --format srt -o session.srt
+
+# Put names on speakers: enroll known voices once per group, then per job
+# get suggestions and have a human confirm them (nothing is auto-confirmed)
+python tools/gochidubb_cli.py voiceprints enroll "Ana Mora" --group talamanca \
+  --role presidenta --job <job_id> --speaker SPEAKER_03
+python tools/gochidubb_cli.py speakers identify <job_id> --group talamanca
+python tools/gochidubb_cli.py speakers confirm <job_id> SPEAKER_03 --profile <profile_id>
+python tools/gochidubb_cli.py speakers confirm <job_id> SPEAKER_07 --public
+```
+
+HTTP: `GET /api/dub/{id}/transcript?format=json|srt|vtt|txt`,
+`GET|POST /api/voiceprints`, `PATCH|DELETE /api/voiceprints/{id}`,
+`POST /api/dub/{id}/speakers/identify` and `/speakers/confirm`. Exports print
+the confirmed name, else the speaker label, else the diarization id — a voice
+match stays a suggestion until confirmed. Voiceprints use pyannote's speaker
+embedding model (no extra install beyond diarization) and live in
+`gochidubb.db`; they are biometric data about real people, so enroll only
+voices whose owners would expect it.
 
 Drive a remote box: `set GOCHIDUBB_URL=http://192.168.0.10:8910`
 
