@@ -172,6 +172,40 @@ async def cmd_dub(c: GoChiDUBBClient, a) -> None:
             sys.exit(2)
 
 
+async def cmd_transcribe(c: GoChiDUBBClient, a) -> None:
+    """Submit a transcribe-only job (download → diarize, no dub)."""
+    res = await c.submit_transcribe(
+        a.source, source_lang=a.source_lang, whisper_model=a.whisper,
+        min_speakers=a.min_speakers, max_speakers=a.max_speakers,
+        initial_prompt=a.prompt or "", auto_denoise=a.auto_denoise,
+    )
+    job_id = res.get("job_id")
+    _print_json(res)
+    if a.wait and job_id:
+        print(f"[wait] polling job {job_id}…", file=sys.stderr)
+        final = await c.wait_for_job(job_id, timeout=a.wait_timeout)
+        status = final.get("status") or ""
+        if status == "complete":
+            print(f"[done] gochidubb transcript {job_id} --format txt")
+        else:
+            print(f"[fail] status={status} err={final.get('error', '?')}",
+                  file=sys.stderr)
+            sys.exit(2)
+
+
+async def cmd_transcript(c: GoChiDUBBClient, a) -> None:
+    """Export a job's speaker-attributed transcript."""
+    data = await c.get_transcript(a.job_id, a.format)
+    text = (json.dumps(data, indent=2, ensure_ascii=False)
+            if a.format == "json" else data)
+    if a.output:
+        with open(a.output, "w", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+        print(f"wrote {a.output}", file=sys.stderr)
+    else:
+        print(text, end="" if text.endswith("\n") else "\n")
+
+
 async def cmd_compare(c: GoChiDUBBClient, a) -> None:
     res = await c.submit_compare(
         a.source, a.langs, trim_seconds=a.trim,
@@ -692,6 +726,37 @@ def build_parser() -> argparse.ArgumentParser:
                         "`continue` resumes it if you want the rest.")
     _add_common_dub_opts(s)
     s.set_defaults(handler=cmd_dub)
+
+    # transcribe-only
+    s = sub.add_parser("transcribe",
+                       help="Transcribe + diarize only (no dub); export with "
+                            "`transcript`")
+    s.add_argument("source", help="Video URL or local file path")
+    s.add_argument("--source-lang", default="auto",
+                   help="Spoken language code, or auto (default)")
+    s.add_argument("--whisper", default="large-v3",
+                   help="Whisper model (large-v3, large-v3-turbo, medium, "
+                        "or an mlx repo id on Apple Silicon)")
+    s.add_argument("--min-speakers", type=int, default=None,
+                   help="Diarization hint: at least this many speakers")
+    s.add_argument("--max-speakers", type=int, default=None,
+                   help="Diarization hint: at most this many speakers")
+    s.add_argument("--prompt", default="",
+                   help="Whisper vocabulary hint: names, places, jargon")
+    s.add_argument("--auto-denoise", action="store_true",
+                   help="FFT-denoise the audio before transcription")
+    s.add_argument("--wait", action="store_true")
+    s.add_argument("--wait-timeout", type=float, default=4 * 3600.0,
+                   help="Seconds before --wait gives up (default 4h)")
+    s.set_defaults(handler=cmd_transcribe)
+
+    s = sub.add_parser("transcript",
+                       help="Export a job's speaker-attributed transcript")
+    s.add_argument("job_id")
+    s.add_argument("--format", default="json",
+                   choices=["json", "srt", "vtt", "txt"])
+    s.add_argument("-o", "--output", help="Write to this file instead of stdout")
+    s.set_defaults(handler=cmd_transcript)
 
     # compare (quick test)
     s = sub.add_parser("compare", help="N separate dubs side-by-side (Quick Test)")

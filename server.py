@@ -9175,7 +9175,11 @@ def _speaker_edit_refusal(job: dict) -> Optional[str]:
     status = job.get("status") or ""
     if status in _BUSY_STATUSES:
         return f"Job is {status} — wait for it to pause before editing speakers"
-    if status not in _SPEAKER_EDIT_STATUSES:
+    # A finished transcribe-mode job synthesized nothing, so there is no
+    # audio a relabel could put in the wrong voice — and fixing speakers is
+    # the review step for a transcript.
+    transcript_done = status == "complete" and job.get("mode") == "transcribe"
+    if status not in _SPEAKER_EDIT_STATUSES and not transcript_done:
         return (f"Job is {status} — speakers can only be edited while parked "
                 f"at a pre-TTS review (or paused/errored)")
     if not _load_checkpoint(job.get("id") or "", "transcription_done"):
@@ -9774,6 +9778,69 @@ async def list_job_files(job_id: str):
         # than silently omitting the row.
         "kept_background": bool(job.get("keep_bg", True)),
     }
+
+
+# Checkpoints a speaker-attributed transcript can be read from, preferred
+# first. transcription_done is the diarized, post-processed transcript and is
+# the one the speaker editor writes through; the later ones carry the same
+# segments (plus translations this export ignores); transcribe_done is the
+# pre-diarization fallback, every line then attributed to one speaker.
+_TRANSCRIPT_CHECKPOINTS = ("transcription_done", "translation_done",
+                           "tts_done", "transcribe_done")
+
+
+def _transcript_doc(job_id: str) -> Optional[dict]:
+    """The job's transcript document (pipeline/transcript.py), or None."""
+    job = jobs.get(job_id) or {}
+    for stage in _TRANSCRIPT_CHECKPOINTS:
+        cp = _load_checkpoint(job_id, stage)
+        if cp and cp.get("segments"):
+            from pipeline.transcript import build_transcript
+            return build_transcript(
+                job_id, cp,
+                source=job.get("source") or cp.get("source") or "",
+                duration=job.get("duration", cp.get("duration")),
+                labels=job.get("speaker_labels"),
+                matches=job.get("speaker_matches"),
+                confirmed=job.get("speaker_confirmed"),
+            )
+    return None
+
+
+@app.get("/api/dub/{job_id}/transcript")
+async def get_transcript(job_id: str, format: str = "json"):
+    """Speaker-attributed source-language transcript.
+
+    format=json (default) returns {job_id, source, duration, language, asr,
+    diarization, speakers[], segments[]} — see pipeline/transcript.py for
+    the exact shape. srt / vtt / txt render each line as "Name: text", where
+    Name is the human-confirmed name, else the speaker editor's label, else
+    the diarization id. Voice-profile matches are suggestions and never
+    become a rendered name until confirmed. Available as soon as the
+    transcription checkpoint exists — transcribe-mode jobs and dubs alike.
+    """
+    from pipeline.transcript import FORMATS, render
+    fmt = (format or "json").strip().lower()
+    if fmt not in FORMATS:
+        return JSONResponse(
+            {"error": f"Unknown format {format!r}. Options: {', '.join(FORMATS)}"},
+            400)
+    if job_id not in jobs:
+        return JSONResponse({"error": "Job not found"}, 404)
+    doc = _transcript_doc(job_id)
+    if doc is None:
+        return JSONResponse({"error": "No transcript yet — the transcribe "
+                                      "stage has not finished"}, 404)
+    if fmt == "json":
+        return doc
+    from fastapi.responses import PlainTextResponse
+    media = {"srt": "application/x-subrip", "vtt": "text/vtt",
+             "txt": "text/plain"}[fmt]
+    return PlainTextResponse(
+        content=render(doc, fmt), media_type=f"{media}; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="transcript_{job_id}.{fmt}"'},
+    )
 
 
 @app.get("/api/dub/{job_id}/transcripts.txt")

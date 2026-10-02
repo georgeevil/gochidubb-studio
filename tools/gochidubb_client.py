@@ -78,6 +78,18 @@ class GoChiDUBBClient:
             raise GoChiDUBBError(err)
         return data
 
+    async def _request_text(self, method: str, path: str, **kw) -> str:
+        """Like _request, for routes that answer with a text document."""
+        r = await self._http.request(method, f"{self.base_url}{path}", **kw)
+        if r.status_code >= 400:
+            try:
+                data = r.json()
+                err = data.get("error") or data.get("detail")
+            except Exception:
+                err = None
+            raise GoChiDUBBError(err or f"HTTP {r.status_code}")
+        return r.text
+
     @staticmethod
     def _prompt_headers(prompt: Optional[str]) -> Optional[dict]:
         """Per-request headers carrying the natural-language request behind a
@@ -151,8 +163,9 @@ class GoChiDUBBClient:
         nobody — the artifacts are on disk and /continue resumes the rest
         later, if you want it.
 
-        mode: 'dub' (full pipeline) or 'reupload' (download + remux only —
-        used for music videos where dubbing makes no sense).
+        mode: 'dub' (full pipeline), 'reupload' (download + remux only —
+        used for music videos where dubbing makes no sense) or 'transcribe'
+        (download → diarize only; see submit_transcribe).
         scheduled_at: unix epoch seconds; a future timestamp parks the job
         as status='scheduled' and the server starts it at that time.
         voxcpm_cfg / voxcpm_steps: per-job VoxCPM guidance and inference
@@ -185,6 +198,59 @@ class GoChiDUBBClient:
             form["stop_after"] = stop_after
         return await self._request("POST", "/api/dub", data=form, files=files,
                                    headers=self._prompt_headers(prompt))
+
+    async def submit_transcribe(
+        self,
+        source: str,
+        *,
+        source_lang: str = "auto",
+        whisper_model: str = "large-v3",
+        min_speakers: Optional[int] = None,
+        max_speakers: Optional[int] = None,
+        initial_prompt: str = "",
+        auto_denoise: bool = False,
+        prompt: Optional[str] = None,
+    ) -> dict:
+        """Submit a transcribe-only job (mode='transcribe'). Returns `job_id`.
+
+        Runs download → extract → transcribe → diarize and finishes
+        'complete' — no background separation, translation, review gates or
+        TTS. Fetch the result with get_transcript().
+
+        min_speakers / max_speakers: diarization hints (None = auto).
+        initial_prompt: whisper vocabulary hint — proper names, places,
+        jargon the recording uses ("Concejo Municipal de Talamanca, …").
+        """
+        files, form = self._source_fields(source)
+        form.update({
+            "mode": "transcribe",
+            "source_lang": source_lang,
+            "whisper_model": whisper_model,
+            "auto_denoise": str(bool(auto_denoise)).lower(),
+            "keep_bg": "false",
+        })
+        if min_speakers:
+            form["min_speakers"] = str(int(min_speakers))
+        if max_speakers:
+            form["max_speakers"] = str(int(max_speakers))
+        if initial_prompt:
+            form["initial_prompt"] = initial_prompt
+        return await self._request("POST", "/api/dub", data=form, files=files,
+                                   headers=self._prompt_headers(prompt))
+
+    async def get_transcript(self, job_id: str, fmt: str = "json"):
+        """Speaker-attributed transcript of a job.
+
+        fmt='json' returns the document as a dict ({job_id, source, duration,
+        language, asr, diarization, speakers[], segments[]}); 'srt', 'vtt'
+        and 'txt' return the rendered text ("Name: line").
+        """
+        params = {"format": fmt}
+        if fmt == "json":
+            return await self._request(
+                "GET", f"/api/dub/{job_id}/transcript", params=params)
+        return await self._request_text(
+            "GET", f"/api/dub/{job_id}/transcript", params=params)
 
     async def submit_compare(
         self,

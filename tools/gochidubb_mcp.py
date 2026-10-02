@@ -181,6 +181,71 @@ async def gochidubb_dub(
 
 
 @mcp.tool()
+async def gochidubb_transcribe(
+    source: str,
+    source_lang: str = "auto",
+    whisper_model: str = "large-v3",
+    min_speakers: Optional[int] = None,
+    max_speakers: Optional[int] = None,
+    initial_prompt: str = "",
+    prompt: str = "",
+    wait: bool = False,
+    wait_timeout: float = 4 * 3600.0,
+) -> dict:
+    """Transcribe a video with speaker diarization — no dub.
+
+    Runs download → extract → transcribe → diarize and finishes 'complete'.
+    No background separation, translation model, review gate or TTS is
+    involved, so it works for long recordings (meetings, council sessions).
+    Fetch the result with gochidubb_get_transcript; put names on speakers
+    with gochidubb_identify_speakers / gochidubb_confirm_speaker.
+
+    Args:
+        source: YouTube/direct URL or absolute local file path.
+        source_lang: spoken language code ('es', 'en', …) or 'auto'.
+        whisper_model: 'large-v3' (default), 'large-v3-turbo', 'medium', …
+        min_speakers / max_speakers: diarization hints; None = auto.
+        initial_prompt: whisper vocabulary hint — proper names, places and
+            jargon the recording uses. Improves their spelling.
+        prompt: the user's request, quoted on the activity feed (optional).
+        wait: block until finished (multi-hour audio takes a while).
+        wait_timeout: max seconds to wait when wait=True.
+
+    Returns {job_id} (+ status when wait=True).
+    """
+    c = await _get_client()
+    res = await c.submit_transcribe(
+        source, source_lang=source_lang, whisper_model=whisper_model,
+        min_speakers=min_speakers, max_speakers=max_speakers,
+        initial_prompt=initial_prompt, prompt=prompt,
+    )
+    job_id = res.get("job_id")
+    if wait and job_id:
+        final = await c.wait_for_job(job_id, timeout=wait_timeout)
+        res["status"] = final.get("status")
+        res["error"] = final.get("error")
+    return res
+
+
+@mcp.tool()
+async def gochidubb_get_transcript(job_id: str, format: str = "json"):
+    """A job's speaker-attributed source-language transcript.
+
+    format='json' (default) returns {job_id, source, duration, language,
+    asr: {backend, model}, diarization: {model}, speakers: [{id, label,
+    talk_secs, segments, match, confirmed}], segments: [{idx, start, end,
+    text, speaker, avg_logprob, no_speech_prob}]}. 'srt' | 'vtt' | 'txt'
+    return text with each line as "Name: text" — Name is the
+    human-confirmed name, else the speaker label, else the speaker id.
+    A `match` is only a voice-profile suggestion; never present it as the
+    speaker's identity until it is `confirmed`.
+    Works for transcribe-mode jobs and for dubs once transcription is done.
+    """
+    c = await _get_client()
+    return await c.get_transcript(job_id, format)
+
+
+@mcp.tool()
 async def gochidubb_compare(
     source: str,
     target_langs: list[str],
