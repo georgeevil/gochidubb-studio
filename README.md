@@ -566,6 +566,7 @@ something else is pointed at the server.
 | Background music preservation | `pip install demucs` (recommended) or `pip install audio-separator` | Demuxes vocals, keeps original BGM; Demucs uses the `htdemucs_ft` model |
 | Lighter voice cloning | `pip install f5-tts`, then set `tts_engine=f5tts` | F5-TTS needs ~3 GB VRAM vs VoxCPM2's 8+; good quality, faster |
 | Faster Whisper on GPU | (already in requirements) | If CUDA isn't found, falls back to CPU |
+| Whisper on Apple Silicon GPU | `pip install -r requirements-mac.txt` (mlx-whisper; `macos_setup.sh` does it on arm64) | `ASR_BACKEND=auto` (default) uses it on an arm64 Mac; `faster-whisper` / `mlx` force one. The backend + model that ran are recorded in the transcript checkpoint |
 
 ---
 

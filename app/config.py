@@ -94,6 +94,7 @@ FIELD_SPECS: dict = {
     "subtitle_max_lines":          (int, 1, 4),
     "subtitle_max_cps":            (float, 5.0, 40.0),
     "subtitle_min_gap_ms":         (int, 0, 1000),
+    "asr_backend":             (str, ("auto", "faster-whisper", "mlx")),
 }
 
 _TRUTHY = ("1", "true", "yes", "on")
@@ -159,6 +160,11 @@ class UserConfig:
     # ── Whisper ───────────────────────────────────────────────────────
     whisper_model: str = "large-v3"       # large-v3 | medium | small | tiny
     auto_denoise: bool = True             # FFT denoise before transcription
+    # ASR engine. "auto" = mlx-whisper on an arm64 Mac when the optional
+    # mlx-whisper package (requirements-mac.txt) is installed, faster-whisper
+    # everywhere else. faster-whisper has no Metal backend, so on a Mac it
+    # runs CPU int8 — mlx-whisper runs the same weights on the GPU.
+    asr_backend: str = "auto"             # "auto" | "faster-whisper" | "mlx"
 
     # ── VAD ───────────────────────────────────────────────────────────
     vad_enabled: bool = True              # strip silence before Whisper
@@ -453,6 +459,7 @@ def _load_config() -> UserConfig:
         "GOCHIDUBB_BG_DUCKING": "bg_ducking",
         "OLLAMA_URL": "ollama_url",
         "WHISPER_MODEL": "whisper_model",
+        "ASR_BACKEND": "asr_backend",
         "GOCHIDUBB_OPEN_BROWSER": "open_browser",
         "GOCHIDUBB_WARMUP": "warmup_on_start",
         "GOCHIDUBB_QA_SAME_LANGUAGE": "qa_same_language",

@@ -1,0 +1,12 @@
+# Apple Silicon extras — install ON TOP of requirements.txt on an arm64 Mac:
+#
+#     pip install -r requirements-mac.txt
+#
+# Not in requirements.txt: mlx only exists for macOS on Apple Silicon.
+
+# GPU (Metal) Whisper. faster-whisper has no Metal backend and runs CPU int8
+# on a Mac; with this installed, ASR_BACKEND=auto (the default) transcribes
+# with mlx-whisper instead. Same Whisper weights, converted by mlx-community
+# (see MLX_MODEL_REPOS in pipeline/transcriber.py). ASR_BACKEND=faster-whisper
+# switches back without uninstalling anything.
+mlx-whisper>=0.4.0
