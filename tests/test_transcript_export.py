@@ -240,3 +240,52 @@ def test_cli_parses_transcribe_and_transcript():
                                    "-o", "out.srt"])
     assert a.handler is cmd_transcript
     assert (a.format, a.output) == ("srt", "out.srt")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Non-finite floats — one NaN must not cost the whole transcript
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestNonFiniteFloats:
+    """mlx-whisper returned a single NaN `avg_logprob` in a 1,317-segment
+    council session. `float("nan")` passes every ordinary check, json.dumps
+    then emits a bare NaN, and FastAPI refuses it — so one number out of a
+    quarter-million made the entire export 500."""
+
+    def _cp(self, value):
+        return {"segments": [
+            {"idx": 0, "start": 0.0, "end": 2.0, "text": "uno",
+             "speaker": "SPEAKER_00", "avg_logprob": value},
+            {"idx": 1, "start": 2.0, "end": 4.0, "text": "dos",
+             "speaker": "SPEAKER_00", "avg_logprob": -0.4},
+        ]}
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+    def test_the_document_stays_json_serializable(self, bad):
+        import json
+        from pipeline.transcript import build_transcript
+        doc = build_transcript("j1", self._cp(bad), source="s", duration=4.0)
+        # Serializes under the same strictness FastAPI applies.
+        json.dumps(doc, allow_nan=False)
+        assert doc["segments"][0]["avg_logprob"] is None
+        # The rest of the transcript is untouched.
+        assert doc["segments"][1]["avg_logprob"] == -0.4
+        assert [s["text"] for s in doc["segments"]] == ["uno", "dos"]
+
+    def test_a_nan_duration_does_not_become_zero(self):
+        from pipeline.transcript import build_transcript
+        doc = build_transcript("j1", self._cp(-0.4), source="s",
+                               duration=float("nan"))
+        # Absence, not a fabricated length.
+        assert doc["duration"] is None
+
+    def test_serialize_segments_keeps_nan_out_of_checkpoints(self):
+        import server
+        out = server._serialize_segments([
+            {"start": 0.0, "end": 1.0, "text": "x", "speaker": "SPEAKER_00",
+             "avg_logprob": float("nan"), "no_speech_prob": 0.2,
+             "word_conf_mean": float("inf")},
+        ])
+        assert "avg_logprob" not in out[0]
+        assert "word_conf_mean" not in out[0]
+        assert out[0]["no_speech_prob"] == 0.2

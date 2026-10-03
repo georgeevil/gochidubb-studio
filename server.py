@@ -2154,8 +2154,18 @@ def _serialize_segments(segments: list) -> list:
         for opt in ("translated_text", "audio_path", "qa_score", "tts_tier",
                     "qa", "avg_logprob", "no_speech_prob", "non_speech",
                     "word_conf_mean", "word_conf_min"):
-            if s.get(opt) is not None:
-                item[opt] = s.get(opt)
+            v = s.get(opt)
+            if v is None:
+                continue
+            # NaN and the infinities are not JSON. Letting one into a
+            # checkpoint poisons every reader of it — the transcript export
+            # 500s on a single NaN avg_logprob in a 1,317-segment file — and
+            # the checkpoint is the durable artifact, so it is cleaned here
+            # rather than at each consumer. Dropped, not coerced to 0: a
+            # confidence of zero is a claim, absence is not.
+            if isinstance(v, float) and not math.isfinite(v):
+                continue
+            item[opt] = v
         # Aggregate per-word ASR confidences the first time through (the
         # words list itself is NOT serialized — only its summary survives
         # checkpointing; later passes carry the stats via the loop above).

@@ -17,6 +17,7 @@ name a model guessed.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Dict, List, Optional
 
 from .subtitles import srt_text, vtt_text
@@ -28,12 +29,22 @@ DEFAULT_SPEAKER = "SPEAKER_00"
 
 
 def _num(v) -> Optional[float]:
+    """A float suitable for JSON, or None.
+
+    NaN and the infinities are rejected rather than passed through. `float()`
+    accepts them happily and `json.dumps` then emits bare NaN/Infinity, which
+    is not JSON: FastAPI's encoder raises «Out of range float values are not
+    JSON compliant» and the whole export 500s. One such value is enough —
+    mlx-whisper returned a single NaN `avg_logprob` in a 1,317-segment
+    council session, and that one number made the transcript unreadable.
+    """
     if isinstance(v, bool):
         return None
     try:
-        return float(v)
+        f = float(v)
     except (TypeError, ValueError):
         return None
+    return f if math.isfinite(f) else None
 
 
 def _clean_match(m: Any) -> Optional[dict]:
