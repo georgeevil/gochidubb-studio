@@ -161,6 +161,7 @@ def _transcribe_mlx(
     model_size: str,
     initial_prompt: Optional[str],
     info: Optional[dict],
+    condition_on_previous_text: bool = True,
 ) -> Tuple[List[Dict], Optional[str]]:
     """mlx-whisper path. Same return shape as the faster-whisper path."""
     try:
@@ -185,7 +186,7 @@ def _transcribe_mlx(
         "language": effective_lang,
         "word_timestamps": True,
         "initial_prompt": initial_prompt or None,
-        "condition_on_previous_text": True,
+        "condition_on_previous_text": condition_on_previous_text,
         "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
         "compression_ratio_threshold": 2.4,
         "logprob_threshold": -1.0,
@@ -244,6 +245,7 @@ def transcribe(
     initial_prompt: Optional[str] = None,
     backend: Optional[str] = None,
     info: Optional[dict] = None,
+    condition_on_previous_text: bool = True,
 ) -> Tuple[List[Dict], Optional[str]]:
     """
     Transcribe audio with faster-whisper or mlx-whisper (see module doc).
@@ -265,7 +267,8 @@ def transcribe(
     """
     if resolve_asr_backend(backend) == "mlx":
         return _transcribe_mlx(audio_path, source_lang, model_size,
-                               initial_prompt, info)
+                               initial_prompt, info,
+                               condition_on_previous_text)
     if info is not None:
         info.update(backend="faster-whisper", model=model_size)
 
@@ -313,7 +316,7 @@ def transcribe(
             "compression_ratio_threshold": 2.4,
             "log_prob_threshold": -1.0,
             "no_speech_threshold": 0.6,
-            "condition_on_previous_text": True,
+            "condition_on_previous_text": condition_on_previous_text,
             "prompt_reset_on_temperature": 0.5,
             "initial_prompt": initial_prompt or None,
             "prefix": None,

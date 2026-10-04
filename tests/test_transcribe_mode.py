@@ -148,6 +148,23 @@ def _run_pipeline_ctx(monkeypatch, **kw):
     return seen
 
 
+def test_transcribe_does_not_feed_whisper_its_own_output(monkeypatch):
+    """The repetition loop that cost 4-18% of six published sessions.
+
+    Whisper conditions each window on the text it just produced. Over hours
+    that becomes a loop — the same sentence re-emitted 25s later with one
+    verb changed. A dub is short and benefits from the context; long-form
+    transcription must not have it.
+    """
+    seen = _run_pipeline_ctx(monkeypatch)
+    assert seen["ctx"]["condition_on_previous_text"] is False
+
+
+def test_a_dub_keeps_its_context_window(monkeypatch):
+    seen = _run_pipeline_ctx(monkeypatch, mode="dub")
+    assert seen["ctx"]["condition_on_previous_text"] is True
+
+
 def test_run_pipeline_transcribe_ctx(monkeypatch):
     seen = _run_pipeline_ctx(monkeypatch, min_speakers=2, max_speakers=0,
                              initial_prompt="  Talamanca  ")
