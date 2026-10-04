@@ -2402,6 +2402,8 @@ async def _stage_transcribe(job, work, ctx, update, perf):
             transcribe, ctx["audio_16k"], source_lang, whisper_model,
             initial_prompt=(ctx.get("initial_prompt") or None),
             info=asr_info,
+            condition_on_previous_text=bool(
+                ctx.get("condition_on_previous_text", True)),
         )
     finally:
         _done_flag["done"] = True
@@ -3910,6 +3912,7 @@ async def run_pipeline(
     job = jobs[job_id]
     job["wizard_mode"] = wizard_mode
     job["mode"] = normalize_job_mode(mode) or "dub"
+    condition_on_previous_text = True
     if job["mode"] == "transcribe":
         # Nothing is mixed back, so separating the background bed is a
         # Demucs run for nothing; nothing is cloned, so no reference voice;
@@ -3919,6 +3922,14 @@ async def run_pipeline(
         reference_audio = ""
         speaker_mode = "all"
         review_gates = {g: "off" for g in app_review_gates.GATES}
+        # Whisper feeds its own previous output back in as context. Over a
+        # multi-hour recording that is how it locks into a loop: across six
+        # Talamanca sessions, 4-18% of published segments were a line it had
+        # already emitted — twice re-stating the same sentence 25 s apart
+        # with a single verb changed. A dub runs for minutes and gains
+        # coherence from that context; a session runs for hours and loses
+        # the record to it.
+        condition_on_previous_text = False
     gates = (dict(review_gates) if isinstance(review_gates, dict)
              else _resolved_review_gates(None, wizard_mode, job))
     job["review_gates"] = gates
@@ -3940,6 +3951,7 @@ async def run_pipeline(
         "tts_speed": tts_speed,
         "wizard_mode": wizard_mode,
         "auto_denoise": auto_denoise,
+        "condition_on_previous_text": condition_on_previous_text,
         "voxcpm_cfg": voxcpm_cfg,
         "voxcpm_steps": voxcpm_steps,
         "min_speakers": _opt_speaker_count(min_speakers),
