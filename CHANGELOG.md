@@ -141,6 +141,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a clean venv at 1016/1016.
 
 ### Fixed
+- **An omitted boolean form field means what the route declares again.** FastAPI
+  0.147.0 through 0.161.1 read every omitted `bool` and `Optional[bool]` form
+  field as `False`, whatever its default, and 0.162.0 reverted that. On a venv
+  built in that window, a dub started from `creator.html` or `go.html` lost its
+  background bed, and so did a redub (`keep_bg` should inherit from the original
+  job). A preset edit that left the consent toggle alone removed the consent
+  record, and `POST /api/storage/cleanup` without `dry_run` deleted files instead
+  of reporting them. The CLI and MCP always send `keep_bg` and `render_video`, so
+  they were not affected. `requirements.txt` now requires `fastapi>=0.162.0`; an
+  existing venv keeps its version until you run
+  `pip install -r requirements.txt` and restart the server.
 - **A narration with `burn_subs` no longer fails after synthesizing every
   line.** The subtitle burn is the last step of a narration, and it needs
   ffmpeg's `subtitles` filter, which needs libass. Homebrew's ffmpeg 9.0.2 is

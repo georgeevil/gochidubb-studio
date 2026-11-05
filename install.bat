@@ -151,7 +151,7 @@ echo [4/7] Installing core Python packages...
 echo      (this takes 2-5 minutes, please wait)
 
 pip install --quiet ^
-    fastapi ^
+    "fastapi>=0.162.0" ^
     "uvicorn[standard]" ^
     python-multipart ^
     httpx ^
