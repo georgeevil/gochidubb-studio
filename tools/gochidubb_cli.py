@@ -41,7 +41,8 @@ try:
 except Exception:
     pass
 
-from gochidubb_client import GoChiDUBBClient, GoChiDUBBError, DEFAULT_URL
+from gochidubb_client import (GoChiDUBBClient, GoChiDUBBError, DEFAULT_URL,
+                              NARRATION_FILES)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -191,6 +192,65 @@ async def cmd_transcribe(c: GoChiDUBBClient, a) -> None:
             print(f"[fail] status={status} err={final.get('error', '?')}",
                   file=sys.stderr)
             sys.exit(2)
+
+
+def parse_timing(spec: str) -> dict:
+    """"slide_gap=1.5,tail=2" -> {"slide_gap": 1.5, "tail": 2.0}. Which keys
+    exist is the server's business; this only parses."""
+    out = {}
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        key, sep, val = part.partition("=")
+        try:
+            out[key.strip()] = float(val)
+        except ValueError:
+            sep = ""
+        if not sep or not key.strip():
+            raise ValueError(
+                f"--timing: {part!r} is not key=seconds "
+                f"(e.g. slide_gap=1.5,tail=2)")
+    return out
+
+
+async def cmd_narrate(c: GoChiDUBBClient, a) -> None:
+    """Submit a narration (script → voice track, subtitles, slideshow)."""
+    res = await c.submit_narration(
+        a.script, images=a.images or None, target_lang=a.lang,
+        voice_preset=a.voice, voice_style=a.voice_style or "",
+        tts_speed=a.tts_speed, title=a.title or "",
+        render_video=not a.no_video, burn_subs=a.burn_subs,
+        timing=parse_timing(a.timing) if a.timing else None,
+    )
+    job_id = res.get("job_id")
+    _print_json(res)
+    if not (a.wait and job_id):
+        if a.output:
+            print("[note] -o needs --wait; nothing was downloaded",
+                  file=sys.stderr)
+        return
+    print(f"[wait] polling job {job_id}…", file=sys.stderr)
+    final = await c.wait_for_job(job_id, timeout=a.wait_timeout)
+    status = final.get("status") or ""
+    if status != "complete":
+        print(f"[fail] status={status} err={final.get('error', '?')}",
+              file=sys.stderr)
+        sys.exit(2)
+    failed = (final.get("narration") or {}).get("failed_lines") or []
+    if failed:
+        print(f"[warn] {len(failed)} line(s) have no audio: {failed}",
+              file=sys.stderr)
+    names = [n for n in NARRATION_FILES
+             if n != "dubbed_video.mp4" or final.get("output_url")]
+    if a.output:
+        for name in names:
+            path = await c.download_output(
+                job_id, name, _os.path.join(a.output, name))
+            print(f"[done] {path}")
+    else:
+        for name in names:
+            print(f"[done] {c.output_url(job_id, name)}")
 
 
 async def cmd_transcript(c: GoChiDUBBClient, a) -> None:
@@ -796,6 +856,43 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--wait-timeout", type=float, default=4 * 3600.0,
                    help="Seconds before --wait gives up (default 4h)")
     s.set_defaults(handler=cmd_transcribe)
+
+    # narration: a script in, a voice track + subtitles (+ slideshow) out
+    s = sub.add_parser("narrate",
+                       help="Narrate a script: voice track, subtitles and, "
+                            "with slide images, a slideshow video")
+    s.add_argument("script",
+                   help="Markdown or JSON script file (one '## Heading' per "
+                        "slide; '![](pic.png)' names its picture)")
+    s.add_argument("--images", default="",
+                   help="Folder holding the slide pictures the script names")
+    s.add_argument("--lang", default="en",
+                   help="Language the script is written in (default en)")
+    s.add_argument("--voice", default="auto",
+                   help="Voice preset id (see `voices`); auto = the default "
+                        "narrator")
+    s.add_argument("--voice-style", default="",
+                   help="Design a voice from a description instead, e.g. "
+                        "'calm mature female narrator, unhurried'")
+    s.add_argument("--tts-speed", default="balanced",
+                   choices=["fast", "balanced", "quality"])
+    s.add_argument("--title", default="", help="Job title (default: the "
+                                               "script's own)")
+    s.add_argument("--timing", default="",
+                   help="Pauses in seconds, key=value pairs: lead_in, "
+                        "sentence_gap, paragraph_gap, slide_lead, slide_gap, "
+                        "tail, silent_slide_hold")
+    s.add_argument("--no-video", action="store_true",
+                   help="Voice track and subtitles only, even with pictures")
+    s.add_argument("--burn-subs", action="store_true",
+                   help="Paint subtitles into the video (default: a soft "
+                        "subtitle track)")
+    s.add_argument("-o", "--output", default="",
+                   help="With --wait: download the results into this folder")
+    s.add_argument("--wait", action="store_true")
+    s.add_argument("--wait-timeout", type=float, default=4 * 3600.0,
+                   help="Seconds before --wait gives up (default 4h)")
+    s.set_defaults(handler=cmd_narrate)
 
     s = sub.add_parser("transcript",
                        help="Export a job's speaker-attributed transcript")

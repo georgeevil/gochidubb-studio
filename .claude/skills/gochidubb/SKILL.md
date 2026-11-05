@@ -76,6 +76,27 @@ missing dependencies before submitting work. Common failures:
 | Voice profiles | `gochidubb_list_voiceprints` / `_enroll_voiceprint` / `_update_voiceprint` / `_delete_voiceprint` | `gochidubb voiceprints list\|enroll\|edit\|rm` |
 | Suggest who each speaker is | `gochidubb_identify_speakers` | `gochidubb speakers identify <jid> --group G` |
 | Record a human's answer | `gochidubb_confirm_speaker` | `gochidubb speakers confirm <jid> SPEAKER_03 --profile ID\|--name N\|--public` |
+| Narrate a script (no source video) | `gochidubb_narrate` | `gochidubb narrate script.md [--images ./slides --voice-style "…" --burn-subs --no-video] --wait -o ./out` |
+
+## Narrating a script
+
+Use `gochidubb_narrate` when there is no video to dub: the user has a text
+(a briefing, an explainer, slide notes) and wants it voiced, with subtitles
+and optionally a slideshow. The script is Markdown — `# Title`, one
+`## Heading` per slide, an optional `![](cover.png)` line naming that slide's
+picture, then the words to say; `<!-- pause: 2 -->` on its own line sets the
+pause after a slide and any other HTML comment is a note that is not spoken.
+It is spoken in the language it is written in (`target_lang`); nothing is
+translated.
+
+Pass `images_dir` (MCP) or `--images` (CLI) with the folder holding the
+pictures the script names to get `dubbed_video.mp4`; leave it out for
+`narration.wav` + `subtitles.srt`/`.vtt` only. Subtitles are a soft track by
+default — use `burn_subs` when the video is going to a chat app that ignores
+subtitle tracks. A finished job can report `narration.failed_lines`: those
+lines have no audio (a silent gap was kept for each), so tell the user rather
+than calling it done. A library voice is a recording of a real person and is
+subject to the clone-consent policy; a designed voice (`voice_style`) is not.
 
 ## Transcripts and speaker names
 

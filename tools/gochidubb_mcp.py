@@ -39,7 +39,7 @@ except ImportError:
           file=sys.stderr)
     sys.exit(1)
 
-from gochidubb_client import GoChiDUBBClient, DEFAULT_URL
+from gochidubb_client import GoChiDUBBClient, DEFAULT_URL, NARRATION_FILES
 
 
 mcp = FastMCP(
@@ -224,6 +224,79 @@ async def gochidubb_transcribe(
         final = await c.wait_for_job(job_id, timeout=wait_timeout)
         res["status"] = final.get("status")
         res["error"] = final.get("error")
+    return res
+
+
+@mcp.tool()
+async def gochidubb_narrate(
+    script: str,
+    images_dir: str = "",
+    target_lang: str = "en",
+    voice_preset: str = "auto",
+    voice_style: str = "",
+    tts_speed: str = "balanced",
+    title: str = "",
+    render_video: bool = True,
+    burn_subs: bool = False,
+    timing: Optional[dict] = None,
+    prompt: str = "",
+    wait: bool = False,
+    wait_timeout: float = 4 * 3600.0,
+) -> dict:
+    """Narrate a written script: a voice track, subtitles and — with slide
+    pictures — a slideshow video. No source video is involved.
+
+    The voice sets the clock: every line is synthesized first and each slide
+    is held for as long as its passage takes to say, so the subtitles and
+    the slide changes are timed from the audio, not guessed.
+
+    Args:
+        script: absolute path to a Markdown or JSON script, or the script
+            text itself. Markdown: `# Title`, one `## Heading` per slide, an
+            optional `![](cover.png)` line naming that slide's picture, then
+            the words to say. `<!-- pause: 2 -->` sets the pause after a
+            slide; any other HTML comment is a note and is not spoken.
+        images_dir: folder holding the pictures the script names. Leave
+            empty for the voice track and subtitles alone.
+        target_lang: the language the script is written in.
+        voice_preset: 'auto' (the default narrator), a preset id from
+            gochidubb_voices, or a library voice.
+        voice_style: design a voice from a description instead, e.g.
+            'calm mature female narrator, unhurried'.
+        tts_speed: 'fast' | 'balanced' | 'quality'.
+        render_video: False = no video even when pictures are given.
+        burn_subs: paint the subtitles into the picture. Default is a soft
+            subtitle track the viewer can turn off.
+        timing: pauses in seconds — lead_in, sentence_gap, paragraph_gap,
+            slide_lead, slide_gap, tail, silent_slide_hold.
+        prompt: the user's request, quoted on the activity feed (optional).
+        wait: block until finished.
+
+    Returns {job_id, slides, lines, estimated_duration, video}. With
+    wait=True also status, error, duration, failed_lines (lines that have no
+    audio — say so, do not present the result as clean) and `files`: URLs
+    of narration.wav, subtitles.srt, subtitles.vtt, narration_timeline.json
+    and, when a video was rendered, dubbed_video.mp4.
+    """
+    c = await _get_client()
+    res = await c.submit_narration(
+        script, images=images_dir or None, target_lang=target_lang,
+        voice_preset=voice_preset, voice_style=voice_style,
+        tts_speed=tts_speed, title=title, render_video=render_video,
+        burn_subs=burn_subs, timing=timing, prompt=prompt,
+    )
+    job_id = res.get("job_id")
+    if wait and job_id:
+        final = await c.wait_for_job(job_id, timeout=wait_timeout)
+        res["status"] = final.get("status")
+        res["error"] = final.get("error")
+        if final.get("status") == "complete":
+            res["duration"] = final.get("duration")
+            res["failed_lines"] = (final.get("narration") or {}).get(
+                "failed_lines") or []
+            res["files"] = {
+                name: c.output_url(job_id, name) for name in NARRATION_FILES
+                if name != "dubbed_video.mp4" or final.get("output_url")}
     return res
 
 

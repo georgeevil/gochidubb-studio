@@ -8,6 +8,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A script can be narrated: no source video, just words in and a voiced
+  slideshow out.** Everything here has always started from a recording. A
+  briefing or an explainer starts from a text, and the only way to voice one
+  was to record it first so there was something to dub. `POST /api/narrate`
+  (and `narrate` on the CLI, `gochidubb_narrate` over MCP) takes a Markdown or
+  JSON script — one `## Heading` per slide, `![](cover.png)` for its picture,
+  `<!-- pause: 2 -->` for the pause after it — and writes `narration.wav`,
+  `subtitles.srt` / `.vtt`, `narration_timeline.json` and, when slide pictures
+  are uploaded, a 1080p slideshow as `dubbed_video.mp4`. That last name is the
+  dub's on purpose: publish, download and export all read that path, so a
+  narrated video goes out through the same reviewed publish workflow.
+
+  The voice sets the clock. A dub fits speech into slots the source video
+  dictates; a narration has no slots, so every line is synthesized first, each
+  clip is measured, and only then are lines, slides and subtitle cues placed.
+  A slide is on screen for as long as its passage takes to say, plus pauses
+  that are defaults, not constants (`timing`). A line that fails synthesis is
+  retried once and, if it still has no audio, keeps a silent slot sized from
+  its text at reading speed and is reported in `narration.failed_lines` — the
+  slide stays up long enough to read the subtitle, and the lines after it are
+  not pulled forward onto the wrong picture.
+
+  The narrator is one person for the whole piece, for the reason a dub's
+  designed voice is: VoxCPM draws a new speaker on every call, so the style
+  is materialized ONCE into a clip and every line is cloned from it. If that
+  clip cannot be made, the fallback is the dub's too: the style goes on
+  `tts_text` line by line, never on the text the subtitles are written from.
+  `auto` means "the source voice" everywhere else and has nothing
+  to mean here, so it resolves to a designed narrator (`male_deep`); a
+  misspelled voice is a 400, not a different narrator; and narrating with a
+  library voice — a recording of a real person — goes through the same
+  clone-consent policy as casting it.
+
+  Two things were only found by encoding a real file and counting its frames.
+  With the frame rate set by `-r`, a two-slide, 18.3 s narration came out with
+  220 video frames: 7.3 s of picture under 18.3 s of sound, in a container
+  that still reported 18.3 s. The encoder repeats a still only once the next
+  one arrives, and `-t` had already dropped the closing one. The `fps` filter
+  runs before that cut and writes all 550. The same change fixes burned-in
+  subtitles, which can only be painted onto frames that exist when a cue is
+  due; with one frame per slide there was nothing to paint the second cue on.
+  The unit suite is ffmpeg-free by design and could not have seen either, so
+  the argv tests now pin the filter and its position, with the measurement in
+  the docstring.
+
+  The script parser treats a script as untrusted input even on a local box:
+  only an image's file NAME survives, matched against the uploaded files, so
+  a path in a script cannot point at a file elsewhere on the machine; slides,
+  characters and image size are capped; HTML comments are notes and are never
+  spoken, whether on their own line, after the words, or across several lines.
+
 - **History can act on many jobs at once without losing its place.** The
   publish-inbox filter used to live inside the scrolling list, so toggling it
   scrolled you away from what you were looking at; it now sits in the pane
