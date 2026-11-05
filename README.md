@@ -135,7 +135,7 @@ Or paste into `~/.claude.json`:
 }
 ```
 
-The MCP server exposes **40 tools**: dub / compare / showcase / redub, transcribe-only + transcript export, speaker identification (voiceprints, identify, confirm), job status and listing, voice casting (get / set / preview), continue / cancel / rescue / delete, per-stage retry, review flags, translation edits, glossary terms, quality report, artifact audit, publish workflow (stage / approve / cancel / inbox), trending scout, duplicate check, and system / languages / models / voices.
+The MCP server exposes **41 tools**: dub / compare / showcase / redub, transcribe-only + transcript export, narration (a script in, a voice track + subtitles + slideshow out), speaker identification (voiceprints, identify, confirm), job status and listing, voice casting (get / set / preview), continue / cancel / rescue / delete, per-stage retry, review flags, translation edits, glossary terms, quality report, artifact audit, publish workflow (stage / approve / cancel / inbox), trending scout, duplicate check, and system / languages / models / voices.
 
 The repo ships a Claude Code skill at [`.claude/skills/gochidubb/SKILL.md`](.claude/skills/gochidubb/SKILL.md). Copy it to `~/.claude/skills/` and Claude knows when and how to drive the pipeline.
 
@@ -167,7 +167,7 @@ python tools/gochidubb_cli.py continue <job_id>
 python tools/gochidubb_cli.py rescue <job_id> ./video.mp4
 ```
 
-The full subcommand list: `dub, transcribe, transcript, voiceprints, speakers, compare, showcase, redub, status, jobs, wait, showcase-status, showcase-rebuild, cast, continue, retry-stage, flags, edit-translations, glossary-term, quality, audit, publish, approve, publish-cancel, publish-inbox, scout, scout-dub, check-dup, cancel, rescue, delete, system, languages, models, voices`.
+The full subcommand list: `dub, transcribe, narrate, transcript, voiceprints, speakers, compare, showcase, redub, status, jobs, wait, showcase-status, showcase-rebuild, cast, continue, retry-stage, flags, edit-translations, glossary-term, quality, audit, publish, approve, publish-cancel, publish-inbox, scout, scout-dub, check-dup, cancel, rescue, delete, system, languages, models, voices`.
 
 ### Transcribe-only + speaker identification
 
@@ -200,6 +200,59 @@ match stays a suggestion until confirmed. Voiceprints use pyannote's speaker
 embedding model (no extra install beyond diarization) and live in
 `gochidubb.db`; they are biometric data about real people, so enroll only
 voices whose owners would expect it.
+
+### Narration — a script in, a narrated slideshow out
+
+When there is no source video at all (a briefing, an explainer, a slide deck
+that needs a voice), `narrate` takes a written script and produces a voice
+track, subtitles timed to that voice and, if the script names slide pictures,
+a slideshow MP4. Nothing is downloaded, transcribed or translated: the script
+is spoken in the language it is written in.
+
+```markdown
+# Where the case stands
+
+## Cover
+![](cover.png)
+Seven years ago the court gave the agency twelve months.
+This is what happened next.
+
+## Timeline
+![](timeline.png)
+<!-- pause: 2 -->
+The deadline passed in February 2021. <!-- notes like this are not spoken -->
+```
+
+```bash
+# Voice track + subtitles + slideshow, downloaded when done
+python tools/gochidubb_cli.py narrate briefing.md --images ./slides \
+  --voice-style "calm mature female narrator, unhurried" --wait -o ./out
+
+# Voice and subtitles only; or subtitles painted into the picture
+python tools/gochidubb_cli.py narrate briefing.md --no-video --wait
+python tools/gochidubb_cli.py narrate briefing.md --images ./slides --burn-subs --wait
+```
+
+The voice sets the clock. Every line is synthesized first, each clip is
+measured, and only then are the slides and subtitles placed, so a slide stays
+up for exactly as long as its passage takes to say. Pauses are tunable
+(`--timing slide_gap=1.5,tail=2`). The narrator is one voice for the whole
+piece: a designed voice is drawn once and cloned from, the same way a dub
+keeps a designed voice from drifting (default: the `male_deep` preset; any
+preset or library voice from `voices` works, and a library voice is subject to
+the same consent policy as casting it).
+
+Outputs under `outputs/<job_id>/`: `narration.wav`, `subtitles.srt`,
+`subtitles.vtt`, `narration_timeline.json` (where every line and slide sits)
+and, with pictures, `dubbed_video.mp4` (1080p H.264/AAC with a soft subtitle
+track; pictures are letterboxed, never stretched). The video keeps the dub's
+file name on purpose, so it goes out through the same reviewed publish
+workflow. HTTP: `POST /api/narrate` (form fields `script`, `target_lang`,
+`voice_preset`, `voice_style`, `tts_speed`, `title`, `render_video`,
+`burn_subs`, `timing`; slide pictures as `images` uploads, matched to the
+script by file name). MCP: `gochidubb_narrate`. A script in JSON
+(`{"title": …, "slides": [{"title", "image", "narration", "pause_after"}]}`)
+is accepted wherever Markdown is.
 
 Drive a remote box: `set GOCHIDUBB_URL=http://192.168.0.10:8910`
 

@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 import urllib.parse
 from pathlib import Path
@@ -29,6 +30,15 @@ _ACTIVE = {
     "transcribing", "translating", "synthesizing", "assembling", "merging",
 }
 _TERMINAL = {"complete", "error", "cancelled"}
+
+# A picture's file name wherever a narration script mentions one —
+# `![](slides/cover.png)` in Markdown, `"image": "cover.png"` in JSON.
+_IMAGE_NAME_RE = re.compile(r"[^\s\"'()<>|]+\.(?:png|jpe?g|webp)", re.IGNORECASE)
+
+# What a finished narration leaves under outputs/<job_id>/, in the order a
+# person would open them. The video exists only when pictures were uploaded.
+NARRATION_FILES = ("narration.wav", "subtitles.srt", "subtitles.vtt",
+                   "narration_timeline.json", "dubbed_video.mp4")
 
 
 class GoChiDUBBError(RuntimeError):
@@ -251,6 +261,116 @@ class GoChiDUBBClient:
                 "GET", f"/api/dub/{job_id}/transcript", params=params)
         return await self._request_text(
             "GET", f"/api/dub/{job_id}/transcript", params=params)
+
+    # ── narration (script → voice track + subtitles + slideshow) ─────
+    @staticmethod
+    def _script_text(script: str) -> str:
+        """`script` is a path to a .md/.json file or the script itself."""
+        s = str(script or "")
+        if "\n" not in s and len(s) < 1024:
+            p = Path(s).expanduser()
+            try:
+                if p.is_file():
+                    return p.read_text(encoding="utf-8")
+            except OSError:
+                pass
+        return s
+
+    @staticmethod
+    def narration_image_paths(script_text: str, images=None) -> list[Path]:
+        """Resolve `images` to the files worth uploading.
+
+        `images` is a list of file paths or one directory. From a directory
+        only the pictures the script actually names are taken — a slides
+        folder usually holds more than the deck uses, and every extra file
+        is an upload the server would ignore.
+        """
+        if not images:
+            return []
+        if isinstance(images, (str, Path)):
+            folder = Path(images).expanduser()
+            if not folder.is_dir():
+                raise GoChiDUBBError(f"Images folder not found: {folder}")
+            named = {n.strip().replace("\\", "/").rsplit("/", 1)[-1]
+                     for n in _IMAGE_NAME_RE.findall(script_text)}
+            return sorted(p for p in folder.iterdir()
+                          if p.is_file() and p.name in named)
+        out = []
+        for item in images:
+            p = Path(item).expanduser()
+            if not p.is_file():
+                raise GoChiDUBBError(f"Slide image not found: {p}")
+            out.append(p)
+        return out
+
+    async def submit_narration(
+        self,
+        script: str,
+        *,
+        images=None,
+        target_lang: str = "en",
+        voice_preset: str = "auto",
+        voice_style: str = "",
+        tts_speed: str = "balanced",
+        title: str = "",
+        render_video: bool = True,
+        burn_subs: bool = False,
+        timing: Optional[dict] = None,
+        prompt: Optional[str] = None,
+    ) -> dict:
+        """Submit a narration: a script in, a voice track and subtitles out.
+
+        script: path to a Markdown/JSON script, or the script text. Markdown:
+            `# Title`, one `## Heading` per slide, an optional `![](pic.png)`
+            line naming the slide's picture, then the words to say.
+        images: list of picture paths, or the folder holding them. With
+            pictures the job also renders a slideshow video.
+        voice_preset: 'auto' (the default narrator), a preset id from
+            list_voices(), or a library voice; voice_style designs one from
+            a description instead.
+        timing: pauses in seconds, e.g. {"slide_gap": 1.5, "tail": 2}.
+
+        Returns {job_id, slides, lines, estimated_duration, video}. When the
+        job completes it carries narration_url, srt_url, vtt_url,
+        timeline_url and — with pictures — output_url.
+        """
+        text = self._script_text(script)
+        form = {
+            "script": text,
+            "target_lang": target_lang,
+            "voice_preset": voice_preset,
+            "voice_style": voice_style,
+            "tts_speed": tts_speed,
+            "title": title,
+            "render_video": str(bool(render_video)).lower(),
+            "burn_subs": str(bool(burn_subs)).lower(),
+        }
+        if timing:
+            form["timing"] = json.dumps(timing)
+        paths = self.narration_image_paths(text, images)
+        handles = [open(p, "rb") for p in paths]
+        try:
+            files = [("images", (p.name, fh, "application/octet-stream"))
+                     for p, fh in zip(paths, handles)]
+            return await self._request(
+                "POST", "/api/narrate", data=form, files=files or None,
+                headers=self._prompt_headers(prompt))
+        finally:
+            for fh in handles:
+                fh.close()
+
+    async def download_output(self, job_id: str, filename: str,
+                              dest: str) -> str:
+        """Save one of a job's output files to `dest`. Returns the path."""
+        r = await self._http.get(self.output_url(job_id, filename))
+        if r.status_code >= 400:
+            raise GoChiDUBBError(
+                f"{filename} is not available for job {job_id} "
+                f"(HTTP {r.status_code})")
+        out = Path(dest).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(r.content)
+        return str(out)
 
     # ── speaker identification (voice profiles) ──────────────────────
     async def list_voiceprints(self, group: Optional[str] = None) -> list[dict]:

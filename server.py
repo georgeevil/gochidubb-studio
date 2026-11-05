@@ -206,6 +206,7 @@ from pipeline.metrics import (
     stage_timer, load_metrics, gpu_backend, gpu_snapshot,
 )
 from pipeline import diagnostics as diag
+from pipeline import narration as narr
 from pipeline.notices import (
     mask_secret, merge_notices, worst_severity, notice as pnotice,
 )
@@ -780,12 +781,18 @@ async def _job_queue_worker():
                 # can't collide with another job on the GPU, and so they
                 # inherit the cancel / post-success handling below.
                 retry = pipeline_args.get("__stage_retry__")
+                narrate = pipeline_args.get("__narrate__")
                 if retry:
                     await run_pipeline_stages(
                         job_id, retry["ctx"],
                         start_stage=retry["start_stage"],
                         stop_after=retry.get("stop_after", ""),
                     )
+                elif narrate is not None:
+                    # A narration has no source video and so no stages to
+                    # walk — but it synthesizes on the same GPU, so it waits
+                    # its turn in the same queue as every dub.
+                    await run_narration(job_id, narrate)
                 else:
                     await run_pipeline(job_id, **pipeline_args)
             else:
@@ -1889,7 +1896,7 @@ _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 # Route families that submit, mutate or re-run jobs — the dub:write surface.
 _DUB_WRITE_PREFIXES = ("/api/dub", "/api/showcase", "/api/quick_test",
-                       "/api/job/", "/api/scout/dub")
+                       "/api/job/", "/api/scout/dub", "/api/narrate")
 # Read routes over jobs and their artifacts — the jobs:read surface.
 _JOBS_READ_PREFIXES = ("/api/jobs", "/api/job/", "/api/dub", "/api/showcase")
 
@@ -3642,22 +3649,17 @@ def _evaluate_gate(stage_id: str, ctx: dict, job: dict,
     return None
 
 
-async def run_pipeline_stages(
-    job_id: str,
-    ctx: dict,
-    start_stage: str = "download",
-    stop_after: str = "",
-) -> None:
-    """Run the pipeline from `start_stage` through to the end (or `stop_after`).
+def _job_updater(job_id: str):
+    """The `update(**fields)` a runner hands to its stages.
 
-    Each stage is timed and resource-sampled, then its output context is
-    checkpointed. A failure marks the job as errored but leaves every prior
-    checkpoint intact, so the failed stage — and only the failed stage — can
-    be retried via /api/dub/{id}/retry_stage/{stage}.
+    One definition for every runner (the stage walker and the narration
+    runner), because the three things it does are the contract the rest of
+    the server relies on: a cancel request is honoured at the next update, a
+    change is persisted before anything else reads the job, and a status
+    transition — not a progress tick — reaches the activity feed and the
+    webhooks exactly once.
     """
     job = jobs[job_id]
-    work = OUTPUT_DIR / job_id
-    work.mkdir(exist_ok=True)
 
     def update(**kwargs):
         # Check the cancel flag at every stage transition. Any pipeline
@@ -3687,6 +3689,28 @@ async def run_pipeline_stages(
                 _fire_webhooks(new_status, job)
             except Exception:
                 log.debug("[webhooks] could not schedule delivery", exc_info=True)
+
+    return update
+
+
+async def run_pipeline_stages(
+    job_id: str,
+    ctx: dict,
+    start_stage: str = "download",
+    stop_after: str = "",
+) -> None:
+    """Run the pipeline from `start_stage` through to the end (or `stop_after`).
+
+    Each stage is timed and resource-sampled, then its output context is
+    checkpointed. A failure marks the job as errored but leaves every prior
+    checkpoint intact, so the failed stage — and only the failed stage — can
+    be retried via /api/dub/{id}/retry_stage/{stage}.
+    """
+    job = jobs[job_id]
+    work = OUTPUT_DIR / job_id
+    work.mkdir(exist_ok=True)
+
+    update = _job_updater(job_id)
 
     _resolve_voice_into_ctx(job, ctx)
     start_i = max(_stage_index(start_stage), 0)
@@ -3968,6 +3992,479 @@ async def run_pipeline(
     job["stop_after"] = final_stop = _earlier_stage(stop_after, mode_stop)
     await run_pipeline_stages(
         job_id, ctx, start_stage=stage_ids[0], stop_after=final_stop)
+
+
+# ─────────────────────────────────────────────────────────────
+# Narration: a written script in, a voice track and subtitles out
+# ─────────────────────────────────────────────────────────────
+# Every other job here starts from a video and inherits its timeline. A
+# narration starts from text, so there is nothing to download, transcribe or
+# translate, and nothing to fit speech INTO: the clips are synthesized first
+# and the timeline is built from how long they turned out to be (see
+# pipeline/narration.py). That is why it has its own runner instead of being
+# a fourth entry in JOB_MODES — the stage walker's checkpoints, review gates
+# and retry routes all describe a source video that does not exist.
+#
+# What it shares with a dub is the part that matters for the GPU: it rides
+# the same queue, uses the same engine and the same voices, honours Cancel
+# through the same update(), and lands on the same terminal statuses.
+#
+# Outputs, all under outputs/<job_id>/:
+#   narration.wav             the voice track (always)
+#   subtitles.srt / .vtt      cues timed to the voice (always)
+#   narration_timeline.json   where every line and slide sits (always)
+#   dubbed_video.mp4          the slideshow, when slide images were uploaded.
+#                             The name is the dub's on purpose: publish,
+#                             download and export all read that path, so a
+#                             narrated video can go out through the same
+#                             reviewed publish workflow (same reason
+#                             _finalize_reupload uses it).
+NARRATE_MODE = "narrate"
+
+# "auto" means "the voice in the source video" everywhere else. A script has
+# no source voice, so here it resolves to a designed narrator.
+_NARRATION_DEFAULT_PRESET = "male_deep"
+_NARRATION_TTS_SPEEDS = ("fast", "balanced", "quality")
+_NARRATION_MAX_IMAGE_BYTES = 25 * 1024 * 1024
+
+
+def _narration_voice(voice_preset: str, voice_style: str, job_id: str):
+    """(preset, style, seed, reference_file) for a narration.
+
+    The dub's own resolve_voice_config, with "auto" re-pointed (see
+    _NARRATION_DEFAULT_PRESET). Its precedence is unchanged: a free-text
+    style beats a built-in preset's style, and a library voice beats both —
+    it is a recording, not a description.
+    """
+    preset = (voice_preset or "auto").strip() or "auto"
+    if preset == "auto" and not (voice_style or "").strip():
+        preset = _NARRATION_DEFAULT_PRESET
+    style, seed, ref_file = resolve_voice_config(preset, voice_style, job_id)
+    return preset, style, seed, ref_file
+
+
+async def _synthesize_narration(tts_used, todo: list, tts_dir: str, *,
+                                speaker_refs: dict, voice_seed, tts_speed: str,
+                                target_lang: str, progress) -> list:
+    """One synthesis pass, through whichever call the engine exposes.
+
+    The same three-way split as _stage_tts: VoxCPM's blocking subprocess call
+    goes off the event loop, edge-tts is natively async, and any other
+    cloning engine takes the base synthesize_segments signature.
+    """
+    if isinstance(tts_used, VoxCPMSynthesizer):
+        return await _blocking(
+            tts_used.synthesize_segments, todo, tts_dir,
+            speaker_refs=speaker_refs,
+            speaker_transcripts={sp: "" for sp in speaker_refs},
+            progress_callback=progress, voice_seed=voice_seed,
+            tts_speed=tts_speed, is_cross_lingual=False,
+            target_lang=target_lang,
+        )
+    if hasattr(tts_used, "synthesize_segments_async"):
+        return await tts_used.synthesize_segments_async(
+            todo, tts_dir, target_lang, progress_callback=progress)
+    return await _blocking(
+        tts_used.synthesize_segments, todo, tts_dir,
+        speaker_refs=speaker_refs, progress_callback=progress,
+        voice_seed=voice_seed, tts_speed=tts_speed, target_lang=target_lang,
+    )
+
+
+def _has_clip(seg: dict) -> bool:
+    return bool(seg.get("audio_path")) and os.path.exists(seg["audio_path"])
+
+
+async def run_narration(job_id: str, args: dict) -> None:
+    """Synthesize a script, time it, and write the track, subtitles and video.
+
+    `args` is what POST /api/narrate queued: {script, target_lang,
+    voice_preset, voice_style, tts_speed, timing, render_video, burn_subs}.
+    `script` is the parsed document — it was validated at submit, so a
+    failure in here is a synthesis or encoding failure, not a typo.
+    """
+    from pipeline import subtitles as _subs
+    job = jobs[job_id]
+    work = OUTPUT_DIR / job_id
+    work.mkdir(exist_ok=True)
+    update = _job_updater(job_id)
+    job["mode"] = NARRATE_MODE
+    lang = (args.get("target_lang") or "en").strip().lower()
+    tts_speed = args.get("tts_speed") or "balanced"
+    run_t0 = time.time()
+
+    try:
+        job["_stage_log_from"] = logbuf.current_seq()
+        update(status="synthesizing", progress=3, stage_id="tts",
+               step_detail="Preparing the narrator's voice...")
+        script = narr.parse_script(args["script"])
+        segments = narr.build_segments(script)
+        tts_dir = str(work / "tts_segments")
+
+        with stage_timer(work, job_id, "narrate") as perf:
+            tts_used = _tts_engine_for_lang(get_tts_engine(), lang)
+            is_vox = isinstance(tts_used, VoxCPMSynthesizer)
+            preset, eff_style, voice_seed, ref_file = _narration_voice(
+                args.get("voice_preset", "auto"), args.get("voice_style", ""),
+                job_id)
+
+            # ── Voice ────────────────────────────────────────────────
+            # One reference, cloned from for every line — the only way a
+            # designed voice stays one person (see _materialize_designed_voice).
+            speaker_refs: dict = {}
+            style_prefix = ""
+            if ref_file and os.path.exists(ref_file):
+                if isinstance(tts_used, EdgeTTSFallback):
+                    voice_mode = "engine_default"
+                    log.warning(
+                        f"[narrate] {type(tts_used).__name__} has fixed voices "
+                        f"and cannot clone — the '{preset}' voice is ignored")
+                else:
+                    speaker_refs = {narr.NARRATOR: ref_file}
+                    voice_mode = "file_ref"
+            elif is_vox and eff_style:
+                designed = await _blocking(
+                    _materialize_designed_voice, tts_used, eff_style,
+                    voice_seed, lang)
+                if designed:
+                    speaker_refs = {narr.NARRATOR: designed}
+                    voice_mode = "designed_ref"
+                    perf["designed_voice"] = os.path.basename(designed)
+                else:
+                    # Same fallback as a dub: a voice that wobbles between
+                    # lines is still a narration, and no voice is not.
+                    style_prefix = eff_style.strip().strip("()")
+                    voice_mode = "voice_design"
+                    log.warning("[narrate] Could not materialise the designed "
+                                "voice; designing per line instead")
+            else:
+                voice_mode = "engine_default"
+
+            if is_vox:
+                # Glossary `say` respellings apply to a script exactly as
+                # they do to a translation ("Sala IV" → "Sala Cuarta").
+                _compose_tts_texts(segments, style_prefix, _say_map_for(lang))
+
+            update(
+                step_detail=f"Generating speech ({len(segments)} lines, "
+                            f"voice={preset})...",
+                voice_mode=_VOICE_MODE_LABEL.get(voice_mode, "preset"),
+                voice_preset=preset, voice_seed=voice_seed,
+            )
+
+            def synth_progress(done, total):
+                pct = 5 + int((done / max(total, 1)) * 73)
+                update(progress=min(pct, 78),
+                       step_detail=f"Synthesizing: {done}/{total}")
+
+            synth = dict(speaker_refs=speaker_refs, voice_seed=voice_seed,
+                         tts_speed=tts_speed, target_lang=lang)
+            t0 = time.time()
+            segments = await _synthesize_narration(
+                tts_used, segments, tts_dir, progress=synth_progress, **synth)
+
+            # One more pass over whatever failed. A line missing from a dub
+            # is a gap under moving pictures; a line missing from a narration
+            # is a slide sitting in silence, so it is worth the retry before
+            # it is worth reporting.
+            failed = [s for s in segments if not _has_clip(s)]
+            if failed and len(failed) < len(segments):
+                log.info(f"[narrate] Retrying {len(failed)} failed line(s)")
+                update(step_detail=f"Retrying {len(failed)} failed line(s)...")
+                redo = [dict(s, audio_path=None) for s in failed]
+                redo = await _synthesize_narration(
+                    tts_used, redo, str(work / "tts_segments_retry"),
+                    progress=None, **synth)
+                by_idx = {s["idx"]: s for s in segments}
+                for s in redo:
+                    if _has_clip(s):
+                        by_idx[s["idx"]]["audio_path"] = s["audio_path"]
+
+            synth_ok = sum(1 for s in segments if _has_clip(s))
+            took = time.time() - t0
+            perf.update(
+                engine=type(tts_used).__name__, mode=voice_mode,
+                seed=voice_seed, lines=len(segments), synthesized=synth_ok,
+                failed=len(segments) - synth_ok,
+                sec_per_line=round(took / max(synth_ok, 1), 2),
+            )
+            if synth_ok == 0:
+                detail = ""
+                if hasattr(tts_used, "last_failure_detail"):
+                    detail = tts_used.last_failure_detail()
+                raise RuntimeError(
+                    f"All {len(segments)} narration lines failed"
+                    + (f": {detail}" if detail else " - check model/GPU"))
+
+            # ── Timeline, track, subtitles ───────────────────────────
+            update(status="assembling", progress=80, stage_id="assemble",
+                   step_detail="Timing the narration...")
+            durations = await _blocking(narr.measure_durations, segments)
+            timeline = narr.build_timeline(
+                script, segments, durations, args.get("timing"))
+            sample_rate = getattr(tts_used, "sample_rate", 48000)
+            wav_path = work / "narration.wav"
+            mix = await _blocking(
+                narr.mix_narration, timeline["segments"], str(wav_path),
+                duration=timeline["duration"], sample_rate=sample_rate)
+
+            limits = _subtitle_limits()
+            cues = narr.subtitle_cues(timeline["segments"], limits)
+            srt_path = work / "subtitles.srt"
+            _subs.write_srt_cues(cues, str(srt_path))
+            _subs.write_vtt_cues(cues, str(work / "subtitles.vtt"))
+
+            failed_lines = [s["idx"] for s in timeline["segments"]
+                            if s.get("missing_audio")]
+            doc = {
+                "job_id": job_id, "title": script.get("title", ""),
+                "language": lang, "duration": timeline["duration"],
+                "sample_rate": sample_rate, "timing": timeline["timing"],
+                "slides": timeline["slides"],
+                # Paths stay out: the document is meant to be carried to
+                # another machine along with the WAV and the slides.
+                "segments": [
+                    {k: s[k] for k in ("idx", "slide", "slide_index", "text",
+                                       "start", "end", "missing_audio")
+                     if k in s}
+                    for s in timeline["segments"]],
+                "cues": len(cues),
+                "subtitle_violations": len(narr.cue_violations(cues, limits)),
+                "failed_lines": failed_lines,
+            }
+            (work / "narration_timeline.json").write_text(
+                json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
+            perf.update(media_sec=timeline["duration"], cues=len(cues),
+                        mix=mix)
+
+            # ── Slideshow ────────────────────────────────────────────
+            stamp = int(time.time())
+            fields = {}
+            has_images = any(s.get("image") for s in timeline["slides"])
+            if args.get("render_video", True) and has_images:
+                update(status="merging", progress=88, stage_id="merge",
+                       step_detail="Rendering the slideshow...")
+                slides_dir = work / "slides"
+                spans = [(str(slides_dir / image), dur) for image, dur
+                         in narr.slideshow_spans(timeline["slides"])]
+                await _blocking(
+                    narr.render_slideshow, spans, str(wav_path),
+                    str(work / "dubbed_video.mp4"),
+                    duration=timeline["duration"], srt_path=str(srt_path),
+                    burn_subs=bool(args.get("burn_subs")))
+                fields["output_url"] = (
+                    f"/outputs/{job_id}/dubbed_video.mp4?v={stamp}")
+                perf["video"] = True
+
+        summary = dict(job.get("narration") or {})
+        summary.update(lines=len(segments), synthesized=synth_ok,
+                       failed_lines=failed_lines, cues=len(cues))
+        done = (f"Narration ready — {len(failed_lines)} line(s) have no audio"
+                if failed_lines else "Narration ready")
+        update(
+            status="complete", progress=100, stage_id=None,
+            completed_at=time.time(), duration=timeline["duration"],
+            step_detail=done, narration=summary,
+            narration_url=f"/outputs/{job_id}/narration.wav?v={stamp}",
+            srt_url=f"/outputs/{job_id}/subtitles.srt",
+            vtt_url=f"/outputs/{job_id}/subtitles.vtt",
+            timeline_url=f"/outputs/{job_id}/narration_timeline.json",
+            **fields,
+        )
+        log.info(f"[perf] ═ narration job={job_id} finished in "
+                 f"{time.time() - run_t0:.1f}s ({timeline['duration']:.0f}s "
+                 f"of audio, {synth_ok}/{len(segments)} lines)")
+    except JobCancelled:
+        log.info(f"Narration cancelled for {job_id}")
+        raise
+    except asyncio.CancelledError:
+        job["failed_stage"] = job.get("stage_id", "")
+        update(
+            status="interrupted",
+            error="Interrupted by server shutdown — submit the script again",
+            step_detail="Interrupted by server shutdown",
+        )
+        raise
+    except Exception as e:
+        job["failed_stage"] = job.get("stage_id", "")
+        # Log before recording, as run_pipeline_stages does: the traceback
+        # has to land inside the failure's log window.
+        log.exception(f"Narration failed at '{job.get('stage_id')}': {e}")
+        _set_job_error(job, e)
+        update(status="error")
+
+
+@app.post("/api/narrate")
+async def start_narration(
+    script: str = Form(...),          # Markdown, or a JSON {title, slides}
+    target_lang: str = Form("en"),    # the language the script is written in
+    voice_preset: str = Form("auto"),  # "auto" = the default narrator
+    voice_style: str = Form(""),      # free-text voice design; beats a preset
+    tts_speed: str = Form("balanced"),
+    title: str = Form(""),
+    render_video: bool = Form(True),  # only when slide images are uploaded
+    burn_subs: bool = Form(False),    # paint subtitles in (default: soft track)
+    timing: str = Form(""),           # JSON overrides of narration.DEFAULT_TIMING
+    images: list[UploadFile] = File(default=[]),
+):
+    """Queue a narration: a script in, a voice track and subtitles out.
+
+    Slides name their picture by file name (`![](cover.png)` in Markdown,
+    `"image": "cover.png"` in JSON) and the pictures arrive as `images`
+    uploads, matched by name. With pictures the job also renders a slideshow
+    video; without them it produces the track and the subtitles only.
+    """
+    try:
+        doc = narr.parse_script(script)
+    except narr.ScriptError as e:
+        return JSONResponse({"error": str(e)}, 400)
+
+    lang = (target_lang or "en").strip().lower()
+    if lang not in EdgeTTSFallback.VOICE_MAP:
+        return JSONResponse(
+            {"error": f"Unsupported language '{target_lang}'. "
+                      f"See GET /api/languages."}, 400)
+    if tts_speed not in _NARRATION_TTS_SPEEDS:
+        return JSONResponse(
+            {"error": f"Unknown tts_speed '{tts_speed}'. "
+                      f"Options: {list(_NARRATION_TTS_SPEEDS)}"}, 400)
+
+    # Unlike a dub — where an unknown preset quietly means "the source
+    # voice" — a narration has nothing to fall back to that the user chose,
+    # so a misspelled voice is an error, not a different narrator.
+    voice_preset = (voice_preset or "auto").strip() or "auto"
+    file_presets = scan_file_presets()
+    if voice_preset not in VOICE_PRESETS and voice_preset not in file_presets:
+        return JSONResponse(
+            {"error": f"Unknown voice '{voice_preset}'. See GET /api/voices."},
+            400)
+
+    timing_overrides: dict = {}
+    if timing.strip():
+        try:
+            timing_overrides = json.loads(timing)
+        except json.JSONDecodeError:
+            timing_overrides = None
+        if not isinstance(timing_overrides, dict):
+            return JSONResponse(
+                {"error": "timing must be a JSON object, e.g. "
+                          '{"slide_gap": 1.5}. Keys: '
+                          f"{', '.join(narr.DEFAULT_TIMING)}"}, 400)
+
+    job_id = uuid.uuid4().hex[:8]
+
+    # A library voice is a recording of a real person. The same consent
+    # policy that guards casting it onto a speaker guards narrating with it;
+    # designed voices are drawn from a description and need none.
+    consent_missing = False
+    policy = getattr(cfg, "voice_consent_policy", "off")
+    if (voice_preset in file_presets and policy in ("warn", "require")
+            and not _clone_consent_attested("file", "", job_id, voice_preset)):
+        if policy == "require":
+            return JSONResponse(
+                {"error": f"Voice '{voice_preset}' has no clone consent on "
+                          f"record. Record consent on the voice, or narrate "
+                          f"with a designed voice."}, 400)
+        consent_missing = True
+        log.warning(f"[consent] narrating with '{voice_preset}' without an "
+                    f"attestation (policy=warn)")
+
+    # ── Slide images ────────────────────────────────────────────────
+    wanted = {s["image"] for s in doc["slides"] if s["image"]}
+    uploads = {}
+    for up in images or []:
+        name = os.path.basename((up.filename or "").replace("\\", "/"))
+        if not name:
+            continue
+        if not name.lower().endswith(narr.IMAGE_EXTS):
+            return JSONResponse(
+                {"error": f"'{name}' is not a slide image "
+                          f"({', '.join(narr.IMAGE_EXTS)})."}, 400)
+        uploads[name] = up
+    ignored = sorted(set(uploads) - wanted)
+    want_video = bool(render_video and wanted)
+    if want_video:
+        missing = sorted(wanted - set(uploads))
+        if missing:
+            return JSONResponse(
+                {"error": "The script names slide images that were not "
+                          "uploaded: " + ", ".join(missing)
+                          + ". Upload them, or send render_video=false for "
+                            "the voice track and subtitles alone."}, 400)
+        if not doc["slides"][0]["image"]:
+            return JSONResponse(
+                {"error": "The first slide has no image; a slideshow needs a "
+                          "picture to open on."}, 400)
+
+    work = OUTPUT_DIR / job_id
+    work.mkdir(exist_ok=True)
+    if want_video:
+        slides_dir = work / "slides"
+        slides_dir.mkdir(exist_ok=True)
+        for name in sorted(wanted):
+            dst = slides_dir / name
+            with open(dst, "wb") as f:
+                shutil.copyfileobj(uploads[name].file, f)
+            if dst.stat().st_size > _NARRATION_MAX_IMAGE_BYTES:
+                shutil.rmtree(work, ignore_errors=True)
+                return JSONResponse(
+                    {"error": f"'{name}' is larger than "
+                              f"{_NARRATION_MAX_IMAGE_BYTES // (1024 * 1024)} MB."},
+                    400)
+    (work / "narration_script.json").write_text(
+        json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    segments = narr.build_segments(doc)
+    estimate = narr.estimate_duration(segments, timing_overrides)
+    label = (title.strip() or doc.get("title")
+             or doc["slides"][0].get("title") or "Narration")
+    narrate_args = {
+        "script": doc,
+        "target_lang": lang,
+        "voice_preset": voice_preset,
+        "voice_style": voice_style,
+        "tts_speed": tts_speed,
+        "timing": timing_overrides,
+        "render_video": want_video,
+        "burn_subs": bool(burn_subs),
+    }
+    jobs[job_id] = {
+        "id": job_id,
+        "status": "queued",
+        "progress": 0,
+        "mode": NARRATE_MODE,
+        "source": "",
+        "source_type": "script",
+        "source_label": label,
+        "title": label,
+        "target_lang": lang,
+        "voice_style": voice_style,
+        "voice_preset": voice_preset,
+        "voice_mode": ("upload" if voice_preset in file_presets else
+                       ("custom" if voice_style.strip() else "preset")),
+        "tts_speed": tts_speed,
+        "created": time.time(),
+        "step_detail": "Queued...",
+        "narration": {
+            "slides": len(doc["slides"]),
+            "lines": len(segments),
+            "chars": sum(len(s["text"]) for s in segments),
+            "estimated_duration": estimate,
+            "video": want_video,
+            "burn_subs": bool(burn_subs) and want_video,
+            **({"voice_consent": "missing"} if consent_missing else {}),
+        },
+    }
+    save_job(jobs[job_id])
+    await enqueue_job(job_id, {"__narrate__": narrate_args})
+    return {
+        "job_id": job_id,
+        "slides": len(doc["slides"]),
+        "lines": len(segments),
+        "estimated_duration": estimate,
+        "video": want_video,
+        **({"ignored_images": ignored} if ignored else {}),
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -12058,6 +12555,13 @@ _KEEP_ON_INTERMEDIATE_CLEAN = {
     "checkpoint_translation_done.json",
     "checkpoint_tts_done.json",
     # Keep final so Resume stays possible even on cleaned jobs
+    # A narration's deliverables (run_narration). Its per-line clips under
+    # tts_segments/ are the regenerable part.
+    "narration.wav",
+    "narration_timeline.json",
+    "narration_script.json",
+    "subtitles.srt",
+    "subtitles.vtt",
 }
 
 
