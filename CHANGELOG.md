@@ -141,6 +141,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a clean venv at 1016/1016.
 
 ### Fixed
+- **A narration with `burn_subs` no longer fails after synthesizing every
+  line.** The subtitle burn is the last step of a narration, and it needs
+  ffmpeg's `subtitles` filter, which needs libass. Homebrew's ffmpeg 9.0.2 is
+  built without it, so the whole synthesis was spent before the render failed,
+  and a failed narration is resubmitted rather than resumed. `POST /api/narrate`
+  now returns a 400 at submission, naming libass and the two ways out. The same
+  check covers `POST /api/dub/{id}/burn_subs` and the `tiktok`, `shorts` and
+  `reels` export presets, which lost no work but answered with a 500 quoting
+  ffmpeg's "No option name near …". `_ffmpeg_has_filter` no longer caches a
+  probe that could not run: a timeout says nothing about the build, so it
+  cannot refuse burns until the next restart.
 - **An apostrophe in the install path crashed yt-dlp resolution outright.** The
   live-interpreter check that PR #45 added to `_find_ytdlp` read each
   candidate's `#!` line through `shlex.split`, which applies shell quoting

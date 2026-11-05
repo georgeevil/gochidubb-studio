@@ -4395,6 +4395,13 @@ async def start_narration(
             return JSONResponse(
                 {"error": "The first slide has no image; a slideshow needs a "
                           "picture to open on."}, 400)
+        # The burn is the very last step, after every line is synthesized,
+        # and a failed narration is resubmitted rather than resumed. Without
+        # a video nothing is burned, so only a slideshow needs the filter.
+        if burn_subs:
+            refusal = _burn_subs_refusal()
+            if refusal:
+                return refusal
 
     work = OUTPUT_DIR / job_id
     work.mkdir(exist_ok=True)
@@ -6262,6 +6269,9 @@ async def burn_subtitles(
 
     if not src_video.exists():
         return JSONResponse({"error": "Dubbed video not yet generated"}, 400)
+    refusal = _burn_subs_refusal()
+    if refusal:
+        return refusal
 
     # Ensure SRT exists (it's written alongside translation checkpoint,
     # but regenerate if missing using current segments)
@@ -6824,28 +6834,49 @@ def _find_drawtext_font() -> str:
 _FILTER_CACHE: dict = {}
 
 
-def _ffmpeg_has_filter(name: str) -> bool:
+def _ffmpeg_has_filter(name: str, if_unknown: bool = False) -> bool:
     """Whether this ffmpeg build ships a given filter.
 
     `drawtext` needs libfreetype, and plenty of builds skip it — Homebrew's
     ffmpeg 8.x on macOS is one, which turns the showcase stitch into
     "No such filter: 'drawtext'" after every dub has already been rendered.
     Checked once and cached; `ffmpeg -filters` costs ~50ms.
+
+    A probe that could not run says nothing about the build, so it is not
+    cached and the answer is `if_unknown`: False suits a caller with a
+    fallback, True suits one that would refuse work on a "no".
     """
     if name in _FILTER_CACHE:
         return _FILTER_CACHE[name]
     import subprocess as _sp   # module-level import is not available here
-    ok = False
     try:
         r = _sp.run(["ffmpeg", "-hide_banner", "-filters"],
-                    capture_output=True, text=True, timeout=20)
-        # Lines look like " ..C drawtext V->V  Draw text on top of video."
-        ok = any(ln.split()[1:2] == [name]
-                 for ln in r.stdout.splitlines() if len(ln.split()) > 1)
+                    capture_output=True, text=True, timeout=20, check=True)
     except Exception as e:
-        log.warning(f"[showcase] could not probe ffmpeg filters: {e}")
+        log.warning(f"[ffmpeg] could not probe filters: {e}")
+        return if_unknown
+    # Lines look like " ..C drawtext V->V  Draw text on top of video."
+    ok = any(ln.split()[1:2] == [name]
+             for ln in r.stdout.splitlines() if len(ln.split()) > 1)
     _FILTER_CACHE[name] = ok
     return ok
+
+
+def _burn_subs_refusal():
+    """The 400 for a subtitle burn this ffmpeg cannot do; None if it can.
+
+    The `subtitles` filter needs libass, and Homebrew's ffmpeg 9.x ships
+    without it. ffmpeg's own error does not help: the argument form used here
+    fails as "No option name near '<path>'", which never mentions a filter.
+    """
+    if _ffmpeg_has_filter("subtitles", if_unknown=True):
+        return None
+    return JSONResponse(
+        {"error": "ffmpeg was built without libass, so it has no 'subtitles' "
+                  "filter and cannot paint subtitles into the picture. Use a "
+                  "soft subtitle track instead (for a narration, leave "
+                  "burn_subs off), or install an ffmpeg build with libass "
+                  "and restart the server."}, 400)
 
 
 def _render_label_png(text: str, dest: Path, font_path: str = "") -> bool:
@@ -8010,6 +8041,9 @@ async def export_for_platform(
                 except Exception as e:
                     return JSONResponse({"error": f"Could not generate SRT: {e}"}, 500)
         if srt_file.exists():
+            refusal = _burn_subs_refusal()
+            if refusal:
+                return refusal
             force_style = SUB_STYLE_MAP.get(style, SUB_STYLE_MAP["default"])
             srt_arg = str(srt_file).replace("\\", "/").replace(":", r"\:")
             vf = f"{vf},subtitles='{srt_arg}':force_style='{force_style}'"

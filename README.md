@@ -252,7 +252,9 @@ workflow. HTTP: `POST /api/narrate` (form fields `script`, `target_lang`,
 `burn_subs`, `timing`; slide pictures as `images` uploads, matched to the
 script by file name). MCP: `gochidubb_narrate`. A script in JSON
 (`{"title": …, "slides": [{"title", "image", "narration", "pause_after"}]}`)
-is accepted wherever Markdown is.
+is accepted wherever Markdown is. `burn_subs` needs an ffmpeg built with libass, which
+provides the `subtitles` filter; without one the request gets a 400 before
+anything is synthesized.
 
 Drive a remote box: `set GOCHIDUBB_URL=http://192.168.0.10:8910`
 
