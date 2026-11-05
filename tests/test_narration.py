@@ -84,6 +84,33 @@ def test_comments_are_not_spoken_wherever_they_sit():
     assert two["paragraphs"] == ["Still here."]
 
 
+def test_a_held_back_lead_in_is_not_left_on_its_own():
+    # "a clear," is held back so it goes with the clause it opens. When that
+    # clause does not fit beside it, the two are wrapped together; before,
+    # the lead-in came out as a chunk of its own: an 8-character subtitle on
+    # screen for 0.4 s, and a synthesis call for two words.
+    s = ("The State should carry out what the court already ordered: a "
+         "clear, public and final line between protected forest and the "
+         "land where people live, respecting rights acquired in good faith.")
+    chunks = n.chunk_text(s, 78)
+    assert " ".join(chunks) == s
+    assert all(15 <= len(c) <= 78 for c in chunks), chunks
+
+
+def test_a_chunk_whose_words_break_badly_becomes_two_cues():
+    # 78 characters under a 2 x 42 box, and still no way to wrap it in two
+    # lines: the only breaks are after 34 and after 43 characters.
+    s = ("They bar municipal permits on 20.1 hectares of forest inside the "
+         "coastal zone.")
+    placed = [{"idx": 0, "text": s, "translated_text": s, "slide": "a",
+               "placed_start": 1.0, "placed_end": 6.2}]
+    cues = n.subtitle_cues(placed)
+    assert len(cues) == 2
+    assert " ".join(c["text"] for c in cues) == s
+    assert n.cue_violations(cues) == []
+    assert cues[0]["start"] == 1.0 and cues[-1]["end"] <= 6.2
+
+
 def test_a_note_before_the_first_slide_is_not_a_slide():
     # Found with a real 15-slide script: a comment under the title became an
     # opening slide with no picture and no words, and the slideshow then had

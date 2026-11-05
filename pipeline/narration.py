@@ -363,12 +363,38 @@ def _greedy_chunks(flat: str, width: int) -> List[str]:
             cur = piece
         elif fits and not strand:
             cur = f"{cur} {piece}"
+        elif _is_lead_in(cur):
+            # The lead-in was held back for this clause and the two do not
+            # fit on one line. Wrap them together, as above: emitting it
+            # alone is the dangling scrap holding it back was meant to avoid
+            # ("…already ordered:" / "a clear," / "public and final line…").
+            wrapped = textwrap.wrap(f"{cur} {piece}", width=width,
+                                    break_long_words=False,
+                                    break_on_hyphens=False)
+            out.extend(wrapped[:-1])
+            cur = wrapped[-1] if wrapped else ""
         else:
             out.append(cur)
             cur = piece
     if cur:
         out.append(cur)
     return out
+
+
+def _fits_box(text: str, per_line: int, max_lines: int) -> bool:
+    """Does `text` wrap into at most `max_lines` lines of `per_line`?"""
+    lines = textwrap.wrap(text, width=per_line, break_long_words=False,
+                          break_on_hyphens=False)
+    return len(lines) <= max_lines and all(len(ln) <= per_line for ln in lines)
+
+
+def _halve(text: str) -> List[str]:
+    """Two pieces, cut at the space nearest the middle."""
+    spaces = [m.start() for m in re.finditer(" ", text)]
+    if not spaces:
+        return [text]
+    cut = min(spaces, key=lambda p: abs(p - len(text) // 2))
+    return [text[:cut].strip(), text[cut:].strip()]
 
 
 def chunk_text(text: str, max_chars: int) -> List[str]:
@@ -547,7 +573,15 @@ def subtitle_cues(placed_segments: List[dict],
         text = (seg.get("translated_text") or seg.get("text") or "").strip()
         if not text:
             continue
-        chunks = chunk_text(text, cap)
+        # `cap` is under the box and a chunk can still fail to fit it: where
+        # the words break decides, not the character count ("…on 20.1" /
+        # "hectares of forest inside the coastal zone." is 34 + 43 under a
+        # 42-character line). Such a chunk becomes two cues instead of one
+        # cue with a line that runs over.
+        chunks: List[str] = []
+        for c in chunk_text(text, cap):
+            chunks.extend([c] if _fits_box(c, per_line, max_lines)
+                          else _halve(c))
         total = sum(len(c) for c in chunks) or 1
         t0 = float(seg["placed_start"])
         span = max(0.0, float(seg["placed_end"]) - t0)
