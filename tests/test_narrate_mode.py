@@ -14,6 +14,7 @@ timeline, the mix and the subtitle files are the real ones.
 import asyncio
 import io
 import json
+import subprocess
 
 import numpy as np
 import pytest
@@ -59,6 +60,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setattr(server, "cfg", _Cfg())
     monkeypatch.setattr(server, "save_job", lambda job: None)
     monkeypatch.setattr(server, "scan_file_presets", lambda: {})
+    monkeypatch.setattr(server, "_ffmpeg_has_filter", lambda name, **kw: True)
     enqueued = []
 
     async def _enqueue(job_id, args):
@@ -203,6 +205,136 @@ def test_timing_and_voice_reach_the_queue(client):
 def test_a_free_text_style_is_a_custom_voice(client):
     r = _submit(client, voice_style="calm mature female narrator")
     assert server.jobs[r.json()["job_id"]]["voice_mode"] == "custom"
+
+
+# ── burn_subs: an ffmpeg without libass cannot paint subtitles ──────────
+
+def _without_libass(monkeypatch):
+    monkeypatch.setattr(server, "_ffmpeg_has_filter",
+                        lambda name, **kw: name != "subtitles")
+
+
+def test_burn_subs_is_refused_before_synthesis_without_the_filter(
+        client, monkeypatch):
+    _without_libass(monkeypatch)
+    r = _submit(client, burn_subs="true", render_video="true")
+    assert r.status_code == 400, r.text
+    error = r.json()["error"]
+    assert "libass" in error and "soft subtitle track" in error
+    assert client.enqueued == [] and server.jobs == {}
+    assert list(client.out.iterdir()) == []
+
+
+def test_burn_subs_is_queued_when_the_filter_is_present(client):
+    r = _submit(client, burn_subs="true", render_video="true")
+    assert r.status_code == 200, r.text
+    assert r.json()["video"] is True
+    assert client.enqueued[0][1]["__narrate__"]["burn_subs"] is True
+
+
+def test_a_soft_track_does_not_need_the_filter(client, monkeypatch):
+    _without_libass(monkeypatch)
+    r = _submit(client, burn_subs="false", render_video="true")
+    assert r.status_code == 200, r.text
+    assert r.json()["video"] is True
+    assert client.enqueued[0][1]["__narrate__"]["burn_subs"] is False
+
+
+def test_burn_subs_without_a_video_does_not_need_the_filter(client, monkeypatch):
+    # Nothing is rendered, so nothing would be burned.
+    _without_libass(monkeypatch)
+    r = _submit(client, burn_subs="true", render_video="false", images=())
+    assert r.status_code == 200, r.text
+    assert r.json()["video"] is False
+
+
+# The same filter, on the routes that burn into a finished dub.
+
+@pytest.fixture
+def dub_job(client, monkeypatch):
+    server.jobs["dj1"] = {"id": "dj1", "status": "complete"}
+    work = client.out / "dj1"
+    work.mkdir()
+    (work / "dubbed_video.mp4").write_bytes(b"mp4")
+    (work / "translated.srt").write_text("1\n", encoding="utf-8")
+    ran = []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **kw: ran.append(cmd))
+    return ran
+
+
+_DUB_BURNS = [("burn_subs", {}), ("export", {"preset": "tiktok"}),
+              ("export", {"preset": "shorts"}), ("export", {"preset": "reels"})]
+
+
+@pytest.mark.parametrize("route, form", _DUB_BURNS)
+def test_a_dub_burn_is_refused_without_the_filter(
+        client, dub_job, monkeypatch, route, form):
+    _without_libass(monkeypatch)
+    r = client.post(f"/api/dub/dj1/{route}", data=form)
+    assert r.status_code == 400, r.text
+    assert "libass" in r.json()["error"]
+    assert dub_job == []
+
+
+@pytest.mark.parametrize("route, form", _DUB_BURNS)
+def test_a_dub_burn_runs_when_the_filter_is_present(
+        client, dub_job, route, form):
+    r = client.post(f"/api/dub/dj1/{route}", data=form)
+    assert r.status_code == 200, r.text
+    assert "subtitles=" in dub_job[0][dub_job[0].index("-vf") + 1]
+
+
+def test_an_export_that_burns_nothing_does_not_need_the_filter(
+        client, dub_job, monkeypatch):
+    _without_libass(monkeypatch)
+    r = client.post("/api/dub/dj1/export", data={"preset": "youtube_1080p"})
+    assert r.status_code == 200, r.text
+    assert "subtitles=" not in dub_job[0][dub_job[0].index("-vf") + 1]
+
+
+# The probe itself, on a canned `ffmpeg -filters` listing.
+
+_FILTERS = """Filters:
+  T.. = Timeline support
+  | = Source or sink filter
+  ------
+ .. fps               V->V       Force constant framerate.
+ TS overlay           VV->V      Overlay a video source on top of the input.
+"""
+
+
+def test_the_probe_reads_the_listing_and_runs_once(monkeypatch):
+    monkeypatch.setattr(server, "_FILTER_CACHE", {})
+    calls = []
+
+    def _run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, stdout=_FILTERS, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    assert server._ffmpeg_has_filter("overlay") is True
+    assert server._ffmpeg_has_filter("overlay") is True
+    assert server._ffmpeg_has_filter("subtitles", if_unknown=True) is False
+    assert server._ffmpeg_has_filter("subtitles", if_unknown=True) is False
+    assert len(calls) == 2
+
+
+@pytest.mark.parametrize("failure", [
+    FileNotFoundError("ffmpeg"),
+    subprocess.TimeoutExpired("ffmpeg", 20),
+    subprocess.CalledProcessError(1, "ffmpeg"),
+])
+def test_a_probe_that_could_not_run_is_not_an_answer(monkeypatch, failure):
+    monkeypatch.setattr(server, "_FILTER_CACHE", {})
+
+    def _run(cmd, **kw):
+        raise failure
+
+    monkeypatch.setattr(subprocess, "run", _run)
+    assert server._ffmpeg_has_filter("subtitles", if_unknown=True) is True
+    assert server._ffmpeg_has_filter("subtitles") is False
+    assert server._burn_subs_refusal() is None
+    assert server._FILTER_CACHE == {}
 
 
 # ── consent: a library voice is a recording of a real person ────────────
