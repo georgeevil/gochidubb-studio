@@ -65,7 +65,7 @@ source venv/bin/activate
 pip install --upgrade pip wheel setuptools -q
 
 step "Core packages"
-pip install -q fastapi "uvicorn[standard]" python-multipart httpx soundfile numpy pydub nltk yt-dlp edge-tts
+pip install -q "fastapi>=0.162.0" "uvicorn[standard]" python-multipart httpx soundfile numpy pydub nltk yt-dlp edge-tts
 ok "Core installed"
 
 # ── PyTorch ──

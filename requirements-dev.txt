@@ -18,7 +18,7 @@ pytest
 # ── What the code under test imports ────────────────────────────────────
 numpy                 # segment maths, metrics, quality scorers
 aiohttp               # translator's HTTP client (5 test files)
-fastapi               # route tests (3 test files)
+fastapi>=0.162.0      # route tests; floor explained in requirements.txt
 httpx                 # webhook delivery
 soundfile             # audio round-trips
 python-multipart      # FastAPI Form() parsing — route tests fail to collect without it

@@ -6,7 +6,11 @@
 # Install: pip install -r requirements.txt
 
 # Core server
-fastapi>=0.104.0
+# >=0.162.0: 0.147.0 through 0.161.1 read every omitted bool form field as False,
+# ignoring its declared default. A dub from creator.html or go.html lost its
+# background bed, a preset edit dropped its consent record, and a storage cleanup
+# without dry_run deleted files. Do not lower this floor.
+fastapi>=0.162.0
 uvicorn[standard]>=0.24.0
 python-multipart>=0.0.9
 httpx>=0.25.0
