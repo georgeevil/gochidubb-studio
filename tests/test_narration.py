@@ -84,6 +84,22 @@ def test_comments_are_not_spoken_wherever_they_sit():
     assert two["paragraphs"] == ["Still here."]
 
 
+def test_a_note_before_the_first_slide_is_not_a_slide():
+    # Found with a real 15-slide script: a comment under the title became an
+    # opening slide with no picture and no words, and the slideshow then had
+    # nothing to open on.
+    doc = n.parse_script(
+        "# Briefing\n\n<!-- one heading per slide -->\n\n"
+        "## Cover\n![](cover.png)\nHello.\n")
+    assert [s["id"] for s in doc["slides"]] == ["cover"]
+    assert doc["slides"][0]["image"] == "cover.png"
+    # The same for a note that runs over lines and for a line that is all note.
+    doc = n.parse_script(
+        "# Briefing\n<!-- a note\nover two lines -->\n<!-- x --> <!-- y -->\n"
+        "## Cover\nHello.\n")
+    assert [s["id"] for s in doc["slides"]] == ["cover"]
+
+
 def test_a_pause_comment_still_works_next_to_other_comments():
     doc = n.parse_script(
         "## One\nHello. <!-- note -->\n<!-- pause: 3 -->\n\n## Two\nBye.")

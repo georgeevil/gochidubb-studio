@@ -155,27 +155,32 @@ def _parse_markdown(text: str) -> dict:
                 continue
             cur = open_slide(heading)
             continue
+        img = _MD_IMAGE.match(line)
+        pause = None if img else _MD_PAUSE.match(line)
+        if not img and not pause:
+            if _MD_COMMENT.match(line):
+                continue
+            line = _MD_INLINE_COMMENT.sub(" ", line)
+            if "<!--" in line:
+                line, _, _ = line.partition("<!--")
+                in_comment = True
+            line = _MD_LIST.sub("", line.strip())
+            if line.startswith(">"):
+                line = line.lstrip("> ").strip()
+            line = _strip_inline_markup(line).strip()
+            if not line:
+                continue
+        # Only something a slide can hold opens the opening slide. A note to
+        # self between the title and the first heading is not a slide: it
+        # used to become one, with no picture and no words, and a slideshow
+        # cannot open on a slide with no picture.
         if cur is None:
             cur = open_slide(title)
-        img = _MD_IMAGE.match(line)
         if img:
             cur.setdefault("image", img.group(1))
-            continue
-        pause = _MD_PAUSE.match(line)
-        if pause:
+        elif pause:
             cur["pause_after"] = float(pause.group(1))
-            continue
-        if _MD_COMMENT.match(line):
-            continue
-        line = _MD_INLINE_COMMENT.sub(" ", line)
-        if "<!--" in line:
-            line, _, _ = line.partition("<!--")
-            in_comment = True
-        line = _MD_LIST.sub("", line.strip())
-        if line.startswith(">"):
-            line = line.lstrip("> ").strip()
-        line = _strip_inline_markup(line).strip()
-        if line:
+        else:
             para.append(line)
     flush_para()
     return {"title": title, "slides": slides}
