@@ -52,5 +52,6 @@ from). Runbooks refer to it as `$CLIP`.
 | `voice-casting.md` | Per-speaker casting, audition, consent chip |
 | `redub-and-reuse.md` | Redub into a new language; stage-reuse acceleration visible at /beta |
 | `rescue.md` | A failed download rescued by attaching the file by hand |
+| `transcript.md` | New → Transcript: submit, fix and name the speakers, re-detect, export |
 | `sync-and-subtitles.md` | Sync-fit fixes and the cue editor, .srt/.vtt export |
 | `wizard-regression.md` | The legacy `--wizard-mode` contract still pauses exactly once |
