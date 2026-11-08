@@ -128,11 +128,16 @@ const STAGES = [
 // (server.STAGE_ORDER), not the six presentation stages above. A partial run
 // ends in status 'paused' with its artifacts kept and nothing waiting on a
 // human, which is the difference between this and a review gate.
+//
+// No transcript stops here on purpose. A dub stopped after 'diarize' is not a
+// transcript: it ran as a dub, so "Main speaker only" folded every speaker
+// into one (server.py's main_only remap), Whisper kept feeding itself its own
+// output (the repetition loop transcribe mode turns off), and the job ends
+// 'paused' with no export. The Transcript goal on New submits mode=transcribe,
+// which gets all of that right.
 const RUN_UNTIL = [
   { id: '',           label: 'The whole dub — download to final mix' },
   { id: 'extract',    label: 'Audio only — extract and stop' },
-  { id: 'transcribe', label: 'Transcript — no speaker labels' },
-  { id: 'diarize',    label: 'Transcript + speakers — no translation' },
   { id: 'translate',  label: 'Translated subtitles — no voices' },
   { id: 'tts',        label: 'Synthesized voices — no video' },
   { id: 'assemble',   label: 'Assembled audio — no final mux' },
@@ -704,7 +709,7 @@ function LeftRail({ view, setView, runningJob, awaitingReviewCount, system,
   const groups = [
     { label: 'Work', items: [
       { id: 'feed',     label: 'Agent feed', hint: 'Runs · events',           ic: I.feed },
-      { id: 'home',     label: 'New dub',    hint: 'Upload · URL · showcase', ic: I.home },
+      { id: 'home',     label: 'New',        hint: 'Dub · transcript',        ic: I.home },
       { id: 'jobs',     label: 'Jobs',       hint: jobsHint, ic: I.history,
         badge: jobsBadge },
       { id: 'discover', label: 'Discover',   hint: 'Trending · scout',        ic: I.discover },
@@ -899,7 +904,7 @@ function TopBar({ view, runningJob, awaitingReviewCount, notices, mode = 'local'
                   onJumpToProcessing, onJumpToReview, onOpenSetup, onCommand,
                   narrow = false, onOpenNav }) {
   const TITLES = {
-    feed: 'Agent feed', home: 'New dub', jobs: 'Jobs', library: 'Library',
+    feed: 'Agent feed', home: 'New', jobs: 'Jobs', library: 'Library',
     discover: 'Discover', apikeys: 'API keys', mcp: 'MCP server',
     webhooks: 'Webhooks', billing: 'Billing & usage', system: 'Settings',
   };
@@ -1064,7 +1069,17 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
   // still maps onto the gate it used to mean.
   const [wizardMode, setWizardMode] = useState(
     () => _lsGet('wizardMode', _lsGet('wizardReview', false) ? 'review_translation' : 'auto'));
-  const [stopAfter, setStopAfter] = useState(() => _lsGet('stopAfter', ''));
+  // A stop point this form no longer offers (a stored 'diarize' from before
+  // the transcript stops moved to the Transcript goal) would otherwise be
+  // sent invisibly, with the select showing an option that is not there.
+  const [stopAfter, setStopAfter] = useState(() => {
+    const v = _lsGet('stopAfter', '');
+    return RUN_UNTIL.some(o => o.id === v) ? v : '';
+  });
+  // What New makes: a dub, or a transcript. Remembered, because someone who
+  // transcribes council sessions does it every time.
+  const [goal, setGoal] = useState(() => (_lsGet('newGoal', 'dub') === 'transcript' ? 'transcript' : 'dub'));
+  useEffect(() => { _lsSet('newGoal', goal); }, [goal]);
   // Per-job VoxCPM overrides. 0 = "auto", i.e. follow Settings -> Voice & TTS.
   const [voxCfg, setVoxCfg] = useState(() => _lsGet('voxCfg', 0));
   const [voxSteps, setVoxSteps] = useState(() => _lsGet('voxSteps', 0));
@@ -1089,6 +1104,9 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
     // already chosen, because their sentence made no sense, is worse than
     // simply saying it made no sense.
     if (!command.understood.length) { setApplied(command); onCommandConsumed && onCommandConsumed(); return; }
+    // Every ⌘K command is a dub command (languages, showcase, batch), so
+    // filling it into the Transcript form would drop half of it unseen.
+    setGoal('dub');
     if (command.source) { setYtUrl(command.source); setMode('url'); }
     if (command.mode === 'showcase') switchTo('showcase');
     else if (command.mode === 'quick') switchTo('quick');
@@ -1363,7 +1381,7 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
   return (
     <div style={{ flex: 1, overflow: 'auto', position: 'relative', background: 'var(--bg)' }}>
       {/* Hero */}
-      <Hero sphereOn={sphereOn}/>
+      <Hero sphereOn={sphereOn} goal={goal}/>
 
       {/* Form */}
       <div style={{ maxWidth: 760, margin: '0 auto', padding: '0 32px 80px' }}>
@@ -1411,6 +1429,18 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
           </div>
         )}
 
+        <GoalPicker goal={goal} setGoal={setGoal}/>
+
+        {goal === 'transcript' && (
+          <TranscriptForm
+            mode={mode} setMode={setMode}
+            videoFile={videoFile} setVideoFile={setVideoFile}
+            ytUrl={ytUrl} setYtUrl={setYtUrl}
+            srcLang={srcLang} setSrcLang={setSrcLang}
+            onJobSubmitted={onJobSubmitted}/>
+        )}
+
+        {goal === 'dub' && (<>
         <SectionHeader index={1} title="Source media" subtitle="One file or batch · file upload or URL"/>
 
         <div style={{ display: 'flex', gap: 6, marginBottom: 16, flexWrap: 'wrap' }}>
@@ -1605,8 +1635,8 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
           <Field label="Run until"
                  hint="A review gate pauses and waits to be approved; this just
                        ends the job there, artifacts kept, nothing queued behind
-                       it. Use it when the transcript is the product and the dub
-                       is not — you can still Continue the rest later.">
+                       it, and you can still Continue the rest later. Only want
+                       the transcript? Pick Transcript at the top instead.">
             <Select value={stopAfter} onChange={setStopAfter}>
               {RUN_UNTIL.map(o => (
                 <option key={o.id} value={o.id}>{o.label}</option>
@@ -1685,13 +1715,184 @@ function HomeView({ system, voicePresets, sphereOn, onJobSubmitted,
           <span className="mono" style={{ fontSize: 10, color: 'var(--ink-4)' }}>⌘↵</span>
         </div>
         </>)}
+        </>)}
       </div>
     </div>
   );
 }
 
+// ── Goal picker ──
+// What New makes. A goal is not a fourth "Single / Batch / ..." button:
+// those say how many videos go into a dub, while a transcript is a different
+// job with different inputs (no target language, no voice) and a different
+// result. Narration joins this row in its own PR.
+const NEW_GOALS = [
+  { id: 'dub',        label: 'Dub',        hint: 'Translate and re-voice a video' },
+  { id: 'transcript', label: 'Transcript', hint: 'Who said what, in the original language' },
+];
+
+function GoalPicker({ goal, setGoal }) {
+  return (
+    <div role="radiogroup" aria-label="What are you making?" style={{ marginBottom: 8 }}>
+      <div className="caps" style={{ marginBottom: 10 }}>What are you making?</div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8 }}>
+        {NEW_GOALS.map(g => (
+          <button key={g.id} role="radio" aria-checked={goal === g.id}
+                  onClick={() => setGoal(g.id)} style={{
+            padding: '10px 14px', borderRadius: 6, textAlign: 'left', cursor: 'pointer',
+            background: goal === g.id ? 'var(--bg-2)' : 'var(--bg-1)',
+            border: '1px solid ' + (goal === g.id ? 'var(--accent)' : 'var(--line)'),
+            color: 'var(--ink)',
+          }}>
+            <div style={{ fontSize: 13, fontWeight: 500 }}>{g.label}</div>
+            <div className="mono" style={{ fontSize: 10, color: 'var(--ink-3)', marginTop: 2 }}>{g.hint}</div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Transcript form ──
+// Submits mode=transcribe, not a dub with a stop point. The server then
+// keeps every speaker, turns off Whisper's self-conditioning (the repetition
+// loop on hours-long recordings), skips background separation and the
+// translation-model check, and finishes 'complete' with an export.
+const SPEAKER_COUNTS = [
+  { id: 'auto', label: 'Detect automatically' },
+  ...[1, 2, 3, 4, 5, 6, 8, 10].map(n => ({ id: String(n), label: `Exactly ${n}` })),
+];
+
+function TranscriptForm({ mode, setMode, videoFile, setVideoFile, ytUrl, setYtUrl,
+                          srcLang, setSrcLang, onJobSubmitted }) {
+  // Separate keys from the dub form's: the dub's Whisper default is tuned for
+  // speed, and a transcript is the one job where accuracy is the product.
+  const [whisperModel, setWhisperModel] = useState(() => _lsGet('trWhisperModel', 'large-v3'));
+  const [withSpeakers, setWithSpeakers] = useState(() => _lsGet('trWithSpeakers', true));
+  const [speakerCount, setSpeakerCount] = useState('auto');
+  const [vocab, setVocab] = useState('');
+  const [autoDenoise, setAutoDenoise] = useState(() => _lsGet('trAutoDenoise', false));
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState(null);
+  useEffect(() => { _lsSet('trWhisperModel', whisperModel); }, [whisperModel]);
+  useEffect(() => { _lsSet('trWithSpeakers', withSpeakers); }, [withSpeakers]);
+  useEffect(() => { _lsSet('trAutoDenoise', autoDenoise); }, [autoDenoise]);
+
+  const hasSource = mode === 'file' ? !!videoFile : !!ytUrl.trim();
+  const canSubmit = !submitting && hasSource;
+
+  const submit = async () => {
+    if (!canSubmit) return;
+    setError(null); setSubmitting(true);
+    const fd = new FormData();
+    if (mode === 'file' && videoFile) fd.append('video', videoFile);
+    else fd.append('source', ytUrl.trim());
+    fd.append('mode', 'transcribe');
+    fd.append('stop_after', withSpeakers ? 'diarize' : 'transcribe');
+    fd.append('source_lang', srcLang);
+    fd.append('whisper_model', whisperModel);
+    fd.append('auto_denoise', autoDenoise);
+    if (withSpeakers && speakerCount !== 'auto') {
+      fd.append('min_speakers', speakerCount);
+      fd.append('max_speakers', speakerCount);
+    }
+    if (vocab.trim()) fd.append('initial_prompt', vocab.trim());
+    try {
+      const r = await fetch('/api/dub', { method: 'POST', body: fd });
+      const d = await r.json();
+      if (d.job_id) onJobSubmitted(d.job_id);
+      else setError(d.error || d.detail || 'Submit failed');
+    } catch (e) {
+      setError(String(e.message || e));
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const label = submitting ? 'Submitting…'
+    : !hasSource ? (mode === 'file' ? 'Choose a file' : 'Paste a URL')
+    : withSpeakers ? 'Transcribe and label speakers' : 'Transcribe';
+
+  return (
+    <>
+      {error && (
+        <div style={{ margin: '16px 0 0', padding: '12px 14px', borderRadius: 8,
+                      background: 'oklch(0.7 0.2 25 / 0.08)',
+                      border: '1px solid oklch(0.7 0.2 25 / 0.3)',
+                      fontSize: 12.5, color: 'var(--ink)' }}>{error}</div>
+      )}
+      <SectionHeader index={1} title="Source media" subtitle="A video or audio file, or a URL"/>
+      <SingleSource
+        mode={mode} setMode={setMode}
+        videoFile={videoFile} setVideoFile={setVideoFile}
+        ytUrl={ytUrl} setYtUrl={setYtUrl}/>
+
+      <SectionHeader index={2} title="Listening"/>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))', gap: 14 }}>
+        <Field label="Spoken language" hint="Pick it when you know it — detection can guess wrong on a music intro or a noisy opening.">
+          <Select value={srcLang} onChange={setSrcLang}>
+            {LANGS.map(l => <option key={l.c} value={l.c} style={{ background: '#16161c' }}>{l.n}</option>)}
+          </Select>
+        </Field>
+        <Field label="Whisper model" hint="large-v3 is the slowest and the most accurate.">
+          <Select value={whisperModel} onChange={setWhisperModel}>
+            {WHISPER_MODELS.map(m => <option key={m.id} value={m.id} style={{ background: '#16161c' }}>{m.name} · {m.size} · {m.detail}</option>)}
+          </Select>
+        </Field>
+      </div>
+      <div style={{ marginTop: 14 }}>
+        <Field label="Names and terms (optional)"
+               hint="People, places and jargon Whisper should spell right, separated
+                     by commas. Whisper reads only the last ~220 tokens.">
+          <input className="field" value={vocab} maxLength={2000}
+                 onChange={e => setVocab(e.target.value)}
+                 placeholder="e.g. Lic. Roberto Soto, CCITUL, Limón"/>
+        </Field>
+      </div>
+      <Toggle value={autoDenoise} onChange={setAutoDenoise} label="Auto-denoise audio"
+              hint="For noisy recordings (crowd, AC hum, phone lines). Off for clean audio."/>
+
+      <SectionHeader index={3} title="Speakers"/>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 12 }}>
+        {[
+          [true,  'Label who is speaking', 'Transcript + speaker labels'],
+          [false, 'Text only',             'Faster · no speaker detection'],
+        ].map(([v, title, hint]) => (
+          <button key={String(v)} onClick={() => setWithSpeakers(v)} style={{
+            padding: '10px 14px', borderRadius: 6, textAlign: 'left', cursor: 'pointer',
+            background: withSpeakers === v ? 'var(--bg-2)' : 'var(--bg-1)',
+            border: '1px solid ' + (withSpeakers === v ? 'var(--accent)' : 'var(--line)'),
+            color: 'var(--ink)',
+          }}>
+            <div style={{ fontSize: 12.5, fontWeight: 500 }}>{title}</div>
+            <div className="mono" style={{ fontSize: 10, color: 'var(--ink-3)', marginTop: 2 }}>{hint}</div>
+          </button>
+        ))}
+      </div>
+      {withSpeakers && (
+        <Field label="Number of voices"
+               hint="Count every distinct voice, not just the people talking. A
+                     station ident or a jingle announcer takes a slot too, so a
+                     two-person radio interview is often 3.">
+          <Select value={speakerCount} onChange={setSpeakerCount}>
+            {SPEAKER_COUNTS.map(o => <option key={o.id} value={o.id} style={{ background: '#16161c' }}>{o.label}</option>)}
+          </Select>
+        </Field>
+      )}
+
+      <div style={{ marginTop: 36 }}>
+        <button onClick={submit} disabled={!canSubmit} className="btn btn-primary" style={{
+          width: '100%', justifyContent: 'center', padding: '12px 16px', fontSize: 13,
+        }}>
+          {label} {canSubmit && I.arrow}
+        </button>
+      </div>
+    </>
+  );
+}
+
 // ── Hero ──
-function Hero({ sphereOn }) {
+function Hero({ sphereOn, goal = 'dub' }) {
   const ref = useRef(null);
   useEffect(() => {
     if (!ref.current || !sphereOn) return;
@@ -1705,15 +1906,18 @@ function Hero({ sphereOn }) {
       display: 'flex', alignItems: 'flex-start', gap: 36,
     }}>
       <div style={{ flex: 1, minWidth: 0 }}>
-        <div className="caps" style={{ marginBottom: 12 }}>New dub</div>
+        <div className="caps" style={{ marginBottom: 12 }}>{goal === 'transcript' ? 'New transcript' : 'New dub'}</div>
         <h1 className="serif" style={{
           fontSize: 'clamp(30px, 9vw, 48px)', lineHeight: 1.02, letterSpacing: '-0.02em', marginBottom: 14,
         }}>
-          Voice it back, <span style={{ fontStyle: 'italic', color: 'var(--ink-3)' }}>line by line</span>.
+          {goal === 'transcript'
+            ? <>Who said <span style={{ fontStyle: 'italic', color: 'var(--ink-3)' }}>what, and when</span>.</>
+            : <>Voice it back, <span style={{ fontStyle: 'italic', color: 'var(--ink-3)' }}>line by line</span>.</>}
         </h1>
         <div style={{ fontSize: 13.5, color: 'var(--ink-2)', lineHeight: 1.55, maxWidth: 480 }}>
-          Local, GPU-accelerated dubbing. WhisperX listens, Ollama translates, VoxCPM speaks.
-          Drop a file or paste a URL below.
+          {goal === 'transcript'
+            ? 'Local transcription with speaker labels. Whisper listens, pyannote tells the voices apart. Nothing is translated or re-voiced.'
+            : 'Local, GPU-accelerated dubbing. WhisperX listens, Ollama translates, VoxCPM speaks. Drop a file or paste a URL below.'}
         </div>
       </div>
       {sphereOn && (
@@ -5391,6 +5595,275 @@ function MetadataPanel({ jobId, defaultOpen = false }) {
   );
 }
 
+// ── Transcript result ──
+// Read, fix the speakers, export. Every fix goes through
+// /api/dub/{id}/speakers/edit, which a finished transcribe job accepts
+// (nothing was synthesized, so no relabel can put words in the wrong voice),
+// and every export is re-rendered from the checkpoint by the server, so a
+// download always carries the latest names.
+const TR_NEW = '__new__';
+const TR_NON_SPEECH = '__non_speech__';
+
+function TranscriptResult({ job, onRefresh, onBack }) {
+  const base = `/api/dub/${job.id}`;
+  const { doc, err, loading, reload } = useWbDoc(`${base}/transcript`);
+  const refs = useWbDoc(`/api/job/${job.id}/speakers`);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  const [opErr, setOpErr] = useState('');
+  const [names, setNames] = useState({});
+  const [mergeFrom, setMergeFrom] = useState('');
+  const [mergeInto, setMergeInto] = useState('');
+  const [only, setOnly] = useState('');
+  const [query, setQuery] = useState('');
+  const [rerunCount, setRerunCount] = useState('auto');
+  const [playing, setPlaying] = useState('');
+
+  const busyJob = ACTIVE_STATUSES.has(job.status);
+  // A re-run of speaker detection finishes on its own; pick up the new
+  // labels when it does instead of showing the old ones as current.
+  const wasBusy = useRef(busyJob);
+  useEffect(() => {
+    if (wasBusy.current && !busyJob) { reload(); refs.reload(); }
+    wasBusy.current = busyJob;
+  }, [busyJob]);
+
+  const speakers = (doc && doc.speakers) || [];
+  const segments = (doc && doc.segments) || [];
+  const display = (id) => {
+    const sp = speakers.find(s => s.id === id);
+    return (sp && ((sp.confirmed && sp.confirmed.name) || sp.label)) || id;
+  };
+  const audioFor = (id) => {
+    const r = ((refs.doc && refs.doc.speakers) || []).find(x => x.speaker === id);
+    return r ? r.audio_url : null;
+  };
+  // The next unused SPEAKER_NN — reassigning a line to it is how a person
+  // diarization folded into someone else gets a row of their own.
+  const nextSpeakerId = () => {
+    const used = new Set(speakers.map(s => s.id));
+    for (let n = 0; n < 100; n++) {
+      const id = `SPEAKER_${String(n).padStart(2, '0')}`;
+      if (!used.has(id)) return id;
+    }
+    return `SPEAKER_${Date.now() % 1000}`;
+  };
+
+  const applyOps = async (ops, done) => {
+    if (!ops.length) return;
+    setBusy(true); setOpErr(''); setMsg('');
+    try {
+      // The route takes at most 100 ops per request.
+      for (let i = 0; i < ops.length; i += 100) {
+        await wbPost(`${base}/speakers/edit`, { ops: ops.slice(i, i + 100) });
+      }
+      setMsg(done);
+      await reload();
+    } catch (e) { setOpErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  const saveNames = () => applyOps(
+    Object.entries(names)
+      .filter(([id, v]) => v.trim() && v.trim() !== display(id))
+      .map(([id, v]) => ({ op: 'rename', speaker: id, label: v.trim() })),
+    'Names saved');
+
+  const reassign = (seg, to) => {
+    if (to === seg.speaker) return;
+    if (to === TR_NON_SPEECH) {
+      return applyOps([{ op: 'mark_non_speech', segment_idxs: [seg.idx] }],
+                      `Line at ${fmtSec(seg.start)} removed as non-speech`);
+    }
+    const target = to === TR_NEW ? nextSpeakerId() : to;
+    return applyOps([{ op: 'reassign', segment_idx: seg.idx, to: target }],
+                    `Line at ${fmtSec(seg.start)} → ${display(target)}`);
+  };
+
+  const merge = () => {
+    if (!mergeFrom || !mergeInto || mergeFrom === mergeInto) return;
+    applyOps([{ op: 'merge', from: mergeFrom, into: mergeInto }],
+             `${display(mergeFrom)} merged into ${display(mergeInto)}`)
+      .then(() => { setMergeFrom(''); setMergeInto(''); });
+  };
+
+  const rerunDiarize = async () => {
+    setBusy(true); setOpErr(''); setMsg('');
+    try {
+      const overrides = rerunCount === 'auto'
+        ? { min_speakers: 0, max_speakers: 0 }
+        : { min_speakers: Number(rerunCount), max_speakers: Number(rerunCount) };
+      await wbPost(`${base}/retry_stage/diarize`,
+                   wbForm({ overrides: JSON.stringify(overrides), stop_after: 'diarize' }));
+      setMsg('Speaker detection is running again — this page updates when it finishes.');
+      onRefresh && onRefresh();
+    } catch (e) { setOpErr(String(e.message || e)); }
+    setBusy(false);
+  };
+
+  const togglePlay = (id) => {
+    const url = audioFor(id);
+    if (!url) return;
+    if (playing === id) { wbStop(); return; }
+    setPlaying(id);
+    wbPlay(url, () => setPlaying(p => (p === id ? '' : p)));
+  };
+
+  const q = query.trim().toLowerCase();
+  const shown = segments.filter(s => (!only || s.speaker === only)
+                                     && (!q || s.text.toLowerCase().includes(q)));
+  const lineCap = 600;
+  const optionStyle = { background: '#16161c' };
+
+  return (
+    <div className="scroll" style={{ flex: 1, padding: 'var(--pad)', background: 'var(--bg)' }}>
+      <div style={{ maxWidth: 900, margin: '0 auto', display: 'flex', flexDirection: 'column', gap: 18 }}>
+        <div>
+          <div className="caps" style={{ marginBottom: 6 }}>Transcript</div>
+          <div className="serif" style={{ fontSize: 24 }}>{job.title || job.source_label || job.id}</div>
+          {doc && (
+            <div className="mono" style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 6 }}>
+              {[doc.language && `language ${doc.language}`,
+                doc.duration != null && fmtSec(doc.duration),
+                `${segments.length} lines`,
+                `${speakers.length} speaker${speakers.length === 1 ? '' : 's'}`,
+                doc.asr && `${doc.asr.backend} ${doc.asr.model}`.trim(),
+                doc.diarization && doc.diarization.model].filter(Boolean).join(' · ')}
+            </div>
+          )}
+        </div>
+
+        <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+          {['txt', 'srt', 'vtt', 'json'].map(f => (
+            <a key={f} className={'btn' + (f === 'txt' ? ' btn-primary' : '')}
+               href={`${base}/transcript?format=${f}`} download={`transcript_${job.id}.${f}`}>
+              .{f} ↓
+            </a>
+          ))}
+          {onBack && <button className="btn btn-ghost" onClick={onBack}>Back to Jobs</button>}
+        </div>
+
+        {busyJob && (
+          <div style={{ fontSize: 12.5, color: 'var(--ink-2)' }}>
+            {job.step_detail || 'Working…'} Edits are locked until it finishes.
+          </div>
+        )}
+        {loading && !doc && <div style={{ fontSize: 12.5, color: 'var(--ink-3)' }}>Loading transcript…</div>}
+        {err && <div style={{ fontSize: 12.5, color: 'var(--err)' }}>{err}</div>}
+        {opErr && <div style={{ fontSize: 12.5, color: 'var(--err)' }}>{opErr}</div>}
+        {msg && <div style={{ fontSize: 12.5, color: 'var(--accent)' }}>{msg}</div>}
+
+        {doc && (
+          <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 12, background: 'var(--bg-1)', border: '1px solid var(--line)', borderRadius: 'var(--r-md)' }}>
+            <div style={{ display: 'flex', alignItems: 'baseline', gap: 10 }}>
+              <span style={{ fontSize: 13, fontWeight: 600 }}>Speakers</span>
+              <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}>
+                most talk first · names appear in every export
+              </span>
+            </div>
+            {speakers.map(sp => (
+              <div key={sp.id} style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+                <button className="btn btn-ghost" style={{ fontSize: 11, minWidth: 34 }}
+                        disabled={!audioFor(sp.id)} title={audioFor(sp.id) ? 'Hear this voice' : 'No voice sample'}
+                        onClick={() => togglePlay(sp.id)}>{playing === sp.id ? '■' : '▶'}</button>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--ink-3)', width: 96 }}>{sp.id}</span>
+                <input className="field" style={{ flex: '1 1 180px', maxWidth: 280 }}
+                       value={names[sp.id] ?? ((sp.confirmed && sp.confirmed.name) || sp.label || '')}
+                       placeholder="Name, e.g. Randy Gordon"
+                       maxLength={80} disabled={busy || busyJob}
+                       onChange={e => setNames(n => ({ ...n, [sp.id]: e.target.value }))}/>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--ink-3)' }}>
+                  {fmtSec(sp.talk_secs)} · {sp.segments} lines
+                </span>
+                {sp.match && !sp.confirmed && (
+                  <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)' }}
+                        title="A voice-profile suggestion — it is never used as the name until you type it">
+                    sounds like {sp.match.name}?
+                  </span>
+                )}
+              </div>
+            ))}
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center' }}>
+              <button className="btn btn-primary" disabled={busy || busyJob || !Object.keys(names).length}
+                      onClick={saveNames}>Save names</button>
+              {speakers.length > 1 && (
+                <>
+                  <span style={{ fontSize: 12, color: 'var(--ink-3)', marginLeft: 8 }}>Same person?</span>
+                  <select className="field" style={{ width: 'auto' }} value={mergeFrom}
+                          onChange={e => setMergeFrom(e.target.value)} disabled={busy || busyJob}>
+                    <option value="" style={optionStyle}>merge…</option>
+                    {speakers.map(s => <option key={s.id} value={s.id} style={optionStyle}>{display(s.id)}</option>)}
+                  </select>
+                  <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>into</span>
+                  <select className="field" style={{ width: 'auto' }} value={mergeInto}
+                          onChange={e => setMergeInto(e.target.value)} disabled={busy || busyJob}>
+                    <option value="" style={optionStyle}>…</option>
+                    {speakers.filter(s => s.id !== mergeFrom).map(s =>
+                      <option key={s.id} value={s.id} style={optionStyle}>{display(s.id)}</option>)}
+                  </select>
+                  <button className="btn" disabled={busy || busyJob || !mergeFrom || !mergeInto} onClick={merge}>Merge</button>
+                </>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', alignItems: 'center',
+                          borderTop: '1px solid var(--line)', paddingTop: 12 }}>
+              <span style={{ fontSize: 12, color: 'var(--ink-2)' }}>Speakers wrong? Detect them again · number of voices:</span>
+              <select className="field" style={{ width: 'auto' }} value={rerunCount}
+                      onChange={e => setRerunCount(e.target.value)} disabled={busy || busyJob}>
+                {SPEAKER_COUNTS.map(o => <option key={o.id} value={o.id} style={optionStyle}>{o.label}</option>)}
+              </select>
+              <button className="btn" disabled={busy || busyJob} onClick={rerunDiarize}>Re-run</button>
+              <div className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)', flexBasis: '100%' }}>
+                Reuses the transcript, so it takes minutes, not a re-download. Speaker numbers can change
+                between runs, so check the names afterwards. Count jingles and idents as voices.
+              </div>
+            </div>
+          </div>
+        )}
+
+        {doc && (
+          <div style={{ padding: 14, display: 'flex', flexDirection: 'column', gap: 8, background: 'var(--bg-1)', border: '1px solid var(--line)', borderRadius: 'var(--r-md)' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+              <span style={{ fontSize: 13, fontWeight: 600 }}>Lines</span>
+              <select className="field" style={{ width: 'auto' }} value={only} onChange={e => setOnly(e.target.value)}>
+                <option value="" style={optionStyle}>everyone</option>
+                {speakers.map(s => <option key={s.id} value={s.id} style={optionStyle}>{display(s.id)}</option>)}
+              </select>
+              <input className="field" style={{ flex: '1 1 160px', maxWidth: 260 }} value={query}
+                     onChange={e => setQuery(e.target.value)} placeholder="Search the text"/>
+              <span className="mono" style={{ fontSize: 10.5, color: 'var(--ink-3)', marginLeft: 'auto' }}>
+                change a line's speaker on the left
+              </span>
+            </div>
+            {shown.slice(0, lineCap).map(s => (
+              <div key={s.idx} style={{ display: 'grid', gridTemplateColumns: '64px minmax(110px, 170px) 1fr',
+                                        gap: 10, alignItems: 'baseline', padding: '4px 0',
+                                        borderTop: '1px solid var(--line)' }}>
+                <span className="mono" style={{ fontSize: 11, color: 'var(--ink-3)' }}>{fmtSec(s.start)}</span>
+                <select className="field" style={{ fontSize: 11.5, padding: '3px 6px' }}
+                        value={s.speaker} disabled={busy || busyJob}
+                        onChange={e => reassign(s, e.target.value)}>
+                  {speakers.map(sp => <option key={sp.id} value={sp.id} style={optionStyle}>{display(sp.id)}</option>)}
+                  <option value={TR_NEW} style={optionStyle}>+ new speaker</option>
+                  <option value={TR_NON_SPEECH} style={optionStyle}>not speech (remove)</option>
+                </select>
+                <span style={{ fontSize: 13, lineHeight: 1.5, color: 'var(--ink)' }}>{s.text}</span>
+              </div>
+            ))}
+            {shown.length > lineCap && (
+              <div className="mono" style={{ fontSize: 11, color: 'var(--ink-3)' }}>
+                Showing the first {lineCap} of {shown.length} lines — filter by speaker or search to see the rest.
+                The downloads always have every line.
+              </div>
+            )}
+            {!shown.length && <div style={{ fontSize: 12.5, color: 'var(--ink-3)' }}>No lines match.</div>}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function ResultView({ jobs, selectedJobId, voicePresets, system, onRefresh, onPickJob, onSwitchToHome, onSwitchToHistory }) {
   const completedJobs = jobs.filter(j => j.status === 'complete').sort((a, b) => (b.completed_at || b.created || 0) - (a.completed_at || a.created || 0));
   const job = selectedJobId ? jobs.find(j => j.id === selectedJobId) : completedJobs[0];
@@ -5402,9 +5875,15 @@ function ResultView({ jobs, selectedJobId, voicePresets, system, onRefresh, onPi
         <div className="serif" style={{ fontSize: 'clamp(20px, 5.5vw, 32px)', letterSpacing: '-0.015em', textAlign: 'center', maxWidth: 480 }}>
           Nothing to <span style={{ fontStyle: 'italic', color: 'var(--ink-3)' }}>show off</span> yet.
         </div>
-        <button onClick={onSwitchToHome} className="btn btn-primary">Start your first dub</button>
+        <button onClick={onSwitchToHome} className="btn btn-primary">Start something new</button>
       </div>
     );
+  }
+  // A transcript job has no dubbed_video.mp4 — the player below would be a
+  // dead box — and its product is the text, so it gets its own result.
+  if (job.mode === 'transcribe') {
+    return <TranscriptResult key={job.id} job={job} onRefresh={onRefresh}
+                             onBack={onSwitchToHistory}/>;
   }
   return (
     <div className="scroll" style={{ flex: 1, padding: 'var(--pad)', background: 'var(--bg)' }}>
